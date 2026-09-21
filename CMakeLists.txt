@@ -78,6 +78,8 @@ add_library(ttplayer_core
   src/audio/archive_member.cpp
   src/audio/asio_sink.cpp
   src/audio/audio_engine.cpp
+  src/audio/online_stream_descriptor.cpp
+  src/audio/http_stream_source.cpp
   src/audio/builtin_file_info.cpp
   src/audio/cue_sheet.cpp
   src/audio/file_encoder.cpp

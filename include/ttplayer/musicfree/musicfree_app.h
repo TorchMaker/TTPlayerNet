@@ -7,8 +7,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "ttplayer/musicfree/musicfree_types.h"
 
 namespace ttplayer::musicfree {
 
@@ -59,6 +62,42 @@ std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
 // 返回空串表示失败；error 非空时写入失败原因（音乐窗会把它显示出来）。
 std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
                            std::string* error = nullptr);
+
+// 解析「完整」播放源（url + 自定义请求头 headers + user_agent），供流式播放使用。
+// 与 ResolvePlayUrl 不同，这里把插件 getMediaSource 返回的请求头一并带出，因为很多
+// CDN（如网易云 m*.music.126.net）的签名直链需要带上 Referer/User-Agent 等头，
+// Media Foundation 默认的 URL reader 发不出这些头，必须用自定义字节流喂给解码器。
+// 失败返回 nullopt；error 非空时写入失败原因。
+std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
+                                            const std::string& id,
+                                            std::string* error = nullptr);
+
+// 把在线曲目的播放地址下载到本地文件（音乐窗的「下载到…」）。
+//   url  : ResolvePlayUrl 解析出来的地址（宽字符，与音乐窗内部一致）。
+//   path : 目标文件路径，写之前认为父目录已存在。
+// 成功返回 true；失败返回 false 并把原因写入 error（若提供）。走与插件搜索同一条
+// 网络链路（代理 / 超时 / 跟随重定向），二进制写入，不经过 std::string。
+bool DownloadTrackFile(const std::wstring& url, const std::filesystem::path& path,
+                       std::string* error = nullptr);
+
+// ---- 下载落点的取名规则（音乐窗的「下载到…」与播放列表的「下载歌曲」共用）----
+
+// 把 Windows 文件名里非法的字符换成 '_'，并去掉结尾的空格与点（这类名字资源管理器
+// 会拒绝创建）。音源返回的歌名带 " / \ : ? * 的情况很常见。
+std::wstring SanitizeFileName(const std::wstring& text);
+
+// 从播放地址推断扩展名。CDN 地址常带 ?query 或干脆没有扩展名，推不出来按 mp3。
+std::wstring GuessExtension(const std::wstring& url);
+
+// 默认文件名「歌手 - 歌名.ext」。用音源返回的元数据，**不要**从 CDN 地址反推 ——
+// 地址末段通常是哈希（播放列表那边踩过这个坑，列表里显示成一串乱码）。
+std::wstring DefaultDownloadName(const std::string& title,
+                                 const std::string& artist,
+                                 const std::wstring& url);
+
+// 默认下载目录：用户主目录下的 Music / 音乐 / 我的音乐，都没有就退回主目录。
+// 返回空路径表示连主目录都取不到。
+std::filesystem::path DefaultDownloadDirectory();
 
 // 诊断日志：仅在 TTPLAYER_MF_TRACE=1 时把一条自有记录追加到
 // %TEMP%\ttplayer_mf_http.log（与 axios 追踪同一个文件）。用它把

@@ -6,12 +6,16 @@
 #include "ttplayer/musicfree/musicfree_app.h"
 
 #include <cstdio>
+#include <cwctype>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 
+#include "ttplayer/musicfree/musicfree_http.h"
 #include "ttplayer/musicfree/musicfree_source_manager.h"
 #include "ttplayer/musicfree/musicfree_plugin.h"
 
@@ -25,6 +29,29 @@ std::filesystem::path ExecutableDir() {
     if (n == 0 || n >= exe.size()) return {};
     exe.resize(n);
     return std::filesystem::path(exe).parent_path();
+}
+
+std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                      static_cast<int>(value.size()), nullptr, 0,
+                                      nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                      static_cast<int>(value.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        out.data(), n);
+    return out;
 }
 
 std::once_flag g_once;
@@ -132,6 +159,142 @@ std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
     item.raw["platform"] = platform;
     auto ms = plugin->GetMediaSource(item, QualityKey::kStandard, error);
     return ms ? ms->url : std::string{};
+}
+
+std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
+                                            const std::string& id,
+                                            std::string* error) {
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) {
+        if (error) *error = "MusicFree 管理器未初始化";
+        return std::nullopt;
+    }
+    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
+    if (!plugin || !plugin->IsMounted()) {
+        if (error) *error = "找不到音源「" + platform + "」";
+        return std::nullopt;
+    }
+    MusicItem item;
+    item.id = id;
+    item.platform = platform;
+    item.raw = nlohmann::json::object();
+    item.raw["id"] = id;
+    item.raw["platform"] = platform;
+    auto ms = plugin->GetMediaSource(item, QualityKey::kStandard, error);
+    if (!ms) return std::nullopt;
+    return *ms;
+}
+
+bool DownloadTrackFile(const std::wstring& url, const std::filesystem::path& path,
+                       std::string* error) {
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) {
+        if (error) *error = "MusicFree 管理器未初始化";
+        return false;
+    }
+    if (url.empty()) {
+        if (error) *error = "播放地址为空，无法下载";
+        return false;
+    }
+    if (path.empty()) {
+        if (error) *error = "未指定保存路径";
+        return false;
+    }
+
+    // 下载与写盘都放在调用方的工作线程里（音乐窗就是这么用的），这里只做同步 IO。
+    std::vector<std::uint8_t> bytes;
+    try {
+        bytes = DownloadBinary(WideToUtf8(url), mgr->network());
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    } catch (...) {
+        if (error) *error = "下载时发生未知错误";
+        return false;
+    }
+
+    // 用 _wfopen/_wremove 直接吃宽路径：目标目录常含中文，走 std::ofstream 在某些
+    // 区域设置下会把路径按 ANSI 降级成 '?'。
+    const std::wstring native = path.wstring();
+    FILE* file = _wfopen(native.c_str(), L"wb");
+    if (!file) {
+        if (error) *error = "无法写入文件：" + WideToUtf8(native);
+        return false;
+    }
+    const size_t written =
+        bytes.empty() ? 0 : std::fwrite(bytes.data(), 1, bytes.size(), file);
+    const bool size_ok = written == bytes.size();
+    std::fclose(file);
+    if (!size_ok) {
+        _wremove(native.c_str());  // 半截文件比没有文件更糟，直接清掉。
+        if (error) *error = "写入文件时字节数不完整（磁盘空间不足？）";
+        return false;
+    }
+    return true;
+}
+
+// ---- 下载落点的取名规则 ----------------------------------------------------
+//
+// 这三段逻辑原本只长在音乐窗里；播放列表的「下载歌曲」也要用同一套命名，所以提到
+// 这里共用，免得两处各写一份、行为慢慢分叉。
+
+std::wstring SanitizeFileName(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (const wchar_t ch : text) {
+        if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' || ch == L'?' ||
+            ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|' || ch < 0x20)
+            out.push_back(L'_');
+        else
+            out.push_back(ch);
+    }
+    // 结尾的空格和点会被资源管理器直接吞掉（或拒绝创建），先剪干净。
+    while (!out.empty() && (out.back() == L' ' || out.back() == L'.'))
+        out.pop_back();
+    return out.empty() ? std::wstring(L"未命名曲目") : out;
+}
+
+std::wstring GuessExtension(const std::wstring& url) {
+    std::wstring path = url;
+    const size_t query = path.find_first_of(L"?#");
+    if (query != std::wstring::npos) path.erase(query);
+    const size_t dot = path.find_last_of(L'.');
+    const size_t slash = path.find_last_of(L'/');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
+        return L".mp3";
+    std::wstring extension = path.substr(dot);
+    if (extension.size() > 6) return L".mp3";
+    for (wchar_t& ch : extension) ch = static_cast<wchar_t>(towlower(ch));
+    for (const wchar_t* known : {L".mp3", L".flac", L".m4a", L".aac", L".wav",
+                                L".ogg", L".wma"})
+        if (extension == known) return extension;
+    return L".mp3";
+}
+
+std::wstring DefaultDownloadName(const std::string& title,
+                                 const std::string& artist,
+                                 const std::wstring& url) {
+    const std::wstring wide_title = Utf8ToWide(title);
+    const std::wstring wide_artist = Utf8ToWide(artist);
+    std::wstring name;
+    if (!wide_artist.empty() && !wide_title.empty())
+        name = wide_artist + L" - " + wide_title;
+    else
+        name = wide_title.empty() ? wide_artist : wide_title;
+    return SanitizeFileName(name) + GuessExtension(url);
+}
+
+std::filesystem::path DefaultDownloadDirectory() {
+    wchar_t profile[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH) == 0) return {};
+    const std::filesystem::path home(profile);
+    for (const wchar_t* name : {L"Music", L"音乐", L"我的音乐"}) {
+        std::error_code error;
+        const auto candidate = home / name;
+        if (std::filesystem::is_directory(candidate, error) && !error)
+            return candidate;
+    }
+    return home;
 }
 
 } // namespace ttplayer::musicfree

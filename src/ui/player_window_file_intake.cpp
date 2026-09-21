@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -1439,9 +1440,62 @@ void PlayerWindow::RunMusicFreeSelfTest(const std::string& query) {
         musicfree::TraceDiagnostic("MF_SELFTEST", "end 播放地址转码失败");
         return;
     }
+
+    // 可选：把解析出来的地址真的下一遍，验证「下载」这条链路（右键菜单 / 「下载」
+    // 按钮走的就是 musicfree::DownloadTrackFile）。设了环境变量才跑，免得每次都
+    // 拖一个几 MB 的文件。产物落在 %TEMP%，文件名固定，便于脚本核对。
+    wchar_t flag[8]{};
+    if (GetEnvironmentVariableW(L"TTPLAYER_MF_SELFTEST_DOWNLOAD", flag, 8) != 0) {
+        wchar_t temp[MAX_PATH]{};
+        const DWORD length = GetTempPathW(MAX_PATH, temp);
+        if (length == 0) {
+            musicfree::TraceDiagnostic("MF_SELFTEST_DOWNLOAD", "取临时目录失败");
+        } else {
+            const std::filesystem::path target =
+                std::filesystem::path(std::wstring(temp, length)) /
+                L"ttplayer_mf_download_test.mp3";
+            std::string download_error;
+            const bool ok =
+                musicfree::DownloadTrackFile(wide_url, target, &download_error);
+            std::string report = std::string("ok=") + (ok ? "1" : "0") +
+                "\npath=" + core::WideToUtf8(target.native()) +
+                "\nerror=" + download_error;
+            if (ok) {
+                std::error_code size_error;
+                const auto size = std::filesystem::file_size(target, size_error);
+                if (!size_error)
+                    report += "\nbytes=" + std::to_string(size);
+            }
+            musicfree::TraceDiagnostic("MF_SELFTEST_DOWNLOAD", report);
+        }
+    }
+
     const bool committed = AddOnlineTrack(hit, wide_url, false);
     musicfree::TraceDiagnostic("MF_SELFTEST",
         std::string("end committed=") + (committed ? "1" : "0"));
+
+    // 播放列表右键的「下载歌曲」不是直接调 DownloadTrackFile，而是先按元数据袋
+    // 认出「这是一条在线条目」（Platform + SongId），再弹另存为、后台下载。把识别
+    // 那一步单独从刚入列的条目读回来验一遍，并核对默认文件名/落点用的是音源元数据
+    // 而不是 CDN 地址末段。
+    if (!committed) return;
+    const auto& list = playlists_.At(index);
+    if (list.Tracks().empty()) return;
+    const auto& stored = list.Tracks().back();
+    std::string platform;
+    std::string song_id;
+    const bool online = OnlineTrackIdentity(stored, &platform, &song_id);
+    const std::wstring stored_url = stored.path.wstring();
+    const std::wstring default_name =
+        musicfree::DefaultDownloadName(stored.title, stored.artist, stored_url);
+    musicfree::TraceDiagnostic("MF_SELFTEST_IDENTITY",
+        std::string("online=") + (online ? "1" : "0") +
+        "\nplatform=" + platform +
+        "\nsong_id=" + song_id +
+        "\npath_is_http=" + (stored_url.rfind(L"http", 0) == 0 ? "1" : "0") +
+        "\ndefault_name=" + core::WideToUtf8(default_name) +
+        "\ndefault_dir=" +
+            core::WideToUtf8(musicfree::DefaultDownloadDirectory().wstring()));
 }
 
 void PlayerWindow::OpenCommandLinePath(const std::filesystem::path& path,

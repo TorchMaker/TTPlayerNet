@@ -802,4 +802,16 @@ std::string DownloadText(const std::string& url, const NetworkConfig& cfg) {
     return std::string(r.body.begin(), r.body.end());
 }
 
+std::vector<std::uint8_t> DownloadBinary(
+    const std::string& url, const NetworkConfig& cfg,
+    const std::map<std::string, std::string>& headers) {
+    std::wstring wurl = ToWide(url);
+    HttpResponse r = WinHttpBlocking(wurl, false, {}, headers, cfg);
+    if (r.status < 200 || r.status >= 300)
+        throw std::runtime_error("下载失败，HTTP " + std::to_string(r.status));
+    if (r.body.empty())
+        throw std::runtime_error("下载结果为空（服务器返回 0 字节）");
+    return r.body;
+}
+
 } // namespace ttplayer::musicfree

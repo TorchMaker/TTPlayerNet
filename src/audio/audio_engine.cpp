@@ -10,6 +10,7 @@
 #include "ttplayer/audio/mp3pro_source.h"
 #include "ttplayer/audio/legacy_windows_source.h"
 #include "ttplayer/audio/pcm_output_transform.h"
+#include "ttplayer/audio/http_stream_source.h"
 #include "ttplayer/audio/replay_gain_policy.h"
 #include "ttplayer/audio/replay_gain_scanner.h"
 #include "ttplayer/audio/winamp_dsp.h"
@@ -1140,7 +1141,7 @@ std::unique_ptr<DecodedAudioSource> MakeBaseSource(
     // AddIn creators expect SHCreateStreamOnFileEx and must never intercept
     // values such as https://host/song.flac or http://host/song.ape.
     if (AudioEngine::IsNetworkMediaLocation(path))
-        return std::make_unique<MediaFoundationSource>(ttpcomm);
+        return std::make_unique<HttpStreamSource>(ttpcomm);
     const auto extension = LowerExtension(path);
     if (extension == L".cda") return std::make_unique<CdaSource>();
     // FUN_004CBC1F walks registered creators before every built-in fallback.

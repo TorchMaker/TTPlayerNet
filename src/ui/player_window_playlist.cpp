@@ -7,6 +7,7 @@
 #include "modern_file_dialog.h"
 
 #include "ttplayer/core/text.h"
+#include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/ui/dialog_history_policy.h"
 #include "ttplayer/ui/playlist_catalog_reorder.h"
 #include "ttplayer/ui/playlist_drag_completion.h"
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -5340,13 +5342,49 @@ bool PlayerWindow::HandlePlaylistCommand(UINT command) {
         return true;
     }
     if (command == kPlaylistOnlineSearch) {
-        auto address = ResourceText(0x8298);
-        while (!address.empty() && address.back() == L'/') address.pop_back();
-        if (!address.empty())
-            address += L"/lrcsearch.html?f=client-search";
-        if (!address.empty())
-            ShellExecuteW(playlist_window_, L"open", address.c_str(), nullptr,
-                          nullptr, SW_SHOWNORMAL);
+        // 原版这里 ShellExecute 打开 qianqian.com 的歌词搜索页（0x8298 + /lrcsearch）。
+        // 重建版不再跳浏览器：改成在 MusicFree 音乐窗里按「歌手 - 歌名」直接搜
+        // 已导入的在线音源，搜到就能试听/下载。
+        //
+        // 关键词的行来源按「选中行 → 焦点行 → 正在播放的行」依次回退，任何一种
+        // 情况下右键都能得到有意义的关键词，而不是打开一个空搜索框。
+        std::optional<size_t> row;
+        if (!playlist_selected_rows_.empty())
+            row = *playlist_selected_rows_.begin();
+        if (!row) row = playlist_selection_;
+        if (!row) row = VisiblePlaylistPlayingRow();
+
+        std::wstring query;
+        if (row) {
+            if (const auto* track = VisiblePlaylistTrack(*row)) {
+                std::wstring title = core::Utf8ToWide(track->title);
+                const std::wstring artist = core::Utf8ToWide(track->artist);
+                // 本地条目的标题有时就是文件名（"01 告白气球.mp3"），扩展名会
+                // 直接毁掉搜索命中率，先剪掉。
+                const size_t dot = title.find_last_of(L'.');
+                if (dot != std::wstring::npos && title.size() - dot <= 5) {
+                    std::wstring extension = title.substr(dot);
+                    for (wchar_t& ch : extension)
+                        ch = static_cast<wchar_t>(towlower(ch));
+                    for (const wchar_t* known : {L".mp3", L".flac", L".m4a",
+                                                L".aac", L".wav", L".ogg",
+                                                L".wma", L".ape", L".tak"})
+                        if (extension == known) { title.erase(dot); break; }
+                }
+                if (title.empty()) {
+                    // 标签为空时退到文件名主干，至少还有东西可搜。
+                    title = track->path.stem().wstring();
+                }
+                query = artist.empty() ? title : (title.empty() ? artist
+                                                                : artist + L" - " + title);
+            }
+        }
+        // 关键词会原样填进音乐窗的搜索框并立即搜索；行号与关键词都记一条，
+        // 便于核对「点的是哪一行、搜的是什么」，不必靠截图判断。
+        musicfree::TraceDiagnostic("ONLINE_SEARCH",
+            std::string("row=") + (row ? std::to_string(*row) : std::string("-")) +
+            "\nquery=" + core::WideToUtf8(query));
+        ShowMusicFreeBrowserWindow(query);
         return true;
     }
     if (command == kPlaylistConvert) {

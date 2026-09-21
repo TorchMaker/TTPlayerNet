@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <future>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -403,6 +404,38 @@ private:
     [[nodiscard]] bool AddOnlineTrack(const musicfree::OnlineSearchHit& hit,
                                       const std::wstring& resolved_url,
                                       bool start_playback);
+    // 从条目的元数据袋里取出在线身份（音源平台 + 歌曲 id）。AddOnlineTrack 入列时
+    // 会把这两个键写进去；普通本地文件没有它们，返回 false 即「不是在线条目」。
+    [[nodiscard]] static bool OnlineTrackIdentity(
+        const playlist::Track& track, std::string* platform, std::string* song_id);
+    // 播放列表右键「下载歌曲」：在线条目走这条（另存为 → 后台下载 → 完成消息）。
+    // 返回 false 表示这条不是在线条目，调用方继续走原来的「无可用下载后端」提示。
+    [[nodiscard]] bool StartOnlineTrackDownload(const playlist::Track& track);
+    // 后台线程把结果 PostMessage 回来后的收尾：join、显示结果、释放负载。
+    bool HandleOnlineDownloadComplete(LPARAM payload);
+    // MusicFree getMediaSource 的「本地优先」在 TTPlayer 的等价物：给定一条在线条目
+    // （path 是 CDN 地址），返回一个可以直接交给原生解码器的本地文件路径。
+    //   - 条目本来就是本地文件（path 非 http）→ 原样返回 true；
+    //   - 否则先查会话内缓存（之前解析/下载记下的本地路径），再扫默认下载目录里
+    //     匹配「平台:歌曲id」或默认文件名的副本；命中且文件还存在就返回 true；
+    //   - 都没有本地副本返回 false（调用方应走 StartOnlineTrackResolveAndPlay 现拉）。
+    [[nodiscard]] static bool ResolveOnlineTrackLocalCopy(
+        const playlist::Track& track, std::filesystem::path& out_local);
+    // 在线条目没有本地副本时：后台线程按音源平台+歌曲 id 重新解析播放地址并落盘到
+    // 缓存，完成后发 kMsgOnlinePlayResolved 让 UI 线程重选同一行真正播放。
+    void StartOnlineTrackResolveAndPlay(size_t playlist_index, size_t row,
+                                        const playlist::Track& track);
+    // kMsgOnlinePlayResolved 的收尾：取出解析结果，重选同一行触发 PlayCurrent。
+    bool HandleOnlinePlayResolved(LPARAM payload);
+    // 在线曲目流式播放时顺手把地址落盘到本地缓存（不重选、不阻塞播放），下次重播
+    // 优先命中本地副本；下载失败（需自定义头 / HLS 切片流）静默跳过，流式不受影响。
+    void StartOnlineTrackBackgroundCache(const playlist::Track& track,
+                                         const std::string& resolved_url,
+                                         const std::map<std::string, std::string>& headers,
+                                         const std::string& user_agent);
+    // 打开/前置 MusicFree 音乐窗，接线皮肤与拖动吸附宿主回调。
+    // query 非空时音乐窗会预填该关键词并立即搜索（「在线搜索当前曲目」用）。
+    void ShowMusicFreeBrowserWindow(const std::wstring& query);
     void HandleDroppedFiles(FileDropSurface surface, IDataObject* data,
                             DWORD key_state, POINTL point, DWORD* effect);
     [[nodiscard]] DWORD FileDropEffect(FileDropSurface surface,

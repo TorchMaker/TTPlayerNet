@@ -14,6 +14,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <cwctype>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -21,18 +24,25 @@
 #include <vector>
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <windowsx.h>
 
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
+#include "ttplayer/musicfree/musicfree_frame.h"
 #include "ttplayer/musicfree/musicfree_import_dialog.h"
 #include "ttplayer/musicfree/musicfree_source_manager.h"
+#include "ttplayer/musicfree/musicfree_theme.h"
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/skin/skin_frame.h"
 
 namespace ttplayer::musicfree {
 
 namespace {
+
+// 调色板与基本图元（填充/描边/圆角框/文字/字体）都在共用主题里，音乐窗与导入窗
+// 共用同一套，免得两处各画一份风格漂移。
+using namespace theme;
 
 constexpr int kIdPlatform = 3001;
 constexpr int kIdQuery = 3002;
@@ -43,35 +53,44 @@ constexpr int kIdPlay = 3006;
 constexpr int kIdClose = 3007;
 constexpr int kIdStatus = 3008;
 constexpr int kIdEnqueue = 3009;
+constexpr int kIdDownload = 3010;
+
+// 结果列表右键菜单的命令号（TrackPopupMenu 返回值，不是窗口命令）。
+constexpr int kMenuPlay = 4001;
+constexpr int kMenuEnqueue = 4002;
+constexpr int kMenuDownload = 4003;
+constexpr int kMenuCopyTitle = 4004;
 
 constexpr UINT kMsgSearchDone = WM_APP + 0x510;
 constexpr UINT kMsgResolveDone = WM_APP + 0x511;
+// 下载是两段式的：先解析地址（kMsgDownloadReady），用户确认落盘位置后再拉字节
+// （kMsgDownloadDone）。扩展名要从解析出来的地址推断，所以不能颠倒。
+constexpr UINT kMsgDownloadReady = WM_APP + 0x512;
+constexpr UINT kMsgDownloadDone = WM_APP + 0x513;
 
 // 皮肤包没有 <browser_window> 时使用的兜底窗口尺寸。
 constexpr int kFallbackWidth = 720;
 constexpr int kFallbackHeight = 462;
 
+// 窗口缩放：可抓取的边框厚度，以及最小尺寸的上下限。
+//
+// 最小尺寸默认取皮肤背景位图的自然尺寸 —— 窗口小于位图时 skin::DrawFrameBackground
+// 会退化成「整幅 1:1 缩放」（见该函数的守卫），边框与标题栏会被拉变形。把最小尺寸
+// 钉在自然尺寸上，边框就永远保持原始像素厚度，窗口只往大变（拖内是无效的，和任何
+// 已到最小尺寸的普通窗口一样）。皮肤自然尺寸特别大时用上限兜一下，免得小屏上窗口
+// 一开就顶到边。
+//
+// ★ 抓取带厚度统一取 frame::kResizeBand（自检也用同一个值，不会各自漂移）。
+// 必须小于皮肤左右/上下边框厚度，否则会把内容区（尤其是列表右侧的滚动条）的
+// 点击抢走。实测内置皮肤的边框：左 8px、右 9px、上 31px、下 31px。
+constexpr int kResizeBorder = frame::kResizeBand;
+constexpr int kMinTrackWidthCap = 640;   // 宽度不再随缩放变化，仅作超大皮肤的兜底上限
+constexpr int kMinTrackHeightCap = 260;  // 高度允许缩小到的下限
+constexpr int kMaxTrackHeightCap = 1600; // 高度允许放大的上限（拖动只改高度）
+
 constexpr int kRowHeight = 22;
 constexpr int kButtonHeight = 22;
 constexpr int kColumnCount = 5;
-
-// 内容区是皮肤里的白色面板（原版在此嵌了一个 IE 视图），所以控件走浅色配色，
-// 与深色框体形成原版那样的对比。
-constexpr COLORREF kPanel = RGB(255, 255, 255);
-constexpr COLORREF kAccent = RGB(38, 134, 163);
-constexpr COLORREF kAccentHot = RGB(56, 162, 194);
-constexpr COLORREF kAccentDown = RGB(26, 104, 128);
-constexpr COLORREF kOutline = RGB(198, 212, 220);
-constexpr COLORREF kOutlineHot = RGB(142, 172, 188);
-constexpr COLORREF kText = RGB(38, 54, 62);
-constexpr COLORREF kSubtleText = RGB(118, 134, 142);
-constexpr COLORREF kDisabledText = RGB(176, 188, 194);
-constexpr COLORREF kRowAlternate = RGB(247, 251, 253);
-constexpr COLORREF kRowHot = RGB(232, 244, 250);
-constexpr COLORREF kRowSelected = RGB(206, 231, 244);
-constexpr COLORREF kRowSeparator = RGB(238, 243, 246);
-constexpr COLORREF kHeaderFill = RGB(238, 245, 248);
-constexpr COLORREF kHeaderSeparator = RGB(214, 228, 236);
 
 // 框体上可命中的皮肤按钮。
 enum FrameHit {
@@ -83,7 +102,8 @@ enum FrameHit {
     kFrameHitTopMost,
 };
 
-// 框体自绘部分的位置（客户区坐标）。皮肤有效时取自 <browser_window>，
+// 框体自绘部分的位置（当前客户区坐标）。皮肤有效时由 frame::Map 把
+// <browser_window> 的位图坐标换算过来（窗口缩放后按钮右锚定、底部行下锚定），
 // 否则按兜底尺寸推算。
 struct FrameLayout {
     bool skinned{};
@@ -95,10 +115,16 @@ struct FrameLayout {
     RECT check_box{};
     RECT check_label{};
     RECT link_text{};
+    // 皮肤形态的换算结果（九宫格拉伸区、背景绘制、窗口区域都要用同一份）。
+    frame::Metrics skin{};
+    // 兜底外框的分区（标题栏 / 标题文字 / 页脚 …）。导航簇与标题文字的互不重叠
+    // 由 theme::BuildFrameChrome 保证；皮肤形态下不使用。
+    theme::FrameChrome chrome{};
     // 搜索输入框的外描边。EDIT 自带的是系统凹陷边（WM_CTLCOLOREDIT 只换得了
     // 底色，换不掉那圈 3D 边），所以把边框改成自己画在子控件下面的一像素圆角线。
     RECT query_field{};
 };
+
 
 // 子控件回调上下文。四个按钮和一个结果列表都需要 hover 高亮，而 Win32 不会把子控件
 // 上的鼠标移动转给父窗口，因此统一挂一层子类化回调。
@@ -121,6 +147,7 @@ struct BrowserState {
     HWND list{};
     HWND play_button{};
     HWND enqueue_button{};
+    HWND download_button{};
     MusicFreeSourceManager* mgr{};
     BrowserWindowHost host;
     // 返回 true 表示播放器已接受该请求（已入列/已开始播放）。
@@ -130,9 +157,19 @@ struct BrowserState {
     // 搜索/解析同一时刻只允许一个后台任务，避免插件沙箱被并发重入。
     std::atomic<bool> busy{false};
     std::wstring query_pending;  // 供后台线程读取的搜索条件（UI 线程写、任务启动前定格）
+    // 首次创建时要预填并立即搜索的关键词。来自「在线搜索当前曲目」：以前那个命令
+    // 会 ShellExecute 打开 qianqian.com，现在改成在音乐窗里按歌名搜。
+    std::wstring initial_query;
     FrameLayout layout;
     bool top_most{};
     bool dragging{};
+    // 重入保护：ApplyFrameMetrics 里的 SetWindowPos 会同步投递 WM_SIZE，
+    // 处理 WM_SIZE 又会回头调用 ApplyFrameMetrics。
+    bool applying_frame{};
+    // 用户是否手动调过窗口大小。调过之后换肤就不再回到皮肤位图尺寸。
+    bool user_resized{};
+    // 鼠标是否停在可缩放的边框上（WM_NCHITTEST 会返回 HTLEFT/HTBOTTOMRIGHT…）。
+    bool resizing{};
     int frame_hover{};
     int frame_pressed{};
     int hot_button{};
@@ -163,6 +200,16 @@ struct ResolvePayload {
     OnlineSearchHit hit;
     std::wstring url;
     std::wstring error;
+};
+
+// 下载线程 → UI 线程的负载。「解析播放地址」也在这个线程里做：下载必须等地址
+// 解析出来，分两步走只会让 busy 标志在两次切换之间出现空窗。
+struct DownloadPayload {
+    OnlineSearchHit hit;
+    std::wstring path;    // 目标文件（用户在选择框里确认过的路径）
+    std::wstring error;
+    std::int64_t bytes{};
+    bool ok{};
 };
 
 std::shared_ptr<BrowserState> g_browser;
@@ -201,6 +248,7 @@ void SetBusyUi(BrowserState* state, bool busy) {
     if (state->search_button) EnableWindow(state->search_button, !busy);
     if (state->play_button) EnableWindow(state->play_button, !busy);
     if (state->enqueue_button) EnableWindow(state->enqueue_button, !busy);
+    if (state->download_button) EnableWindow(state->download_button, !busy);
     if (state->import_button) EnableWindow(state->import_button, !busy);
     InvalidateFrame(state);
 }
@@ -228,26 +276,10 @@ const skin::BrowserSkin* ActiveSkin(const BrowserState* state) {
 
 COLORREF FrameTransparent(const BrowserState* state,
                           const skin::BrowserSkin& browser) {
-    if (browser.transparent_color != CLR_INVALID) return browser.transparent_color;
-    if (const skin::LegacySkin* legacy = ActiveLegacySkin(state))
-        return legacy->TransparentColor();
-    return RGB(255, 0, 255);
+    return frame::TransparentColor(ActiveLegacySkin(state), browser);
 }
 
 // ------------------------------------------------------------------ 字体
-
-HFONT MakeFont(int height, int weight, const wchar_t* face) {
-    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
-}
-
-HFONT CreateUiFont(int height, int weight) {
-    // 中文界面优先用雅黑；CreateFontW 在字体缺失时会自动替换，无需探测。
-    HFONT font = MakeFont(height, weight, L"Microsoft YaHei UI");
-    if (!font) font = MakeFont(height, weight, L"Tahoma");
-    return font;
-}
 
 void EnsureFonts(BrowserState* state) {
     if (!state) return;
@@ -278,67 +310,14 @@ void DiscardFonts(BrowserState* state) {
     }
 }
 
-// ------------------------------------------------------------- 绘图工具
-
-void FillSolidRect(HDC dc, const RECT& rect, COLORREF color) {
-    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-    const HBRUSH brush = CreateSolidBrush(color);
-    FillRect(dc, &rect, brush);
-    DeleteObject(brush);
-}
-
-void StrokeSolidRect(HDC dc, const RECT& rect, COLORREF color) {
-    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-    const HBRUSH brush = CreateSolidBrush(color);
-    FrameRect(dc, &rect, brush);
-    DeleteObject(brush);
-}
-
-void DrawRoundedBox(HDC dc, const RECT& rect, COLORREF fill, COLORREF border,
-                    int radius) {
-    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-    const HBRUSH brush = CreateSolidBrush(fill);
-    const bool outlined = border != CLR_INVALID;
-    const HPEN pen = outlined ? CreatePen(PS_SOLID, 1, border)
-                              : static_cast<HPEN>(GetStockObject(NULL_PEN));
-    const HGDIOBJ old_brush = SelectObject(dc, brush);
-    const HGDIOBJ old_pen = SelectObject(dc, pen);
-    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-    SelectObject(dc, old_brush);
-    SelectObject(dc, old_pen);
-    DeleteObject(brush);
-    if (outlined) DeleteObject(pen);
-}
-
-void DrawTextIn(HDC dc, const RECT& rect, const wchar_t* text, COLORREF color,
-                HFONT font, UINT format) {
-    if (!text || !*text) return;
-    const HGDIOBJ old_font = font ? SelectObject(dc, font) : nullptr;
-    const COLORREF old_color = SetTextColor(dc, color);
-    const int old_mode = SetBkMode(dc, TRANSPARENT);
-    RECT bounds = rect;
-    DrawTextW(dc, text, -1, &bounds, format);
-    SetBkMode(dc, old_mode);
-    SetTextColor(dc, old_color);
-    if (old_font) SelectObject(dc, old_font);
-}
-
-constexpr UINT kLabelFormat = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+// ------------------------------------------------------------------ 命中测试
 
 bool HitTest(const RECT& rect, POINT point) {
-    return rect.right > rect.left && rect.bottom > rect.top &&
-           PtInRect(&rect, point) != FALSE;
+    return theme::HitRect(rect, point);
 }
+
 
 // ------------------------------------------------------------------ 布局
-
-RECT InsetCopy(RECT rect, int dx, int dy) {
-    rect.left += dx;
-    rect.right -= dx;
-    rect.top += dy;
-    rect.bottom -= dy;
-    return rect;
-}
 
 // 内容区顶部那条工具行：音源下拉 + 关键词输入 + 搜索 / 导入。布局与绘制共用同一份
 // 计算，免得描边和子控件位置漂移。
@@ -367,26 +346,23 @@ ToolbarLayout BuildToolbarLayout(const RECT& content) {
     return layout;
 }
 
-// 皮肤有效时窗口尺寸就是背景位图尺寸，框体元素直接使用皮肤坐标；否则按兜底尺寸
+// 皮肤有效时窗口的自然尺寸就是背景位图尺寸，框体元素按 frame::Map 由位图坐标换算
+// 到当前客户区（窗口缩放后内容区变大、按钮右锚定、底部行下锚定）；否则按兜底尺寸
 // 推算一条与皮肤风格相近的边框。
 FrameLayout BuildFrameLayout(const RECT& client,
                              const skin::BrowserSkin* browser) {
     FrameLayout layout;
     if (browser) {
         layout.skinned = true;
-        layout.content = browser->content_bounds;
-        if (layout.content.right <= layout.content.left ||
-            layout.content.bottom <= layout.content.top)
-            layout.content = InsetCopy(client, 8, 31);
-        layout.close = browser->close.bounds;
-        layout.prev_source = browser->backward.bounds;
-        layout.next_source = browser->forward.bounds;
-        layout.refresh = browser->refresh.bounds;
-        layout.check_box = browser->check.bounds;
-        layout.check_label = layout.check_box;
-        layout.check_label.left = layout.check_box.right + 5;
-        layout.check_label.right = layout.check_label.left + 56;
-        layout.link_text = browser->link.bounds;
+        layout.skin = frame::Map(client, *browser);
+        layout.content = layout.skin.content;
+        layout.close = layout.skin.close;
+        layout.prev_source = layout.skin.backward;
+        layout.next_source = layout.skin.forward;
+        layout.refresh = layout.skin.refresh;
+        layout.check_box = layout.skin.check_box;
+        layout.check_label = layout.skin.check_label;
+        layout.link_text = layout.skin.link;
         layout.query_field = BuildToolbarLayout(layout.content).query;
         return layout;
     }
@@ -394,11 +370,14 @@ FrameLayout BuildFrameLayout(const RECT& client,
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     const int pad = 10;
-    layout.content = {pad, 30, width - pad, height - 30};
-    layout.close = {width - pad - 24, 6, width - pad, 24};
-    layout.prev_source = {pad, 7, pad + 22, 23};
-    layout.next_source = {pad + 24, 7, pad + 46, 23};
-    layout.refresh = {pad + 48, 7, pad + 70, 23};
+    // 标题栏 / 内容面板 / 页脚三段，以及右对齐的导航簇（音源 ◀ ▶ 重新搜索 ✕）。
+    // 标题文字区域由 BuildFrameChrome 裁到导航簇左侧，不会和按钮重叠。
+    layout.chrome = theme::BuildFrameChrome(client, pad, 30, 30);
+    layout.content = layout.chrome.content;
+    layout.close = layout.chrome.close;
+    layout.prev_source = layout.chrome.prev_source;
+    layout.next_source = layout.chrome.next_source;
+    layout.refresh = layout.chrome.refresh;
     layout.check_box = {pad, height - 26, pad + 13, height - 13};
     layout.check_label = {pad + 18, height - 27, pad + 86, height - 12};
     layout.link_text = {width - pad - 230, height - 27, width - pad, height - 12};
@@ -455,6 +434,8 @@ void LayoutChildren(BrowserState* state) {
     MoveWindow(state->play_button, inner_left, buttons_y, 92, kButtonHeight, TRUE);
     MoveWindow(state->enqueue_button, inner_left + 98, buttons_y, 108,
                kButtonHeight, TRUE);
+    MoveWindow(state->download_button, inner_left + 212, buttons_y, 70,
+               kButtonHeight, TRUE);
 
     const int list_top = status_y + 20;
     const int list_bottom = std::max(list_top + 40, buttons_y - 8);
@@ -468,41 +449,72 @@ void ApplyFrameRegion(BrowserState* state) {
     if (!state || !state->hwnd) return;
     const skin::BrowserSkin* browser = ActiveSkin(state);
     if (!browser) {
+        // 兜底框是规则矩形，不需要区域。
         SetWindowRgn(state->hwnd, nullptr, TRUE);
         return;
     }
     RECT client{};
     GetClientRect(state->hwnd, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    HRGN region = skin::CreateFrameRegion(browser->background, {}, width, height,
-                                          false,
-                                          FrameTransparent(state, *browser));
-    RECT bounds{};
-    if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
-        !SetWindowRgn(state->hwnd, region, TRUE)) {
-        if (region) DeleteObject(region);
-    }
+    // 区域必须和背景用同一份九宫格映射，否则拉伸之后透明边角会对不上。
+    frame::ApplyWindowRegion(state->hwnd, *browser, state->layout.skin, client,
+                             FrameTransparent(state, *browser));
 }
 
-// 运行期更换皮肤后重新贴合外框尺寸、区域与控件位置。
-void ApplyFrameSize(BrowserState* state) {
-    if (!state || !state->hwnd || !IsWindow(state->hwnd)) return;
-    const skin::BrowserSkin* browser = ActiveSkin(state);
-    int width = kFallbackWidth;
-    int height = kFallbackHeight;
-    if (browser && browser->background.size.cx > 0 &&
-        browser->background.size.cy > 0) {
-        width = browser->background.size.cx;
-        height = browser->background.size.cy;
+// 外框的自然尺寸：皮肤背景位图尺寸；没有皮肤时用兜底尺寸。
+SIZE NaturalFrameSize(const BrowserState* state) {
+    SIZE size{kFallbackWidth, kFallbackHeight};
+    if (const skin::BrowserSkin* browser = ActiveSkin(state)) {
+        if (browser->background.size.cx > 0 && browser->background.size.cy > 0)
+            size = browser->background.size;
     }
+    return size;
+}
+
+// 允许的最小尺寸。宽度锁定在自然位图宽度，高度允许在 [下限, 上限] 内随拖拽变化。
+//
+// ★ 宽度钉死在自然位图宽度：低于它 skin::DrawFrameBackground 会退化成整幅 1:1 缩放、
+// 标题栏变形；高于它标题栏被横向拉糊、按钮错位。两端都钉在同一宽度上，窗口宽度
+// 永远不变。高度则放开上下限，内容区随之下移/拉伸（标题栏与底栏始终保持原始像素）。
+SIZE MinFrameSize(const BrowserState* state) {
+    const SIZE natural = NaturalFrameSize(state);
+    SIZE size{};
+    size.cx = natural.cx;  // 宽度锁定：始终等于皮肤自然宽度
+    size.cy = std::clamp<int>(natural.cy, kMinTrackHeightCap, kMaxTrackHeightCap);
+    return size;
+}
+
+// 换肤 / 缩放后的统一收尾：窗口区域 + 子控件位置 + 重画。
+// reset_size 为 true 时把窗口拉回自然尺寸（只在皮肤变化需要重贴合时用）；
+// 否则保留用户当前的尺寸，只做最小尺寸夹取 —— 音乐窗的宽高因此是「活的」，
+// 不再每次唤出都被写死的位图尺寸覆盖。
+void ApplyFrameMetrics(BrowserState* state, bool reset_size) {
+    if (!state || !state->hwnd || !IsWindow(state->hwnd)) return;
+    if (state->applying_frame) return;
+    state->applying_frame = true;
+
     RECT current{};
     GetWindowRect(state->hwnd, &current);
-    SetWindowPos(state->hwnd, nullptr, current.left, current.top, width, height,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
+    const SIZE natural = NaturalFrameSize(state);
+    const SIZE minimum = MinFrameSize(state);
+    int width = reset_size ? natural.cx : current.right - current.left;
+    int height = reset_size ? natural.cy : current.bottom - current.top;
+    width = std::max<int>(width, minimum.cx);
+    height = std::max<int>(height, minimum.cy);
+    if (width != current.right - current.left ||
+        height != current.bottom - current.top) {
+        // 尺寸变化会同步投递 WM_SIZE；下面重排一次即可，不必依赖那条消息。
+        SetWindowPos(state->hwnd, nullptr, 0, 0, width, height,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    RECT client{};
+    GetClientRect(state->hwnd, &client);
+    state->layout = BuildFrameLayout(client, ActiveSkin(state));
     ApplyFrameRegion(state);
     LayoutChildren(state);
     InvalidateRect(state->hwnd, nullptr, TRUE);
+
+    state->applying_frame = false;
 }
 
 // --------------------------------------------------------------- 框体绘制
@@ -515,44 +527,17 @@ int FrameButtonState(const BrowserState* state, int hit, bool enabled = true) {
 }
 
 void PaintFallbackFrame(BrowserState* state, HDC dc, const RECT& client) {
+    (void)client;
     const FrameLayout& layout = state->layout;
-    FillSolidRect(dc, client, RGB(248, 251, 252));
-
-    const RECT title{client.left + 1, client.top + 1, client.right - 1,
-                     layout.content.top};
-    FillSolidRect(dc, title, kAccent);
-    DrawTextIn(dc, InsetCopy(title, 10, 0), L"音乐窗 · MusicFree",
-               RGB(255, 255, 255), state->bold_font, kLabelFormat);
-
-    const bool close_hot = state->frame_hover == kFrameHitClose;
-    if (close_hot) FillSolidRect(dc, layout.close, kAccentDown);
-    DrawTextIn(dc, layout.close, L"✕",
-               close_hot ? RGB(255, 255, 255) : RGB(206, 232, 240),
-               state->ui_font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-    const struct { RECT rect; const wchar_t* glyph; int hit; } navigation[] = {
-        {layout.prev_source, L"◀", kFrameHitPrevSource},
-        {layout.next_source, L"▶", kFrameHitNextSource},
-        {layout.refresh, L"⟳", kFrameHitRefresh},
-    };
-    for (const auto& item : navigation) {
-        const bool hot = state->frame_hover == item.hit;
-        if (hot) FillSolidRect(dc, item.rect, kAccentDown);
-        DrawTextIn(dc, item.rect, item.glyph,
-                   hot ? RGB(255, 255, 255) : RGB(206, 232, 240),
-                   state->ui_font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-
-    RECT panel = layout.content;
-    panel.top -= 4;
-    panel.left -= 2;
-    panel.right += 2;
-    StrokeSolidRect(dc, panel, kOutline);
-
-    const RECT footer{client.left + 1, panel.bottom, client.right - 1,
-                      client.bottom - 1};
-    FillSolidRect(dc, footer, RGB(240, 246, 248));
-    StrokeSolidRect(dc, client, kOutline);
+    // 分区与外观都交给共用主题；这里只负责把当前 hover/pressed 状态翻成按钮帧号。
+    // FrameButtonState 的 0..3 与 theme::ButtonState 同序（常态/热/按下/禁用）。
+    theme::ChromeStates states;
+    states.close = FrameButtonState(state, kFrameHitClose);
+    states.prev_source = FrameButtonState(state, kFrameHitPrevSource);
+    states.next_source = FrameButtonState(state, kFrameHitNextSource);
+    states.refresh = FrameButtonState(state, kFrameHitRefresh, !state->busy.load());
+    theme::PaintFrameChrome(dc, layout.chrome, L"音乐窗 · MusicFree",
+                            state->bold_font, state->ui_font, states);
 }
 
 void PaintCheckBox(BrowserState* state, HDC dc, const skin::BrowserSkin* browser) {
@@ -586,20 +571,20 @@ void PaintFrame(BrowserState* state, HDC dc) {
     if (!browser) {
         PaintFallbackFrame(state, dc, client);
     } else {
-        const int width = client.right - client.left;
-        const int height = client.bottom - client.top;
-        skin::DrawFrameBackground(dc, browser->background, {}, width, height, false);
+        // 九宫格铺满客户区：边框 / 标题栏 / 页脚保持原始像素，只有内容区随窗口
+        // 变大，所以放大之后的框体和原尺寸下看起来是同一套像素。
+        frame::PaintBackground(dc, *browser, state->layout.skin, client);
         const COLORREF transparent = FrameTransparent(state, *browser);
         const bool busy = state->busy.load();
-        skin::DrawFrameButton(dc, browser->close, browser->close.bounds,
+        skin::DrawFrameButton(dc, browser->close, state->layout.close,
                               FrameButtonState(state, kFrameHitClose), transparent);
-        skin::DrawFrameButton(dc, browser->backward, browser->backward.bounds,
+        skin::DrawFrameButton(dc, browser->backward, state->layout.prev_source,
                               FrameButtonState(state, kFrameHitPrevSource),
                               transparent);
-        skin::DrawFrameButton(dc, browser->forward, browser->forward.bounds,
+        skin::DrawFrameButton(dc, browser->forward, state->layout.next_source,
                               FrameButtonState(state, kFrameHitNextSource),
                               transparent);
-        skin::DrawFrameButton(dc, browser->refresh, browser->refresh.bounds,
+        skin::DrawFrameButton(dc, browser->refresh, state->layout.refresh,
                               FrameButtonState(state, kFrameHitRefresh, !busy),
                               transparent);
     }
@@ -630,6 +615,7 @@ ButtonVisual ButtonVisualFor(const BrowserState* state, int id) {
         case kIdImport: return {L"导入…", false, !busy};
         case kIdPlay: return {L"播放所选", true, !busy};
         case kIdEnqueue: return {L"添加到列表", false, !busy};
+        case kIdDownload: return {L"下载", false, !busy};
         default: return {nullptr, false, true};
     }
 }
@@ -637,33 +623,20 @@ ButtonVisual ButtonVisualFor(const BrowserState* state, int id) {
 void DrawOwnerButton(BrowserState* state, const DRAWITEMSTRUCT& item) {
     const ButtonVisual visual = ButtonVisualFor(state, static_cast<int>(item.CtlID));
     if (!visual.text) return;
-    RECT rect = item.rcItem;
     const bool hover = state->hot_button == static_cast<int>(item.CtlID);
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const bool enabled = visual.enabled && (item.itemState & ODS_DISABLED) == 0;
-
-    COLORREF fill{};
-    COLORREF border = CLR_INVALID;
-    COLORREF label{};
-    if (!enabled) {
-        fill = RGB(238, 243, 245);
-        border = kOutline;
-        label = kDisabledText;
-    } else if (visual.primary) {
-        fill = pressed ? kAccentDown : (hover ? kAccentHot : kAccent);
-        label = RGB(255, 255, 255);
-    } else {
-        fill = pressed ? RGB(226, 238, 244) : (hover ? RGB(242, 249, 252) : kPanel);
-        border = hover ? kOutlineHot : kOutline;
-        label = hover ? kAccent : kText;
-    }
+    const int button_state = !enabled ? theme::kButtonDisabled
+        : (pressed ? theme::kButtonPressed
+                   : (hover ? theme::kButtonHot : theme::kButtonNormal));
 
     FillSolidRect(item.hDC, item.rcItem, kPanel);
+    RECT rect = item.rcItem;
     InflateRect(&rect, -1, -1);
-    DrawRoundedBox(item.hDC, rect, fill, border, 6);
-    DrawTextIn(item.hDC, rect, visual.text, label,
-               visual.primary ? state->bold_font : state->ui_font,
-               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    // 走共用主题：导入窗的按钮用的是同一个 PanelButtonSkin，两处外观必然一致。
+    theme::PaintButton(item.hDC, rect, visual.text,
+                       visual.primary ? state->bold_font : state->ui_font,
+                       theme::PanelButtonSkin(visual.primary, button_state));
 }
 
 // ------------------------------------------------- 结果列表自绘（行绘制）
@@ -920,6 +893,161 @@ void StartResolve(BrowserState* state, OnlineTrackAction action) {
     }).detach();
 }
 
+// ------------------------------------------------------------ 下载 / 右键菜单
+//
+// 文件名的清洗与默认目录规则（SanitizeFileName / GuessExtension /
+// DefaultDownloadName / DefaultDownloadDirectory）已经提到 musicfree_app 里，
+// 播放列表的「下载歌曲」用同一套，两边不会再各写一份。
+
+bool CopyTextToClipboard(HWND owner, const std::wstring& text) {
+    if (text.empty()) return false;
+    if (!OpenClipboard(owner)) return false;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL block = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    bool ok = false;
+    if (block) {
+        if (void* target = GlobalLock(block)) {
+            memcpy(target, text.c_str(), bytes);
+            GlobalUnlock(block);
+            ok = SetClipboardData(CF_UNICODETEXT, block) != nullptr;
+        }
+        if (!ok) GlobalFree(block);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+int SelectedRow(BrowserState* state) {
+    if (!state || !state->list) return -1;
+    const int row = ListView_GetNextItem(state->list, -1, LVNI_SELECTED);
+    if (row < 0 || static_cast<size_t>(row) >= state->hits.size()) return -1;
+    return row;
+}
+
+// 下载的第一步：解析播放地址。地址解析出来后才弹「另存为」，因为文件扩展名
+// 要从地址推断（音源返回的 url 通常是 .mp3/.flac/.m4a）。
+void StartDownload(BrowserState* state) {
+    if (!state) return;
+    const int index = SelectedRow(state);
+    if (index < 0) {
+        SetStatus(state, L"请先在上方列表中选择一首歌曲");
+        return;
+    }
+    if (state->busy.exchange(true)) {
+        SetStatus(state, L"正在处理上一个请求…");
+        return;
+    }
+    const OnlineSearchHit hit = state->hits[static_cast<size_t>(index)];
+    SetBusyUi(state, true);
+    SetStatus(state, L"正在解析下载地址：" + Utf8ToWideString(hit.title) + L" …");
+
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::thread([weak, hit] {
+        auto* payload = new ResolvePayload();
+        payload->action = OnlineTrackAction::play;  // 此路径只做解析，不使用该字段
+        payload->hit = hit;
+        try {
+            std::string error;
+            const std::string url = ResolvePlayUrl(hit.platform, hit.id, &error);
+            payload->url = core::Utf8ToWide(url);
+            payload->error = core::Utf8ToWide(error);
+        } catch (const std::exception& e) {
+            payload->error = core::Utf8ToWide(e.what());
+        } catch (...) {
+        }
+        auto state = weak.lock();
+        if (!state) { delete payload; return; }
+        if (!PostMessageW(state->hwnd, kMsgDownloadReady, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 下载的第二步：用户确认落盘位置后真正拉取字节。
+void BeginDownloadToFile(BrowserState* state, const OnlineSearchHit& hit,
+                         const std::wstring& url, const std::wstring& path) {
+    SetStatus(state, L"正在下载：" + Utf8ToWideString(hit.title) + L" …");
+    const std::wstring wide_url = url;
+    const std::wstring target = path;
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::thread([weak, hit, wide_url, target] {
+        auto* payload = new DownloadPayload();
+        payload->hit = hit;
+        payload->path = target;
+        try {
+            std::string error;
+            payload->ok = DownloadTrackFile(wide_url, std::filesystem::path(target),
+                                            &error);
+            if (!payload->ok) payload->error = core::Utf8ToWide(error);
+            else {
+                std::error_code size_error;
+                const auto size = std::filesystem::file_size(target, size_error);
+                if (!size_error) payload->bytes = static_cast<std::int64_t>(size);
+            }
+        } catch (const std::exception& e) {
+            payload->error = core::Utf8ToWide(e.what());
+        } catch (...) {
+        }
+        auto state = weak.lock();
+        if (!state) { delete payload; return; }
+        if (!PostMessageW(state->hwnd, kMsgDownloadDone, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 结果列表右键菜单。列表本身是自绘的，菜单用系统弹出菜单（文件对话框同理）——
+// 这两处是系统级 UI，逐项自绘的收益不如保持一致。
+void ShowResultContextMenu(BrowserState* state, POINT screen) {
+    if (!state || !state->list) return;
+    POINT client = screen;
+    ScreenToClient(state->list, &client);
+    LVHITTESTINFO info{};
+    info.pt = client;
+    const int row = ListView_HitTest(state->list, &info);
+    if (row < 0) return;  // 空白处右键不弹菜单
+
+    ListView_SetItemState(state->list, -1, 0, LVIS_SELECTED);
+    ListView_SetItemState(state->list, row,
+                          LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    SetFocus(state->list);
+    if (static_cast<size_t>(row) >= state->hits.size()) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, kMenuPlay, L"播放");
+    AppendMenuW(menu, MF_STRING, kMenuEnqueue, L"添加到列表");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuDownload, L"下载到…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuCopyTitle, L"复制歌曲名");
+    if (state->busy.load()) {
+        for (const UINT command : {static_cast<UINT>(kMenuPlay),
+                                   static_cast<UINT>(kMenuEnqueue),
+                                   static_cast<UINT>(kMenuDownload)})
+            EnableMenuItem(menu, command, MF_BYCOMMAND | MF_GRAYED);
+    }
+    const int command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+        screen.x, screen.y, 0, state->hwnd, nullptr);
+    DestroyMenu(menu);
+    switch (command) {
+        case kMenuPlay: StartResolve(state, OnlineTrackAction::play); break;
+        case kMenuEnqueue: StartResolve(state, OnlineTrackAction::enqueue); break;
+        case kMenuDownload: StartDownload(state); break;
+        case kMenuCopyTitle: {
+            const std::wstring text = ListItemText(state->list, row, 1);
+            SetStatus(state, CopyTextToClipboard(state->hwnd, text)
+                ? L"已复制歌曲名：" + text
+                : L"复制到剪贴板失败");
+            break;
+        }
+        default: break;
+    }
+}
+
 // 切换音源（框体上的 ◀ / ▶）。只有关键词非空时才顺带重搜，避免空查询报错。
 void StepPlatform(BrowserState* state, int delta) {
     if (!state || !state->platform) return;
@@ -957,6 +1085,66 @@ int FrameHitTest(const BrowserState* state, POINT point) {
     if (HitTest(layout.check_box, point) || HitTest(layout.check_label, point))
         return kFrameHitTopMost;
     return kFrameHitNone;
+}
+
+// 鼠标落在窗口边框上时返回对应的 HT*，落在别处返回 HTCLIENT。
+//
+// 窗口是 WS_POPUP，没有系统边框可以拖，缩放完全靠 WM_NCHITTEST 自己报。注意
+// **框体按钮必须先判**：默认皮肤里关闭按钮右边缘离窗口右边只有 6 像素，缩放带
+// 会把它抢走，点关闭就变成拉伸了。
+//
+// 真正的几何判定在 frame::ResizeHitCode（纯算术、可被自检直接调用），这里只负责
+// 取当前客户区尺寸。见该函数上方关于「不要按最小尺寸屏蔽某条边」的说明。
+int ResizeHitTest(BrowserState* state, POINT point) {
+    RECT client{};
+    GetClientRect(state->hwnd, &client);
+    const SIZE size{client.right - client.left, client.bottom - client.top};
+    return frame::ResizeHitCode(size, kResizeBorder, point);
+}
+
+// ------------------------------------------------------- 缩放带自检（诊断）
+//
+// 缩放带失效时**没有任何视觉提示** —— 只是鼠标到了边上不变形，靠肉眼很难定位，
+// 以前只能反复手动去拖。这里把「鼠标落在四个边 / 四个角 / 内容区中心时分别拿到
+// 哪个 HT*」直接写进 trace。
+//
+// 判定顺序和 WM_NCHITTEST 保持一致：**框体按钮优先于缩放带**（关闭按钮右边缘
+// 距窗口右边只有 6px，两者会争抢同一条带）。被按钮抢走的位置标 (button)。
+void TraceResizeBands(BrowserState* state) {
+    if (!state || !state->hwnd || !IsWindow(state->hwnd)) return;
+    RECT client{};
+    GetClientRect(state->hwnd, &client);
+    const LONG width = client.right - client.left;
+    const LONG height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) return;
+    const LONG inset = kResizeBorder / 2;  // 探针落在带**内**，不是压在边界线上
+    struct Probe {
+        const char* name;
+        POINT point;
+    };
+    const Probe probes[] = {
+        {"left", {inset, height / 2}},
+        {"right", {width - 1 - inset, height / 2}},
+        {"top", {width / 2, inset}},
+        {"bottom", {width / 2, height - 1 - inset}},
+        {"top_left", {inset, inset}},
+        {"top_right", {width - 1 - inset, inset}},
+        {"bottom_left", {inset, height - 1 - inset}},
+        {"bottom_right", {width - 1 - inset, height - 1 - inset}},
+        {"content", {width / 2, height / 2}},
+    };
+    std::string detail = "client=" + std::to_string(width) + "x" +
+                         std::to_string(height) +
+                         " band=" + std::to_string(kResizeBorder);
+    for (const Probe& probe : probes) {
+        const int frame_hit = FrameHitTest(state, probe.point);
+        const int code = frame_hit != kFrameHitNone
+                             ? HTCLIENT
+                             : ResizeHitTest(state, probe.point);
+        detail += std::string("\n") + probe.name + "=" + frame::HitCodeName(code) +
+                  (frame_hit != kFrameHitNone ? " (button)" : "");
+    }
+    TraceDiagnostic("BROWSER_RESIZE_HIT", detail);
 }
 
 void SetTopMost(BrowserState* state, bool top_most) {
@@ -1108,6 +1296,15 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
                 return 0;
             }
             break;
+        case WM_CONTEXTMENU:
+            // ListView 不会把右键上下文菜单消息转发给父窗口，
+            // 这里显式转给 BrowserProc，由它统一弹「播放/下载」菜单。
+            if (state && state->hwnd) {
+                LRESULT handled = SendMessageW(state->hwnd, WM_CONTEXTMENU,
+                                               wparam, lparam);
+                if (handled) return handled;
+            }
+            break;
         case WM_NCDESTROY:
             // 上下文由 BrowserState::probes 持有；这里只是摘掉反向引用。
             SetWindowLongPtrW(control, GWLP_USERDATA, 0);
@@ -1152,7 +1349,9 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
         case WM_CREATE: {
             if (!state) return -1;
             state->panel_brush = CreateSolidBrush(kPanel);
-            state->link_text = L"◀ ▶ 切换音源　⟳ 重新搜索";
+            // 底部提示行：告诉用户在线结果可以直接下载（右键菜单与「下载」按钮
+            // 走的是同一条路径）。提示文字不用符号字符，界面字体没有那些字形。
+            state->link_text = L"右键结果可下载";
 
             state->platform = CreateWindowW(L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST | WS_TABSTOP,
@@ -1179,6 +1378,10 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             state->enqueue_button = CreateWindowW(L"BUTTON", L"添加到列表",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdEnqueue), nullptr,
+                nullptr);
+            state->download_button = CreateWindowW(L"BUTTON", L"下载",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdDownload), nullptr,
                 nullptr);
             state->status = CreateWindowW(L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
@@ -1212,14 +1415,22 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             TrackControl(state, state->import_button, kIdImport, false);
             TrackControl(state, state->play_button, kIdPlay, false);
             TrackControl(state, state->enqueue_button, kIdEnqueue, false);
+            TrackControl(state, state->download_button, kIdDownload, false);
             TrackControl(state, state->query, kIdQuery, false);
             TrackControl(state, state->list, kIdList, true);
 
             RefreshPlatformCombo(state);
-            ApplyFrameSize(state);
+            // 保留创建时给定的尺寸（可能是用户上次调好的大小），只做最小尺寸夹取。
+            ApplyFrameMetrics(state, false);
             SetStatus(state,
                 L"输入关键词后回车或点「搜索」。音源需要先通过「导入…」添加。");
             SetFocus(state->query);
+            // 「在线搜索当前曲目」这类入口会带一个初始关键词进来：填进输入框并
+            // 立即搜索，省得用户再手敲一遍歌名。
+            if (!state->initial_query.empty()) {
+                SetWindowTextW(state->query, state->initial_query.c_str());
+                StartSearch(state);
+            }
             return 0;
         }
         case WM_MEASUREITEM: {
@@ -1280,8 +1491,57 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
         }
         case WM_ERASEBKGND:
             return 1;
-        case WM_NCHITTEST:
-            return HTCLIENT;
+        case WM_NCHITTEST: {
+            if (!state) return HTCLIENT;
+            // WM_NCHITTEST 的坐标是屏幕坐标，必须先转成客户区。
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ScreenToClient(hwnd, &point);
+            // 框体按钮优先于缩放带（关闭按钮离右边缘只有几个像素）。
+            if (FrameHitTest(state, point) != kFrameHitNone) return HTCLIENT;
+            return ResizeHitTest(state, point);
+        }
+        case WM_GETMINMAXINFO: {
+            if (!state) break;
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            const SIZE minimum = MinFrameSize(state);
+            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.y = minimum.cy;
+            // 宽度钉死：最小 == 最大 == 自然宽度，横向彻底不可缩放（避免标题栏被拉糊）。
+            // 高度不约束上限，保留默认的「随拖拽长高」能力。
+            info->ptMaxTrackSize.x = minimum.cx;
+            return 0;
+        }
+        case WM_SIZE: {
+            // 缩放时跟着重排：内容区、右侧锚定的框体按钮、底部行都要按新客户区
+            // 重新算一遍，窗口区域也要同步（否则拉伸后的边角会被旧掩码裁掉）。
+            if (wparam != SIZE_MINIMIZED) {
+                ApplyFrameMetrics(state, false);
+                // 记住「用户调过大小」——换肤时就不再强行拉回新皮肤的自然尺寸。
+                if (state && !state->applying_frame) {
+                    const SIZE natural = NaturalFrameSize(state);
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    if (client.right - client.left != natural.cx ||
+                        client.bottom - client.top != natural.cy)
+                        state->user_resized = true;
+                }
+            }
+            return 0;
+        }
+        case WM_EXITSIZEMOVE: {
+            // 拖动缩放结束：再对齐一次并把新的宽高一并记进设置，下次打开就是
+            // 用户选的大小（不再被位图尺寸写死）。
+            ApplyFrameMetrics(state, false);
+            if (state && state->host.store_bounds) {
+                RECT bounds{};
+                GetWindowRect(hwnd, &bounds);
+                if (bounds.right > bounds.left && bounds.bottom > bounds.top)
+                    state->host.store_bounds(bounds);
+            }
+            // 缩放带跟着新客户区走，顺便把四条边的命中结果留一份证据。
+            TraceResizeBands(state);
+            return 0;
+        }
         case WM_SETCURSOR: {
             if (reinterpret_cast<HWND>(wparam) != hwnd || LOWORD(lparam) != HTCLIENT)
                 break;
@@ -1359,6 +1619,9 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                 case kIdEnqueue:
                     StartResolve(state, OnlineTrackAction::enqueue);
                     return 0;
+                case kIdDownload:
+                    StartDownload(state);
+                    return 0;
                 case kIdImport: {
                     // 音源集合在导入时会被改写，而搜索线程正在遍历插件表；
                     // 两者不能并发，否则可能出现悬垂指针。
@@ -1368,7 +1631,9 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                     }
                     // 导入对话框自带模态消息循环；导入完成后音源集合可能变化，
                     // 因此回到这里要重建音源下拉框。
-                    ShowMusicFreeImportDialog(hwnd, state->mgr);
+                    // 皮肤来源直接转交音乐窗自己的 host.skin：导入窗因此和音乐窗
+                    // 用同一个框体（同尺寸、同背景位图、同关闭按钮）。
+                    ShowMusicFreeImportDialog(hwnd, state->mgr, state->host.skin);
                     RefreshPlatformCombo(state);
                     if (state->mgr) {
                         const size_t count = state->mgr->ListPlugins().size();
@@ -1491,6 +1756,97 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                 ? L"已加入播放列表：" + label : L"正在播放…");
             return 0;
         }
+        case kMsgDownloadReady: {
+            auto* payload = reinterpret_cast<ResolvePayload*>(lparam);
+            if (!state || !payload) { delete payload; return 0; }
+            const OnlineSearchHit hit = std::move(payload->hit);
+            const std::wstring url = std::move(payload->url);
+            const std::wstring reason = std::move(payload->error);
+            delete payload;
+            if (url.empty()) {
+                state->busy.store(false);
+                SetBusyUi(state, false);
+                std::wstring text = L"下载失败：该音源没有返回可播放地址";
+                if (!reason.empty()) text += L"（" + reason + L"）";
+                SetStatus(state, text);
+                return 0;
+            }
+            // 解析出来的地址决定文件扩展名，所以「另存为」必须放在这一步之后。
+            const std::wstring name = DefaultDownloadName(hit.title, hit.artist, url);
+            const auto directory = DefaultDownloadDirectory();
+            std::wstring initial = directory.empty()
+                ? name : (directory / name).wstring();
+            std::wstring buffer(initial.size() + 64, L'\0');
+            std::copy(initial.begin(), initial.end(), buffer.begin());
+            const std::wstring directory_text = directory.wstring();
+
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = state->hwnd;
+            ofn.lpstrFilter =
+                L"音频文件\0*.mp3;*.flac;*.m4a;*.aac;*.wav;*.ogg;*.wma\0"
+                L"所有文件\0*.*\0";
+            ofn.lpstrFile = buffer.data();
+            ofn.nMaxFile = static_cast<DWORD>(buffer.size());
+            ofn.lpstrInitialDir = directory_text.empty()
+                ? nullptr : directory_text.c_str();
+            // OFN_NOCHANGEDIR 很关键：不设的话公共对话框会把进程当前目录改掉，
+            // 而播放器是按进程当前目录找资源的。
+            ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (!GetSaveFileNameW(&ofn)) {
+                state->busy.store(false);
+                SetBusyUi(state, false);
+                SetStatus(state, L"已取消下载");
+                return 0;
+            }
+            BeginDownloadToFile(state, hit, url, buffer.c_str());
+            return 0;
+        }
+        case kMsgDownloadDone: {
+            auto* payload = reinterpret_cast<DownloadPayload*>(lparam);
+            if (!state || !payload) { delete payload; return 0; }
+            const DownloadPayload result = std::move(*payload);
+            delete payload;
+            state->busy.store(false);
+            SetBusyUi(state, false);
+            const std::wstring title = Utf8ToWideString(result.hit.title);
+            if (!result.ok) {
+                std::wstring text = L"下载失败：" + title;
+                if (!result.error.empty()) text += L"（" + result.error + L"）";
+                SetStatus(state, text);
+                return 0;
+            }
+            // 保留一位小数的 MB，不引 printf：字节 / 1MiB 的十分之一。
+            const std::int64_t tenths = (result.bytes * 10 + 524288) / 1048576;
+            const std::wstring size = std::to_wstring(tenths / 10) + L"." +
+                std::to_wstring(tenths % 10) + L" MB";
+            SetStatus(state, L"已下载 " + title + L"（" + size + L"）→ " +
+                             result.path);
+            try {
+                TraceDiagnostic("DOWNLOADED",
+                    "platform=" + result.hit.platform +
+                    "\ntitle=" + result.hit.title +
+                    "\nartist=" + result.hit.artist +
+                    "\nbytes=" + std::to_string(result.bytes) +
+                    "\npath=" + core::WideToUtf8(result.path));
+            } catch (const std::exception&) {
+            }
+            return 0;
+        }
+        case WM_CONTEXTMENU: {
+            if (!state) break;
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            // 键盘唤出（VK_APPS / Shift+F10）时坐标为 (-1,-1)，用列表左上角附近
+            // 作为默认落点；命中测试拿不到行时不会弹菜单。
+            if (point.x == -1 && point.y == -1) {
+                if (!state->list) break;
+                RECT bounds{};
+                GetWindowRect(state->list, &bounds);
+                point = {bounds.left + 40, bounds.top + 40};
+            }
+            ShowResultContextMenu(state, point);
+            return 0;
+        }
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
@@ -1592,14 +1948,18 @@ void CloseMusicFreeBrowser() {
 }
 
 void RefreshMusicFreeBrowserFrame() {
-    if (g_browser && g_browser->hwnd) ApplyFrameSize(g_browser.get());
+    if (!g_browser || !g_browser->hwnd) return;
+    // 换肤时只有「用户从没调过大小」才回到新皮肤的自然尺寸；用户手动拉大过就
+    // 保留他的尺寸，否则每换一次皮肤窗口尺寸都会被重置。
+    ApplyFrameMetrics(g_browser.get(), !g_browser->user_resized);
 }
 
 void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
                           BrowserWindowHost host,
                           std::function<bool(OnlineTrackAction,
                                              const OnlineSearchHit&,
-                                             const std::wstring&)> on_track) {
+                                             const std::wstring&)> on_track,
+                          const std::wstring& initial_query) {
     // 已存在则只做前置、刷新音源与宿主，保持单一音乐窗。
     if (g_browser && g_browser->hwnd && IsWindow(g_browser->hwnd)) {
         if (on_track) g_browser->on_track = std::move(on_track);
@@ -1609,9 +1969,17 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
         if (g_browser->top_most != g_browser->host.top_most)
             SetTopMost(g_browser.get(), g_browser->host.top_most);
         RefreshPlatformCombo(g_browser.get());
-        ApplyFrameSize(g_browser.get());
+        // 唤出已存在的窗口时**不再**把尺寸拉回皮肤位图尺寸：窗口现在可以缩放，
+        // 用户上次调好的宽高要留着，这里只重排一次。
+        ApplyFrameMetrics(g_browser.get(), false);
         ShowWindow(g_browser->hwnd, SW_SHOWNORMAL);
         SetForegroundWindow(g_browser->hwnd);
+        // 带着关键词再次唤出（例如在播放列表里对另一首歌再点一次「在线搜索」）：
+        // 覆盖输入框并重新搜索，而不是让用户对着旧结果发呆。
+        if (!initial_query.empty()) {
+            SetWindowTextW(g_browser->query, initial_query.c_str());
+            StartSearch(g_browser.get());
+        }
         return;
     }
 
@@ -1623,32 +1991,61 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
     state->host = std::move(host);
     state->on_track = std::move(on_track);
     state->top_most = state->host.top_most;
+    state->initial_query = initial_query;
     g_browser = state;
 
-    const skin::BrowserSkin* browser = ActiveSkin(state.get());
-    int width = kFallbackWidth;
-    int height = kFallbackHeight;
-    if (browser && browser->background.size.cx > 0 &&
-        browser->background.size.cy > 0) {
-        width = browser->background.size.cx;
-        height = browser->background.size.cy;
-    }
+    const SIZE natural = NaturalFrameSize(state.get());
+    const SIZE minimum = MinFrameSize(state.get());
+    int width = natural.cx;
+    int height = natural.cy;
     RECT bounds = InitialBrowserBounds(owner, width, height);
     if (state->host.saved_bounds) {
         const RECT saved = state->host.saved_bounds();
         if (saved.right > saved.left && saved.bottom > saved.top) {
             bounds.left = saved.left;
             bounds.top = saved.top;
+            // 上次的**尺寸**也一起恢复（只夹到最小尺寸）：窗口能缩放之后，
+            // 每次唤出都回到皮肤位图尺寸就等于把用户调过的宽高丢了。
+            width = std::max<int>(saved.right - saved.left, minimum.cx);
+            height = std::max<int>(saved.bottom - saved.top, minimum.cy);
             bounds.right = saved.left + width;
             bounds.bottom = saved.top + height;
         }
     }
 
+    // 皮肤位图尺寸 = 想要的**客户区**尺寸。用 AdjustWindowRectEx 反算外框尺寸，
+    // 而不是直接把位图尺寸当外框尺寸传：只要窗口样式里混进了任何非客户区边框
+    // （例如 WS_EX_DLGMODALFRAME 会给 WS_POPUP 加 3px 边框），客户区就会比位图
+    // 小，从而触发 DrawFrameBackground 的「整幅缩放」退化分支 —— 外观上正是
+    // 「背景偏 / 被压扁」。当前用的是 WS_POPUP + WS_EX_TOOLWINDOW（delta=0），
+    // 这层换算只是防止以后有人改样式时静默退化的保险。
+    const DWORD frame_style = WS_POPUP;
+    const DWORD frame_ex_style = WS_EX_TOOLWINDOW;
+    RECT frame_rect{0, 0, width, height};
+    AdjustWindowRectEx(&frame_rect, frame_style, FALSE, frame_ex_style);
     const HWND hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW, kBrowserClass, L"音乐窗 · MusicFree", WS_POPUP,
-        bounds.left, bounds.top, width, height, owner, nullptr,
-        GetModuleHandleW(nullptr), state.get());
+        frame_ex_style, kBrowserClass, L"音乐窗 · MusicFree", frame_style,
+        bounds.left + frame_rect.left, bounds.top + frame_rect.top,
+        frame_rect.right - frame_rect.left, frame_rect.bottom - frame_rect.top,
+        owner, nullptr, GetModuleHandleW(nullptr), state.get());
     if (!hwnd) { g_browser.reset(); return; }
+
+    // 诊断：客户区必须正好等于皮肤背景位图尺寸，否则皮肤会被整幅压扁。
+    // 这是「音乐窗和导入窗外框是否真的像素一致」的可核对证据。
+    {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        TraceDiagnostic("BROWSER_FRAME_CLIENT",
+                        "client=" + std::to_string(client.right - client.left) + "x" +
+                            std::to_string(client.bottom - client.top) +
+                            " natural=" + std::to_string(natural.cx) + "x" +
+                            std::to_string(natural.cy) + " identical=" +
+                            ((client.right - client.left == natural.cx &&
+                              client.bottom - client.top == natural.cy)
+                                 ? "1"
+                                 : "0"));
+    }
+    TraceResizeBands(g_browser.get());
 
     if (g_browser->top_most)
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,

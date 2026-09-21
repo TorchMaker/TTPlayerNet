@@ -9,9 +9,11 @@
 #include "lyric_upload_window.h"
 
 #include "ttplayer/audio/cue_sheet.h"
+#include "ttplayer/audio/online_stream_descriptor.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/musicfree/musicfree_browser_window.h"
+#include "ttplayer/musicfree/musicfree_frame.h"
 #include "ttplayer/skin/skin_package.h"
 #include "ttplayer/ui/playback_track_state.h"
 #include "ttplayer/ui/media_library_playback.h"
@@ -2040,6 +2042,87 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     auto previous = std::move(skin_);
     ResetSkinControlAnimations();
     skin_.emplace(std::move(next));
+    // 诊断：确认 <browser_window> 段确实跟着 LegacySkin 一起搬了过来。
+    // LegacySkin 的 move 赋值是手写逐成员搬运，曾漏掉 browser_ —— 结果是音乐窗
+    // 永远拿不到皮肤段（ActiveSkin 返回 nullptr），退回自绘外框，而那个外框早期
+    // 把 ◀ ▶ ⟳ 摆在标题文字上，看起来就是「按钮和标题重叠 / 框盖住标题」。
+    // 这里把是否加载到段写进 trace，配合 --mf-selftest 从日志核对，不靠截图。
+    if (skin_) {
+        const auto& browser = skin_->Browser();
+        const std::string detail =
+            std::string("valid=") + (browser.valid ? "1" : "0") +
+            "\nbackground=" + std::to_string(browser.background.size.cx) + "x" +
+            std::to_string(browser.background.size.cy) +
+            "\ncontent=" + std::to_string(browser.content_bounds.left) + "," +
+            std::to_string(browser.content_bounds.top) + "," +
+            std::to_string(browser.content_bounds.right) + "," +
+            std::to_string(browser.content_bounds.bottom);
+        musicfree::TraceDiagnostic("BROWSER_SKIN", detail);
+        // 音乐窗可缩放（宽高不写死）依赖 frame::Map 把皮肤位图坐标换算到当前客户区。
+        // 这里把「自然尺寸」和「放大 220x160 之后」两套映射都算出来写进日志：
+        // 内容区应正好各长 +220/+160，标题栏关闭按钮应右移 +220 且宽度不变。
+        // 纯计算、无窗口，能在 --mf-selftest 里核对，不依赖 UI 驱动或截图。
+        if (browser.valid && browser.background.size.cx > 0) {
+            const LONG nw = browser.background.size.cx;
+            const LONG nh = browser.background.size.cy;
+            const auto natural = musicfree::frame::Map(RECT{0, 0, nw, nh}, browser);
+            const auto grown =
+                musicfree::frame::Map(RECT{0, 0, nw + 220, nh + 160}, browser);
+            const auto rect_text = [](const RECT& r) {
+                return std::to_string(r.left) + "," + std::to_string(r.top) + "," +
+                       std::to_string(r.right) + "," + std::to_string(r.bottom);
+            };
+            const std::string scale =
+                std::string("natural_client=") + std::to_string(nw) + "x" +
+                std::to_string(nh) +
+                "\nnatural_content=" + rect_text(natural.content) +
+                "\nnatural_close=" + rect_text(natural.close) +
+                "\ngrown_client=" + std::to_string(nw + 220) + "x" +
+                std::to_string(nh + 160) +
+                "\ngrown_content=" + rect_text(grown.content) +
+                "\ngrown_close=" + rect_text(grown.close) +
+                "\ncontent_delta=" +
+                std::to_string(grown.content.right - natural.content.right) + "," +
+                std::to_string(grown.content.bottom - natural.content.bottom) +
+                "\nclose_delta_x=" +
+                std::to_string(grown.close.left - natural.close.left) +
+                " close_width_kept=" +
+                ((grown.close.right - grown.close.left) ==
+                         (natural.close.right - natural.close.left)
+                     ? "1"
+                     : "0");
+            // 缩放带自检：宽度已锁定，鼠标移到左/右边与四个角时应拿到 HTCLIENT（不
+            // 缩放），只有上边 HTTOP / 下边 HTBOTTOM 可缩放，落在内容区才是 HTCLIENT。
+            // 这一段是纯算术（frame::ResizeHitCode），不依赖真的有窗口，所以「宽度被
+            // 意外放开、标题栏被拉糊」这类回归能在这里核对。
+            std::string scale_bands = std::string("band=") +
+                                      std::to_string(musicfree::frame::kResizeBand);
+            {
+                const SIZE size{nw, nh};
+                const int band = musicfree::frame::kResizeBand;
+                const int inset = band / 2;
+                struct BandProbe {
+                    const char* name;
+                    POINT point;
+                };
+                const BandProbe bands[] = {
+                    {"left", {inset, nh / 2}},
+                    {"right", {nw - 1 - inset, nh / 2}},
+                    {"top", {nw / 2, inset}},
+                    {"bottom", {nw / 2, nh - 1 - inset}},
+                    {"bottom_right", {nw - 1 - inset, nh - 1 - inset}},
+                    {"content", {nw / 2, nh / 2}},
+                };
+                for (const BandProbe& probe : bands) {
+                    scale_bands += std::string("\n") + probe.name + "=" +
+                                   musicfree::frame::HitCodeName(
+                                       musicfree::frame::ResizeHitCode(
+                                           size, band, probe.point));
+                }
+            }
+            musicfree::TraceDiagnostic("BROWSER_SKIN_SCALE", scale + "\n" + scale_bands);
+        }
+    }
     // Load the target configuration before presenting it. The old menu path
     // applied the package, repainted/recreated its controls, then loaded the
     // sidecar and applied everything again with a second set of HWNDs.
@@ -2807,6 +2890,17 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
     case kMsgApplyOptions:
         ApplyOptionsChangeMask(static_cast<UINT>(wparam), lparam);
         return 0;
+    case kMsgOnlineDownloadDone:
+        // 播放列表「下载歌曲」的后台线程完成通知（见
+        // player_window_playlist_network.cpp）。负载放在文件级全局里，这里只负责
+        // 显示结果；返回 true 表示消息已消费。
+        if (HandleOnlineDownloadComplete(lparam)) return 0;
+        break;
+    case detail::kMsgOnlinePlayResolved:
+        // 在线条目解析/下载完成：重选同一行真正播放（见
+        // player_window_playlist_network.cpp 的 StartOnlineTrackResolveAndPlay）。
+        if (HandleOnlinePlayResolved(lparam)) return 0;
+        break;
     case WM_COMMAND:
         if (HIWORD(wparam) == THBN_CLICKED) {
             HandleTaskbarPlaybackClick(wparam);
@@ -4902,6 +4996,49 @@ void PlayerWindow::ShowContextMenu(POINT screen_point, HWND origin) {
     PostMessageW(window_, WM_NULL, 0, 0);
 }
 
+// 打开（或前置）MusicFree 音乐窗。query 非空时音乐窗会把它填进搜索框并立即搜索。
+// 「查看 → 音乐窗」和播放列表右键的「在线搜索」都走这里，宿主回调（拖动吸附 /
+// 位置记忆 / 置顶持久化）只在这一处接线，免得两处各写一份慢慢漂移。
+void PlayerWindow::ShowMusicFreeBrowserWindow(const std::wstring& query) {
+    // 「在线搜索」不再 ShellExecute 打开 qianqian.com，而是在音乐窗内按关键词搜。
+    // 调用方（播放列表的「网上搜索」）已经把行号与关键词记进 ONLINE_SEARCH trace。
+    musicfree::BrowserWindowHost host;
+    host.skin = [this]() -> const skin::LegacySkin* {
+        return skin_ ? &*skin_ : nullptr;
+    };
+    host.begin_drag = [this](HWND source, POINT point) {
+        BeginSkinBackgroundDrag(source, point, kDragMove);
+    };
+    host.continue_drag = [this](HWND source, POINT point) {
+        ContinueSkinBackgroundDrag(source, point);
+    };
+    host.end_drag = [this](HWND) { EndSkinMouseCapture(); };
+    host.saved_bounds = [this]() { return settings_.player.browser_window; };
+    host.store_bounds = [this](const RECT& bounds) {
+        settings_.player.browser_window = bounds;
+    };
+    host.store_top_most = [this](bool top_most) {
+        settings_.player.browser_top_most = top_most;
+    };
+    host.on_closed = [this]() {
+        // 音乐窗自己关掉时主窗口收不到任何消息；重画一下让「音乐窗」按钮
+        // 的按下态跟着恢复。
+        if (window_) InvalidateRect(window_, nullptr, FALSE);
+    };
+    host.top_most = settings_.player.browser_top_most;
+    musicfree::ShowMusicFreeBrowser(window_, musicfree::AppMusicFreeManager(),
+        std::move(host),
+        [this](musicfree::OnlineTrackAction action,
+               const musicfree::OnlineSearchHit& hit,
+               const std::wstring& url) {
+            if (url.empty()) return false;
+            // 在线条目直接带着音源的标题/歌手/专辑入列；走 OpenPath 只会
+            // 让列表与标题栏显示成 CDN 地址的最后一段。
+            return AddOnlineTrack(hit, url,
+                action == musicfree::OnlineTrackAction::play);
+        }, query);
+}
+
 bool PlayerWindow::HandleContextCommand(UINT command, HWND fullscreen_origin) {
     if (OpenProjectLink(window_, command)) return true;
     if (HandleFullScreenCommand(command, fullscreen_origin ? fullscreen_origin :
@@ -5052,44 +5189,9 @@ bool PlayerWindow::HandleContextCommand(UINT command, HWND fullscreen_origin) {
             if (window_) InvalidateRect(window_, nullptr, FALSE);
             break;
         }
-        // 音乐窗会用皮肤包的 <browser_window> 段自绘外框（背景 + 关闭/换音源/
-        // 重新搜索/置顶 + 底部提示行），并通过下面这组宿主回调复用主窗口已有的
-        // 拖动吸附与位置记忆，和歌词窗、播放列表窗一样参与十像素磁吸与工作区约束。
-        musicfree::BrowserWindowHost host;
-        host.skin = [this]() -> const skin::LegacySkin* {
-            return skin_ ? &*skin_ : nullptr;
-        };
-        host.begin_drag = [this](HWND source, POINT point) {
-            BeginSkinBackgroundDrag(source, point, kDragMove);
-        };
-        host.continue_drag = [this](HWND source, POINT point) {
-            ContinueSkinBackgroundDrag(source, point);
-        };
-        host.end_drag = [this](HWND) { EndSkinMouseCapture(); };
-        host.saved_bounds = [this]() { return settings_.player.browser_window; };
-        host.store_bounds = [this](const RECT& bounds) {
-            settings_.player.browser_window = bounds;
-        };
-        host.store_top_most = [this](bool top_most) {
-            settings_.player.browser_top_most = top_most;
-        };
-        host.on_closed = [this]() {
-            // 音乐窗自己关掉时主窗口收不到任何消息；重画一下让「音乐窗」按钮
-            // 的按下态跟着恢复。
-            if (window_) InvalidateRect(window_, nullptr, FALSE);
-        };
-        host.top_most = settings_.player.browser_top_most;
-        musicfree::ShowMusicFreeBrowser(window_, musicfree::AppMusicFreeManager(),
-            std::move(host),
-            [this](musicfree::OnlineTrackAction action,
-                   const musicfree::OnlineSearchHit& hit,
-                   const std::wstring& url) {
-                if (url.empty()) return false;
-                // 在线条目直接带着音源的标题/歌手/专辑入列；走 OpenPath 只会
-                // 让列表与标题栏显示成 CDN 地址的最后一段。
-                return AddOnlineTrack(hit, url,
-                    action == musicfree::OnlineTrackAction::play);
-            });
+        // 宿主回调（皮肤、拖动吸附、位置记忆、置顶持久化）集中在
+        // ShowMusicFreeBrowserWindow 里，这里与「在线搜索」共用同一条入口。
+        ShowMusicFreeBrowserWindow({});
         break;
     }
     case kCmdOptions:
@@ -6157,7 +6259,53 @@ bool PlayerWindow::PlayCurrent() {
         RefreshPlaybackUi();
         return true;
     }
-    if (!audio_->Play(requested_track.path, requested_track.subtrack)) {
+    // 在线条目（path 是 CDN 地址）双路播放，复刻 MusicFree 的「本地优先 + 现拉流式」：
+    //   1) 命中本地副本 → 直接放本地文件（下次也走这条，零网络）。
+    //   2) 否则解析完整播放源（含自定义请求头），交给 HttpStreamSource 真正流式播放
+    //      （不落盘、边下边播）；同时后台把这首落盘到本地缓存，下一次就走第 1 路。
+    //   3) 解析失败 / 流式打开失败 → 回退到阻塞下载后本地播放（已验证的稳定路径）。
+    std::filesystem::path play_path = requested_track.path;
+    if (requested_track.path.wstring().rfind(L"http", 0) == 0) {
+        std::filesystem::path local;
+        if (ResolveOnlineTrackLocalCopy(requested_track, local)) {
+            play_path = local;
+            musicfree::TraceDiagnostic("PLAYLIST_PLAY_LOCAL",
+                "local=" + core::WideToUtf8(local.wstring()));
+        } else {
+            std::string platform, song_id;
+            std::optional<musicfree::MediaSource> src;
+            std::string err;
+            if (OnlineTrackIdentity(requested_track, &platform, &song_id) &&
+                (src = musicfree::ResolvePlayUrlEx(platform, song_id, &err))) {
+                const bool is_hls = src->url.size() >= 5 &&
+                    _stricmp(src->url.c_str() + src->url.size() - 5, ".m3u8") == 0;
+                audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{
+                    src->url, src->headers, src->user_agent, is_hls});
+                play_path = core::Utf8ToWide(src->url);  // 交给 HttpStreamSource 流式解码
+                // 播放的同时后台落盘到本地缓存：下次再点这条就走本地优先（零网络）。
+                StartOnlineTrackBackgroundCache(requested_track, src->url,
+                                                src->headers, src->user_agent);
+                musicfree::TraceDiagnostic("PLAYLIST_PLAY_STREAM",
+                    "url=" + src->url +
+                    " headers=" + std::to_string(src->headers.size()) +
+                    " hls=" + std::to_string(is_hls));
+            } else {
+                const size_t pi = playback_playlist_index
+                    ? *playback_playlist_index : playlists_.ActiveIndex();
+                StartOnlineTrackResolveAndPlay(pi, *current_, requested_track);
+                return true;  // 延迟到解析/下载完成后再真正播放
+            }
+        }
+    }
+    if (!audio_->Play(play_path, requested_track.subtrack)) {
+        // 流式打开失败（如 HLS 系统不支持、链接已失效）→ 回退阻塞下载后本地播放。
+        if (requested_track.path.wstring().rfind(L"http", 0) == 0 &&
+            play_path.wstring().rfind(L"http", 0) == 0) {
+            const size_t pi = playback_playlist_index
+                ? *playback_playlist_index : playlists_.ActiveIndex();
+            StartOnlineTrackResolveAndPlay(pi, *current_, requested_track);
+            return true;
+        }
         taskbar_preview_.Clear();
 #if !defined(TTPLAYER_LEGACY_WINDOWS)
         system_media_controls_.Clear();

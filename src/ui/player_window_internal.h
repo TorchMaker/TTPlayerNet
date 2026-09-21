@@ -182,6 +182,22 @@ constexpr UINT kCmdLibraryDownloadOptions = 0x0903;
 // lifecycle sentinel) in lParam.
 constexpr UINT kMsgApplyOptions = 0x7f0;
 constexpr UINT kMsgShowOptionsControl = 0x7f4;
+// Rebuild-only: 在线曲目下载完成（播放列表右键「下载歌曲」）。后台线程用它把结果
+// 送回 UI 线程，避免网络阻塞消息循环；负载放在 player_window_playlist_network.cpp
+// 的文件级全局里（同一时刻只允许一个下载），所以这里不带 lParam。
+constexpr UINT kMsgOnlineDownloadDone = WM_APP + 0x518;
+// 重建版：播放列表里的在线条目（path 是 CDN 地址，原生解码器打不开）在 PlayCurrent
+// 里走「本地优先解析」—— 已有本地副本就直接放本地文件；没有则后台按音源平台+歌曲
+// id 重新解析地址并落盘到缓存，落盘完成后用这条消息把结果送回 UI 线程，再重选同一行
+// 触发一次真正的播放。这就是 MusicFree getMediaSource「本地优先、否则现拉」在 TTPlayer
+// 里的等价实现（见 player_window_playlist_network.cpp）。负载是堆上的 PlayResolvedPayload*。
+constexpr UINT kMsgOnlinePlayResolved = WM_APP + 0x519;
+// kMsgOnlinePlayResolved 的堆负载：后台解析/下载完成后，把目标列表下标、行号带回 UI
+// 线程（行号在本会话内稳定，因为解析期间不会增删该列表）。
+struct PlayResolvedPayload {
+    size_t playlist_index;
+    size_t row;
+};
 constexpr UINT kCmdMiniMode = 0x7dd4;
 constexpr UINT kCmdShowElapsedTime = 0x7ddd;
 constexpr int kVisualControlId = 0x7ddc;

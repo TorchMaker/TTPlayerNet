@@ -17,8 +17,11 @@
 //
 // 安全：与歌词子系统一致，绝不禁用 TLS 校验。
 
+#include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // JSValue 在 quickjs-ng 中是指针 typedef，必须包含真实头文件而非前向声明。
 #include <quickjs.h>
@@ -39,5 +42,13 @@ JSValue CreateFetchGlobal(JSContext* ctx);
 
 // 下载文本（注册表 JSON / 插件 JS）。失败抛 std::runtime_error。
 std::string DownloadText(const std::string& url, const NetworkConfig& cfg);
+
+// 下载二进制资源（音频文件）的原始字节。与 DownloadText 走同一条 WinHTTP 链路
+// （自动跟随 301/302 重定向、走 NetworkConfig 里的代理与超时）。失败抛
+// std::runtime_error。之所以单独开一个返回 vector 而不是复用 DownloadText：
+// std::string 会把 0x00 字节当成终止符截断，音频里出现空字节是家常便饭。
+std::vector<std::uint8_t> DownloadBinary(const std::string& url,
+                                         const NetworkConfig& cfg,
+                                         const std::map<std::string, std::string>& headers = {});
 
 } // namespace ttplayer::musicfree

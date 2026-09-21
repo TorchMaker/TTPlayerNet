@@ -45,6 +45,8 @@ public:
 
     // 设置网络配置（用于下载与插件内 axios）。
     void SetNetworkConfig(NetworkConfig cfg) { network_ = std::move(cfg); }
+    // 读回当前网络配置：下载在线曲目（DownloadTrackFile）要走同一条代理/超时链路。
+    const NetworkConfig& network() const { return network_; }
     void SetAppVersion(std::string_view v) { app_version_ = v; }
 
     // 首次启动时把内置的纯 JS 依赖库（crypto-js/dayjs/qs/big-integer/he）复制到

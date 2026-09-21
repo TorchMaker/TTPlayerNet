@@ -68,11 +68,14 @@ struct BrowserWindowHost {
 //             url 为空表示解析失败，此时 hit 仍然有效，可用于提示文案。
 //             返回 true 表示请求已被接受（已入列或已开始播放），音乐窗据此
 //             显示成功/失败状态。回调为空时两个按钮只提示错误。
+//   initial_query: 可选的初始关键词。非空时，音乐窗会把它填进搜索框并立即搜索；
+//             窗口已存在时则覆盖当前关键词重新搜索（「在线搜索当前曲目」用）。
 void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
                           BrowserWindowHost host,
                           std::function<bool(OnlineTrackAction action,
                                              const OnlineSearchHit& hit,
-                                             const std::wstring& url)> on_track);
+                                             const std::wstring& url)> on_track,
+                          const std::wstring& initial_query = {});
 
 // 音乐窗当前是否已经创建（供主窗口同步菜单勾选状态）。
 bool IsMusicFreeBrowserVisible();

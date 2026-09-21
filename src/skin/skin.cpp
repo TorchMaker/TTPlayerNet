@@ -287,6 +287,10 @@ LegacySkin::LegacySkin(LegacySkin&& other) noexcept {
     *this = std::move(other);
 }
 
+// 这是手写的成员搬运表（不能靠默认实现：被搬走的 SkinImage 必须显式清空，否则
+// moved-from 对象析构时会重复释放 HBITMAP）。代价是**每加一个皮肤段都必须在这里
+// 补一行** —— browser_ 漏掉过一次：LoadSkin 内部是 skin_.emplace(std::move(next))，
+// 于是音乐窗的 <browser_window> 段每次都被静默丢弃，窗口永远退化成自绘兜底框。
 LegacySkin& LegacySkin::operator=(LegacySkin&& other) noexcept {
     if (this == &other) return *this;
     if (icon_) DestroyIcon(icon_);
@@ -309,6 +313,8 @@ LegacySkin& LegacySkin::operator=(LegacySkin&& other) noexcept {
     other.playlist_ = {};
     equalizer_ = std::move(other.equalizer_);
     other.equalizer_ = {};
+    browser_ = std::move(other.browser_);
+    other.browser_ = {};
     visual_ = std::move(other.visual_);
     other.visual_ = {};
     return *this;
