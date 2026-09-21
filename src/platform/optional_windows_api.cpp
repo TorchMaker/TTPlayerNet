@@ -39,6 +39,14 @@ HMODULE CommonControls() {
     static const HMODULE module = LoadSystemComponent(L"comctl32.dll");
     return module;
 }
+HMODULE User32() {
+    static const HMODULE module = LoadSystemComponent(L"user32.dll");
+    return module;
+}
+HMODULE ShCore() {
+    static const HMODULE module = LoadSystemComponent(L"shcore.dll");
+    return module;
+}
 HMODULE WindowsMedia() {
     // The fallback decoder remains available in the test that disables MF.
     wchar_t directory[MAX_PATH]{};
@@ -113,4 +121,52 @@ OPTIONAL_API(PropertySystem, PropVariantToString, (REFPROPVARIANT value, PWSTR r
 OPTIONAL_API(PropertySystem, PropVariantToStringAlloc, (REFPROPVARIANT value, PWSTR* result),
     (value, result), if (result) *result = nullptr)
 #undef OPTIONAL_API
+
+BOOL SetProcessDpiAwarenessContext(void* value) {
+    using Function = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    static const auto function = Resolve<Function>(User32(), "SetProcessDpiAwarenessContext");
+    return function ? function(static_cast<DPI_AWARENESS_CONTEXT>(value)) : FALSE;
+}
+
+HRESULT SetProcessDpiAwareness(int value) {
+    using Function = HRESULT(WINAPI*)(int);
+    static const auto function = Resolve<Function>(ShCore(), "SetProcessDpiAwareness");
+    if (function) return function(value);
+    return E_NOTIMPL;
+}
+
+UINT GetDpiForWindow(HWND hwnd) {
+    using Function = UINT(WINAPI*)(HWND);
+    static const auto function = Resolve<Function>(User32(), "GetDpiForWindow");
+    return function ? function(hwnd) : 0u;
+}
+
+HRESULT GetDpiForMonitor(HMONITOR monitor, int dpi_type, UINT* dpi_x, UINT* dpi_y) {
+    using Function = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    static const auto function = Resolve<Function>(ShCore(), "GetDpiForMonitor");
+    if (function) return function(monitor, dpi_type, dpi_x, dpi_y);
+    if (dpi_x) *dpi_x = 0;
+    if (dpi_y) *dpi_y = 0;
+    return E_NOTIMPL;
+}
+
+UINT GetDpiForSystem() {
+    using Function = UINT(WINAPI*)();
+    static const auto function = Resolve<Function>(User32(), "GetDpiForSystem");
+    return function ? function() : 0u;
+}
+
+int GetSystemMetricsForDpi(int index, UINT dpi) {
+    using Function = int(WINAPI*)(int, UINT);
+    static const auto function =
+        Resolve<Function>(User32(), "GetSystemMetricsForDpi");
+    // Absent on Win8.1 and earlier: the caller keeps the system-DPI value.
+    return function ? function(index, dpi) : 0;
+}
+BOOL SystemParametersInfoForDpi(UINT action, UINT param, void* pvparam, UINT fwinini, UINT dpi) {
+    using Function = BOOL(WINAPI*)(UINT, UINT, void*, UINT, UINT);
+    static const auto function = Resolve<Function>(User32(), "SystemParametersInfoForDpi");
+    return function ? function(action, param, pvparam, fwinini, dpi) : FALSE;
+}
+
 } // namespace ttplayer::platform

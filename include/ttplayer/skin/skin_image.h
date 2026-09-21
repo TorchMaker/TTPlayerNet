@@ -17,12 +17,17 @@ public:
     static SkinImage Load(const std::filesystem::path& path);
     [[nodiscard]] bool IsGdiPlus() const noexcept;
     [[nodiscard]] SIZE Size() const noexcept;
+    // Resource multiplier (1 = @1x, 2 = @2x, ...). Lets nine-grid source split
+    // and frame offsets stay correct while the layout DPI scaling is decoupled
+    // from the asset resolution. See docs/HIGH_DPI_SKIN_SPEC.md §7.
+    int source_scale_{1};
     // PNG window-region source: black for alpha 0, white for alpha > 0.
     // This binary mask is only for HWND shape/hit testing, never for painting.
     // BMP callers retain their original RGB colour-key region path.
     [[nodiscard]] SkinImage CoverageMask() const;
     // A DIB view for legacy size/region APIs, never the PNG drawing source.
     [[nodiscard]] operator HBITMAP() const noexcept;
+    [[nodiscard]] int SourceScale() const noexcept { return source_scale_; }
     bool Draw(HDC dc, int x, int y, int width, int height,
               int source_x, int source_y, int source_width, int source_height,
               COLORREF transparent = CLR_INVALID, BYTE opacity = 255) const;

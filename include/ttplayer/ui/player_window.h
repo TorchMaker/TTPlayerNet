@@ -12,6 +12,7 @@
 #include "ttplayer/settings/settings.h"
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/skin/skin_package.h"
+#include "ttplayer/ui/dpi_scale.h"
 #include "ttplayer/ui/desktop_lyrics.h"
 #include "ttplayer/ui/playlist_rating_input.h"
 #include "ttplayer/ui/playlist_marquee.h"
@@ -734,6 +735,15 @@ private:
         return opened_track_ ? &*opened_track_ : nullptr;
     }
     [[nodiscard]] const playlist::Track* PlaybackTrackForUi() const noexcept;
+    // Re-derive the scaled skin mirror for a new DPI and rebind every
+    // skin-backed HWND (region, size, child layouts). Position is preserved.
+    void ApplyDpiScale(const ui::DpiScale& scale);
+    // Saved window rectangles are physical pixels captured at
+    // `settings_.player.window_dpi`. When the session starts on a different
+    // DPI, rescale them once so a restored window keeps its logical size
+    // (docs/HIGH_DPI_SKIN_SPEC.md §8). No-op when the saved DPI is unknown
+    // (0, legacy config) or already matches.
+    void MigrateSavedWindowGeometry(int current_dpi);
     bool LoadSkin(skin::SkinPackage package, const std::filesystem::path& cache,
                   const std::wstring& selector, const std::filesystem::path& profile,
                   bool restore_profile);
@@ -840,6 +850,10 @@ private:
     HWND skin_menu_tooltip_{};
     HFONT popup_menu_font_{};
     HFONT popup_menu_bold_font_{};
+    // Owner-drawn menu geometry. The 20px icon slot is a logical value and is
+    // widened with the DPI so the (native 16px) icon stays centred beside the
+    // scaled menu font (docs/HIGH_DPI_SKIN_SPEC.md §6.10).
+    int popup_menu_icon_slot_{20};
     HIMAGELIST popup_menu_images_{};
     std::vector<std::pair<UINT, int>> popup_menu_image_commands_;
     std::vector<std::array<unsigned char, 16 * 16>> popup_menu_image_masks_;
@@ -861,6 +875,11 @@ private:
     integrations::DiscordPresence discord_presence_;
     DesktopLyricsWindow desktop_lyrics_;
     std::optional<skin::LegacySkin> skin_;
+    // Unscaled (96-DPI logical) skin kept so we can rebuild `skin_` at a new
+    // DPI without re-parsing the package. `skin_` always holds the
+    // current-DPI scaled view consumed by all drawing/hit-test/region code.
+    std::optional<skin::LegacySkin> logical_skin_;
+    ui::DpiScale current_scale_{96};
     std::shared_ptr<VisualRuntime> visual_runtime_;
     std::jthread visual_worker_;
     std::condition_variable_any visual_worker_condition_;

@@ -1497,7 +1497,7 @@ void PlayerWindow::UpdateLyricWindowRegion() {
     if (width <= 0 || height <= 0) return;
     const auto& layout = skin_->Lyric();
     HRGN region = CreateSkinWindowRegion(layout.background, layout.resize_rect,
-        width, height, layout.resize_tile, skin_->TransparentColor());
+        width, height, layout.resize_tile, skin_->TransparentColor(), current_scale_);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(lyric_window_, region, TRUE)) {
@@ -1530,9 +1530,9 @@ void PlayerWindow::PaintLyricWindow(HDC dc) const {
             // FUN_00449313 takes the normal-mode branch through FUN_0044E8CC:
             // paint the lyric-window skin without consulting mini_border.
             DrawResizableSkinBitmap(canvas, layout.background, layout.resize_rect,
-                                    width, height, layout.resize_tile);
+                                    width, height, layout.resize_tile, current_scale_);
             DrawElementFrame(canvas, layout.title, LyricElementBounds(layout.title),
-                             0, skin_->TransparentColor());
+                             0, skin_->TransparentColor(), current_scale_);
         } else {
             // mini_border belongs to FUN_00449313's DAT_0054775C (mini-mode)
             // branch and surrounds the lyric popup client, not LyricCtrl.
@@ -1616,9 +1616,9 @@ void PlayerWindow::PaintLyricControl(HWND control, HDC dc, bool present_layered)
         const HGDIOBJ old_parent = SelectObject(parent_dc, parent_bitmap);
         FillRect(parent_dc, &parent_client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         DrawResizableSkinBitmap(parent_dc, layout.background, layout.resize_rect,
-            parent_client.right, parent_client.bottom, layout.resize_tile);
+            parent_client.right, parent_client.bottom, layout.resize_tile, current_scale_);
         DrawElementFrame(parent_dc, layout.title, LyricElementBounds(layout.title),
-                         0, skin_->TransparentColor());
+                         0, skin_->TransparentColor(), current_scale_);
         POINT origin{};
         MapWindowPoints(control, lyric_window_, &origin, 1);
         BitBlt(canvas, 0, 0, width, height, parent_dc,

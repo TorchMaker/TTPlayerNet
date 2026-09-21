@@ -11,6 +11,7 @@
 // 参与窗口吸附，并随主窗口一起移动。
 
 #include "ttplayer/musicfree/musicfree_browser_window.h"
+#include "ttplayer/ui/dpi_scale.h"
 
 #include <algorithm>
 #include <atomic>
@@ -83,7 +84,15 @@ constexpr int kFallbackHeight = 462;
 // ★ 抓取带厚度统一取 frame::kResizeBand（自检也用同一个值，不会各自漂移）。
 // 必须小于皮肤左右/上下边框厚度，否则会把内容区（尤其是列表右侧的滚动条）的
 // 点击抢走。实测内置皮肤的边框：左 8px、右 9px、上 31px、下 31px。
+// kResizeBand 是 96-DPI 逻辑值，实际判定时按窗口 DPI 换算（§6.9 High-DPI 规格）。
 constexpr int kResizeBorder = frame::kResizeBand;
+
+// The grab band is a logical thickness: on a 200% display a 6px band is only
+// 3 logical pixels and becomes impossible to hit.
+int ScaledResizeBorder(HWND hwnd) {
+    return std::max(kResizeBorder,
+                    ui::ResolveScaleForWindow(hwnd).X(kResizeBorder));
+}
 constexpr int kMinTrackWidthCap = 640;   // 宽度不再随缩放变化，仅作超大皮肤的兜底上限
 constexpr int kMinTrackHeightCap = 260;  // 高度允许缩小到的下限
 constexpr int kMaxTrackHeightCap = 1600; // 高度允许放大的上限（拖动只改高度）
@@ -350,11 +359,12 @@ ToolbarLayout BuildToolbarLayout(const RECT& content) {
 // 到当前客户区（窗口缩放后内容区变大、按钮右锚定、底部行下锚定）；否则按兜底尺寸
 // 推算一条与皮肤风格相近的边框。
 FrameLayout BuildFrameLayout(const RECT& client,
-                             const skin::BrowserSkin* browser) {
+                             const skin::BrowserSkin* browser,
+                             const ui::DpiScale& scale) {
     FrameLayout layout;
     if (browser) {
         layout.skinned = true;
-        layout.skin = frame::Map(client, *browser);
+        layout.skin = frame::Map(client, *browser, scale);
         layout.content = layout.skin.content;
         layout.close = layout.skin.close;
         layout.prev_source = layout.skin.backward;
@@ -407,7 +417,8 @@ void LayoutChildren(BrowserState* state) {
     if (!state || !state->hwnd) return;
     RECT client{};
     GetClientRect(state->hwnd, &client);
-    state->layout = BuildFrameLayout(client, ActiveSkin(state));
+    state->layout = BuildFrameLayout(client, ActiveSkin(state),
+                            ui::ResolveScaleForWindow(state->hwnd));
 
     const RECT content = state->layout.content;
     const LONG inner_left = content.left + 6;
@@ -457,7 +468,8 @@ void ApplyFrameRegion(BrowserState* state) {
     GetClientRect(state->hwnd, &client);
     // 区域必须和背景用同一份九宫格映射，否则拉伸之后透明边角会对不上。
     frame::ApplyWindowRegion(state->hwnd, *browser, state->layout.skin, client,
-                             FrameTransparent(state, *browser));
+                             FrameTransparent(state, *browser),
+                             ui::ResolveScaleForWindow(state->hwnd));
 }
 
 // 外框的自然尺寸：皮肤背景位图尺寸；没有皮肤时用兜底尺寸。
@@ -509,7 +521,8 @@ void ApplyFrameMetrics(BrowserState* state, bool reset_size) {
 
     RECT client{};
     GetClientRect(state->hwnd, &client);
-    state->layout = BuildFrameLayout(client, ActiveSkin(state));
+    state->layout = BuildFrameLayout(client, ActiveSkin(state),
+                            ui::ResolveScaleForWindow(state->hwnd));
     ApplyFrameRegion(state);
     LayoutChildren(state);
     InvalidateRect(state->hwnd, nullptr, TRUE);
@@ -566,7 +579,8 @@ void PaintFrame(BrowserState* state, HDC dc) {
     GetClientRect(state->hwnd, &client);
     EnsureFonts(state);
     const skin::BrowserSkin* browser = ActiveSkin(state);
-    state->layout = BuildFrameLayout(client, browser);
+    state->layout = BuildFrameLayout(
+        client, browser, ui::ResolveScaleForWindow(state->hwnd));
 
     if (!browser) {
         PaintFallbackFrame(state, dc, client);
@@ -1099,7 +1113,7 @@ int ResizeHitTest(BrowserState* state, POINT point) {
     RECT client{};
     GetClientRect(state->hwnd, &client);
     const SIZE size{client.right - client.left, client.bottom - client.top};
-    return frame::ResizeHitCode(size, kResizeBorder, point);
+    return frame::ResizeHitCode(size, ScaledResizeBorder(state->hwnd), point);
 }
 
 // ------------------------------------------------------- 缩放带自检（诊断）
@@ -1117,7 +1131,7 @@ void TraceResizeBands(BrowserState* state) {
     const LONG width = client.right - client.left;
     const LONG height = client.bottom - client.top;
     if (width <= 0 || height <= 0) return;
-    const LONG inset = kResizeBorder / 2;  // 探针落在带**内**，不是压在边界线上
+    const LONG inset = ScaledResizeBorder(state->hwnd) / 2;  // 探针落在带**内**，不是压在边界线上
     struct Probe {
         const char* name;
         POINT point;
@@ -1135,7 +1149,7 @@ void TraceResizeBands(BrowserState* state) {
     };
     std::string detail = "client=" + std::to_string(width) + "x" +
                          std::to_string(height) +
-                         " band=" + std::to_string(kResizeBorder);
+                         " band=" + std::to_string(ScaledResizeBorder(state->hwnd));
     for (const Probe& probe : probes) {
         const int frame_hit = FrameHitTest(state, probe.point);
         const int code = frame_hit != kFrameHitNone

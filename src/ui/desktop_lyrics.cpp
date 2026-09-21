@@ -2,6 +2,7 @@
 #include "ttplayer/ui/wtl_menu.h"
 #include "ttplayer/ui/desktop_lyrics.h"
 #include "ttplayer/ui/desktop_lyric_layout.h"
+#include "ttplayer/ui/dpi_scale.h"
 #include "ttplayer/ui/window_drag.h"
 
 #include "ttplayer/core/text.h"
@@ -285,12 +286,15 @@ public:
             !RegisterClassIfMissing(instance_, kSkinIconClass,
                                     PassiveChildProc)) return false;
 
+        // No HWND yet: fall back to the system DPI so the initial size is
+        // already sane; RefreshScale() re-reads it once the window exists.
+        scale_ = ui::ResolveScaleForWindow(nullptr);
         RECT bounds = *persisted_bounds_;
-        if (!ValidRect(bounds)) bounds = RECT{100, 100, 720, 166};
-        const int width = std::clamp(Width(bounds), kMinimumWidth,
-                                     kMaximumWidth);
+        if (!ValidRect(bounds))
+            bounds = RECT{100, 100, 100 + scale_.X(620), 100 + scale_.Y(66)};
+        const int width = std::clamp(Width(bounds), MinWidth(), MaxWidth());
         bounds.right = bounds.left + width;
-        if (Height(bounds) <= 0) bounds.bottom = bounds.top + 66;
+        if (Height(bounds) <= 0) bounds.bottom = bounds.top + scale_.Y(66);
 
         const DWORD topmost = settings_->topmost ? WS_EX_TOPMOST : 0;
         control_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | topmost,
@@ -301,6 +305,7 @@ public:
             Destroy();
             return false;
         }
+        RefreshScale();
         paint_ = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | topmost,
             kPaintClass, L"PaintWnd", WS_POPUP | WS_CLIPSIBLINGS,
@@ -308,7 +313,8 @@ public:
             nullptr, instance_, this);
         bar_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | topmost,
             kBarClass, L"BarWnd", WS_POPUP | WS_CLIPSIBLINGS,
-            -1000, -1000, 231, 25, control_, nullptr, instance_, this);
+            -1000, -1000, scale_.X(231), scale_.Y(25), control_, nullptr,
+            instance_, this);
         if (!paint_ || !bar_) {
             Destroy();
             return false;
@@ -368,8 +374,16 @@ public:
 
     void SetSkin(const skin::LegacySkin* value) {
         skin_ = value;
+        RefreshScale();
         ApplyBarSkin();
     }
+
+    // Re-read the hosting window's DPI. Called whenever the skin changes (the
+    // player does that on every WM_DPICHANGED) and right after the HWND exists.
+    void RefreshScale() { scale_ = ui::ResolveScaleForWindow(control_); }
+    int MinWidth() const { return scale_.X(kMinimumWidth); }
+    int MaxWidth() const { return scale_.X(kMaximumWidth); }
+
 
     void SetLyrics(const lyrics::Lyrics* value) {
         lyrics_ = value;
@@ -411,10 +425,10 @@ public:
         if (!manual_resizing_ &&
             (applied_lines_ != settings_->lines || font_changed)) {
             const int font_height = MeasureFontHeight();
-            const int desired = std::max(kMinimumLineHeight * settings_->lines,
+            const int desired = std::max(scale_.Y(kMinimumLineHeight) * settings_->lines,
                 font_height * 3 / 2 * settings_->lines);
             bounds.bottom = bounds.top + std::min(
-                kMaximumLineHeight * settings_->lines, desired);
+                scale_.Y(kMaximumLineHeight) * settings_->lines, desired);
             applied_lines_ = settings_->lines;
             last_font_ = settings_->font;
         }
@@ -963,7 +977,7 @@ private:
             kCommandZoomIn, kCommandZoomOut};
         for (size_t index = 0; index < buttons_.size(); ++index) {
             buttons_[index].command = commands[index];
-            const RECT bounds = DefaultBarRect(commands[index]);
+            const RECT bounds = scale_.Rect(DefaultBarRect(commands[index]));
             buttons_[index].window = CreateWindowExW(0, kSkinButtonClass,
                 nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 bounds.left, bounds.top, Width(bounds), Height(bounds), bar_,
@@ -1096,7 +1110,9 @@ private:
     void ApplyBarSkin() {
         if (!bar_) return;
         const auto* layout = skin_ ? &skin_->DesktopLyricBar() : nullptr;
-        SIZE size{231, 25};
+        // 231x25 is the no-skin fallback in 96-DPI logical pixels; a skin's own
+        // background size is already physical and must not be scaled again.
+        SIZE size{scale_.X(231), scale_.Y(25)};
         if (layout && layout->valid && layout->background.size.cx > 0 &&
             layout->background.size.cy > 0) size = layout->background.size;
         SetWindowPos(bar_, nullptr, 0, 0, size.cx, size.cy,
@@ -1106,12 +1122,12 @@ private:
         SetLayeredWindowAttributes(bar_, transparent, 255,
                                    LWA_COLORKEY | LWA_ALPHA);
 
-        RECT icon_bounds{5, 4, 21, 20};
+        RECT icon_bounds = scale_.Rect(RECT{5, 4, 21, 20});
         if (layout && ValidRect(layout->icon)) icon_bounds = layout->icon;
         if (icon_) MoveWindow(icon_, icon_bounds.left, icon_bounds.top,
             Width(icon_bounds), Height(icon_bounds), FALSE);
         for (auto& button : buttons_) {
-            RECT bounds = DefaultBarRect(button.command);
+            RECT bounds = scale_.Rect(DefaultBarRect(button.command));
             const auto* element = ButtonElement(button.command);
             const bool present = layout && layout->valid
                 ? element && element->image && ValidRect(element->bounds)
@@ -1554,16 +1570,16 @@ private:
             if ((drag_hit_ & kDragBottom) != 0) target.bottom += delta_y;
 
             int width = Width(target);
-            if (width < kMinimumWidth) {
-                if ((drag_hit_ & kDragLeft) != 0) target.left = target.right - kMinimumWidth;
-                else target.right = target.left + kMinimumWidth;
-            } else if (width > kMaximumWidth) {
-                if ((drag_hit_ & kDragLeft) != 0) target.left = target.right - kMaximumWidth;
-                else target.right = target.left + kMaximumWidth;
+            if (width < MinWidth()) {
+                if ((drag_hit_ & kDragLeft) != 0) target.left = target.right - MinWidth();
+                else target.right = target.left + MinWidth();
+            } else if (width > MaxWidth()) {
+                if ((drag_hit_ & kDragLeft) != 0) target.left = target.right - MaxWidth();
+                else target.right = target.left + MaxWidth();
             }
             const int lines = settings_ ? std::clamp(settings_->lines, 1, 2) : 1;
-            const int minimum = kMinimumLineHeight * lines;
-            const int maximum = kMaximumLineHeight * lines;
+            const int minimum = scale_.Y(kMinimumLineHeight) * lines;
+            const int maximum = scale_.Y(kMaximumLineHeight) * lines;
             const int height = Height(target);
             if (height < minimum) {
                 if ((drag_hit_ & kDragTop) != 0) target.top = target.bottom - minimum;
@@ -1615,7 +1631,7 @@ private:
     void PositionWindows(RECT target, bool persist) {
         if (!control_ || !IsWindow(control_)) return;
         target.right = target.left + std::clamp(Width(target),
-            kMinimumWidth, kMaximumWidth);
+            MinWidth(), MaxWidth());
         const RECT work = DragWorkAreaForRect(target);
         RECT bar_rect{};
         if (bar_ && IsWindow(bar_)) GetWindowRect(bar_, &bar_rect);
@@ -1823,11 +1839,11 @@ private:
 
     bool ApplyAutomaticWidth(const std::vector<std::wstring>& text) {
         if (!settings_ || !settings_->auto_width || !control_) return false;
-        int desired = kMinimumWidth;
+        int desired = MinWidth();
         for (const auto& line : text) desired = std::max(desired,
             TextWidth(line) + 8 + (settings_->border ? 4 : 0) +
             (settings_->shadow ? 3 : 0));
-        desired = std::clamp(desired, kMinimumWidth, kMaximumWidth);
+        desired = std::clamp(desired, MinWidth(), MaxWidth());
         RECT bounds{};
         GetWindowRect(control_, &bounds);
         if (Width(bounds) == desired) return false;
@@ -2095,6 +2111,10 @@ private:
     HWND bar_{};
     HWND tooltip_{};
     HWND icon_{};
+    // Fallback layout constants (bar size, button rects, drag limits) are
+    // 96-DPI logical values; only the values coming from the skin are already
+    // physical pixels. See docs/HIGH_DPI_SKIN_SPEC.md §6.9.
+    ui::DpiScale scale_{96};
     std::array<Button, 13> buttons_{};
     HFONT font_{};
     LOGFONTW last_font_{};

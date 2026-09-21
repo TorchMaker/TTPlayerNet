@@ -2,6 +2,7 @@
 
 #include "ttplayer/skin/skin_image.h"
 #include "ttplayer/skin/default_colors.h"
+#include "ttplayer/ui/dpi_scale.h"
 
 #include <filesystem>
 #include <array>
@@ -271,7 +272,14 @@ public:
     [[nodiscard]] const VisualSkin& Visual() const noexcept { return visual_; }
     [[nodiscard]] const SkinElement* Find(std::wstring_view name) const;
     [[nodiscard]] const SkinElement* FindMini(std::wstring_view name) const;
+    // Produce a view whose geometry (window size, element bounds, font pixel
+    // sizes, LOGFONT heights) is converted to physical pixels at `scale`, while
+    // bitmap sources and nine-grid resize_rect stay in logical/source pixels.
+    // Bitmaps are shared (shared_ptr storage), so this is cheap and never
+    // re-decodes. See docs/HIGH_DPI_SKIN_SPEC.md §5.2.
+    [[nodiscard]] LegacySkin AtDpi(const ui::DpiScale& scale) const;
     [[nodiscard]] HRGN CreateWindowRegion(bool mini = false) const;
+    [[nodiscard]] HRGN CreateWindowRegion(bool mini, const ui::DpiScale& scale) const;
 
     // Cache and layouts share image ownership, including across rebinds.
     SkinImage LoadBitmap(const std::filesystem::path& path);

@@ -55,19 +55,19 @@ void PlayerWindow::DrawAnimatedSkinFrame(HDC dc, const skin::SkinElement& elemen
     const auto& def = element.animation;
     if (!element.image.IsGdiPlus() || !element.four_state ||
         !def.Enabled() || def.mode > 2) {
-        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor(), current_scale_);
         return;
     }
     const auto& transition = SkinHoverState(owner, element.name, bounds, state, def);
     if (transition.remaining <= 0 || state > 1) {
-        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor(), current_scale_);
         return;
     }
     const int width = element.image_size.cx / 4, height = element.image_size.cy;
     // Caller has restored the skin background into its double buffer. This
     // is the equivalent of the original child's parent 0x10400 background DC.
     if (def.mode == 1) {
-        DrawElementFrame(dc, element, bounds, 0, skin_->TransparentColor());
+        DrawElementFrame(dc, element, bounds, 0, skin_->TransparentColor(), current_scale_);
         element.image.Draw(dc, bounds.left, bounds.top, width, height,
             width, 0, width, height, CLR_INVALID, transition.HotOpacity(def));
     } else if (element.flash_image.IsGdiPlus()) {
@@ -78,7 +78,7 @@ void PlayerWindow::DrawAnimatedSkinFrame(HDC dc, const skin::SkinElement& elemen
             element.flash_size.cy, frame * frame_width, 0, frame_width,
             element.flash_size.cy);
     } else {
-        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor(), current_scale_);
     }
 }
 
@@ -87,7 +87,7 @@ void PlayerWindow::DrawSkinSliderThumb(HDC dc, const skin::SkinElement& thumb,
     if (!skin_) return;
     const auto& def = thumb.animation;
     if (!def.Enabled() || !thumb.image.IsGdiPlus()) {
-        DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor(), current_scale_);
         return;
     }
     const std::wstring key = L"slider:" + thumb.name;
@@ -107,7 +107,7 @@ void PlayerWindow::DrawSkinSliderThumb(HDC dc, const skin::SkinElement& thumb,
             16, nullptr) != 0;
     const auto& pulse = *found->pulse;
     if (state == 2 || state == 3 || (!pulse.playing && pulse.remaining <= 0)) {
-        DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor(), current_scale_);
         return;
     }
     const int width = thumb.image_size.cx / 4, height = thumb.image_size.cy;
@@ -116,7 +116,7 @@ void PlayerWindow::DrawSkinSliderThumb(HDC dc, const skin::SkinElement& thumb,
             state * width, 0, width, height, CLR_INVALID, 255 - pulse.Opacity(def));
         return;
     }
-    DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor());
+    DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor(), current_scale_);
     if (!thumb.flash_image.IsGdiPlus()) return;
     int flash_width = thumb.flash_size.cx;
     const int flash_height = thumb.flash_size.cy;

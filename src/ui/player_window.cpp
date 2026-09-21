@@ -747,24 +747,27 @@ void DrawSolidFrame(HDC target, const RECT& bounds, COLORREF color) {
 }
 
 RECT ResolveAlignedRect(RECT bounds, unsigned int alignment, SIZE native,
-                        int width, int height, SIZE image_size) {
-    const int item_width = image_size.cx > 0 ? image_size.cx : bounds.right - bounds.left;
-    const int item_height = image_size.cy > 0 ? image_size.cy : bounds.bottom - bounds.top;
+                        int width, int height, SIZE image_size,
+                        const ui::DpiScale& scale) {
+    const SIZE native_scaled = scale.Size(native);
+    const SIZE image_scaled = scale.Size(image_size);
+    const int item_width = image_scaled.cx > 0 ? image_scaled.cx : bounds.right - bounds.left;
+    const int item_height = image_scaled.cy > 0 ? image_scaled.cy : bounds.bottom - bounds.top;
     // FUN_0047A9C5 centers the current item, not its XML origin plus half
     // the window's resize delta. It suppresses alignment separately on each
     // axis when the client is smaller than the native skin background.
     // FUN_0042912E supplies bitmap/frame dimensions for image-backed titles.
-    if (width < native.cx) alignment &= 0xf0U;
-    if (height < native.cy) alignment &= 0x0fU;
+    if (width < native_scaled.cx) alignment &= 0xf0U;
+    if (height < native_scaled.cy) alignment &= 0x0fU;
     if ((alignment & 0x0fU) == 2U) {
         bounds.left = (width - item_width) / 2;
     } else if ((alignment & 0x0fU) == 3U) {
-        bounds.left = bounds.right - item_width + width - native.cx;
+        bounds.left = bounds.right - item_width + width - native_scaled.cx;
     }
     if ((alignment & 0xf0U) == 0x20U) {
         bounds.top = (height - item_height) / 2;
     } else if ((alignment & 0xf0U) == 0x30U) {
-        bounds.top = bounds.bottom - item_height + height - native.cy;
+        bounds.top = bounds.bottom - item_height + height - native_scaled.cy;
     }
     bounds.right = bounds.left + item_width;
     bounds.bottom = bounds.top + item_height;
@@ -773,17 +776,17 @@ RECT ResolveAlignedRect(RECT bounds, unsigned int alignment, SIZE native,
 
 PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
                                       int split_on_lists, int width, int height,
-                                      size_t track_count) {
+                                      size_t track_count, const ui::DpiScale& scale) {
     PlaylistGeometry result;
     result.list = layout.list_bounds;
-    const int extra_width = std::max<int>(0, width - layout.background.size.cx);
-    const int extra_height = std::max<int>(0, height - layout.background.size.cy);
+    const int extra_width = std::max<int>(0, width - scale.X(layout.background.size.cx));
+    const int extra_height = std::max<int>(0, height - scale.Y(layout.background.size.cy));
     result.list.right += extra_width;
     result.list.bottom += extra_height;
     // The selected bitmap is a tiled highlight, not the ListCtrl item height.
     // Runtime pixel probes show 16-pixel rows with LX-iPlay's 19-pixel
     // selected.bmp clipped and restarted for every item.
-    result.row_height = 16;
+    result.row_height = scale.Y(16);
     const int available_height = std::max<LONG>(0, result.list.bottom - result.list.top);
     result.page_rows = std::max(1, available_height / result.row_height);
     result.visible_rows = std::max(1, (available_height + result.row_height - 1) /
@@ -793,13 +796,13 @@ PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
     // shortens a one-row selection by 15 px in LX-iPlay (9 px in TT2012).
     result.scrollbar_width = track_count > static_cast<size_t>(result.page_rows) &&
                              layout.scrollbar_buttons.size.cx >= 3
-        ? layout.scrollbar_buttons.size.cx / 3 : 0;
+        ? scale.X(layout.scrollbar_buttons.size.cx) / 3 : 0;
     // SplitterCtrl retains its five-pixel default renderer when a skin omits
     // splitter_bar_image (TT2012); image-backed skins use the native width.
     const int splitter_width = layout.splitter_bar.image
-        ? std::max<int>(0, layout.splitter_bar.size.cx) : 5;
+        ? scale.X(layout.splitter_bar.size.cx) : scale.X(5);
     const int maximum_split = std::max<int>(0, result.list.right - result.list.left -
-        splitter_width - result.scrollbar_width - 24);
+        splitter_width - result.scrollbar_width - scale.X(24));
     const int split = std::clamp(split_on_lists, 0, maximum_split);
     result.list_titles = {result.list.left, result.list.top,
                           result.list.left + split, result.list.bottom};
@@ -811,12 +814,12 @@ PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
                      result.scrollbar_width ? result.scrollbar.left : result.list.right,
                      result.list.bottom};
     result.toolbar = ResolveAlignedRect(layout.toolbar_bounds, layout.toolbar_alignment,
-                                        layout.background.size, width, height);
+                                        layout.background.size, width, height, {}, scale);
     result.close = ResolveAlignedRect(layout.close.bounds, layout.close.alignment,
-                                      layout.background.size, width, height);
+                                      layout.background.size, width, height, {}, scale);
     result.title = ResolveAlignedRect(layout.title.bounds, layout.title.alignment,
                                       layout.background.size, width, height,
-                                      layout.title.image_size);
+                                      layout.title.image_size, scale);
     return result;
 }
 
@@ -1580,14 +1583,12 @@ void PlayerWindow::BeginPopupMenuStyle(HMENU menu, bool hide_keyboard_cues) {
     EnsurePopupMenuImages();
     popup_menu_hide_keyboard_cues_ = hide_keyboard_cues;
 
-    NONCLIENTMETRICSW metrics{};
-    metrics.cbSize = sizeof(metrics) - sizeof(metrics.iPaddedBorderWidth);
-    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize,
-                               &metrics, 0)) {
-        metrics.cbSize = sizeof(metrics);
-        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize,
-                              &metrics, 0);
-    }
+    // Owner-drawn menu: the font must come from the *window's* DPI, not the
+    // system DPI (docs/HIGH_DPI_SKIN_SPEC.md §6.10).
+    const ui::DpiScale menu_scale = ui::ResolveScaleForWindow(window_);
+    const NONCLIENTMETRICSW metrics =
+        ui::NonClientMetricsForDpi(menu_scale.dpi);
+    popup_menu_icon_slot_ = std::max(20, menu_scale.X(20));
     popup_menu_font_ = CreateFontIndirectW(&metrics.lfMenuFont);
     LOGFONTW bold = metrics.lfMenuFont;
     bold.lfWeight += 200;
@@ -1700,14 +1701,16 @@ bool PlayerWindow::MeasurePopupMenuItem(MEASUREITEMSTRUCT& item) const {
     const MenuVisualItem* visual = FindPopupMenuItem(item.itemData);
     if (!visual) return false;
     if (static_cast<SHORT>(visual->command) == -6) {
-        item.itemWidth = static_cast<UINT>(
-            std::max(0, 20 - GetSystemMetrics(SM_CYMENUCHECK)));
+        item.itemWidth = static_cast<UINT>(std::max(
+            0, popup_menu_icon_slot_ -
+                   ui::SystemMetricForDpi(SM_CYMENUCHECK, current_scale_.dpi)));
         item.itemHeight = 0;
         return true;
     }
     if ((visual->type & MFT_SEPARATOR) != 0) {
         item.itemWidth = 0;
-        item.itemHeight = static_cast<UINT>(GetSystemMetrics(SM_CYMENU) / 2);
+        item.itemHeight = static_cast<UINT>(
+            ui::SystemMetricForDpi(SM_CYMENU, current_scale_.dpi) / 2);
         return true;
     }
 
@@ -1735,9 +1738,10 @@ bool PlayerWindow::MeasurePopupMenuItem(MEASUREITEMSTRUCT& item) const {
     ReleaseDC(nullptr, dc);
 
     item.itemHeight = static_cast<UINT>(
-        std::max<LONG>(20, std::abs(description.lfHeight) + 8));
+        std::max<LONG>(popup_menu_icon_slot_, std::abs(description.lfHeight) + 8));
     const LONG measured_width = text.right - text.left + tab_compensation +
-        20 * 2 - GetSystemMetrics(SM_CYMENUCHECK) + 6;
+        popup_menu_icon_slot_ * 2 -
+        ui::SystemMetricForDpi(SM_CYMENUCHECK, current_scale_.dpi) + 6;
     item.itemWidth = static_cast<UINT>(std::max<LONG>(0, measured_width));
     return true;
 }
@@ -1777,13 +1781,17 @@ bool PlayerWindow::DrawPopupMenuItem(const DRAWITEMSTRUCT& item) const {
                   static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
 
+    // The icon bitmaps stay at their native 16px; the slot around them grows
+    // with the DPI and the icon is centred inside it.
     RECT icon_bounds{item.rcItem.left, item.rcItem.top,
-                     item.rcItem.left + 20, item.rcItem.top + 20};
+                     item.rcItem.left + popup_menu_icon_slot_,
+                     item.rcItem.top + popup_menu_icon_slot_};
     OffsetRect(&icon_bounds, 0,
-        ((item.rcItem.bottom - item.rcItem.top) - 20) / 2);
+        ((item.rcItem.bottom - item.rcItem.top) - popup_menu_icon_slot_) / 2);
+    const int icon_padding = (popup_menu_icon_slot_ - 16) / 2;
     if (visual->image >= 0 && popup_menu_images_) {
-        int x = icon_bounds.left + 2;
-        int y = icon_bounds.top + 2;
+        int x = icon_bounds.left + std::max(2, icon_padding);
+        int y = icon_bounds.top + std::max(2, icon_padding);
         if (disabled) {
             const HICON icon = ImageList_GetIcon(popup_menu_images_, visual->image, ILD_NORMAL);
             if (icon) {
@@ -2040,8 +2048,14 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     // after the replacement has passed ApplyLoadedSkin's region validation.
     desktop_lyrics_.SetSkin(nullptr);
     auto previous = std::move(skin_);
+    auto previous_logical = std::move(logical_skin_);
     ResetSkinControlAnimations();
-    skin_.emplace(std::move(next));
+    // 皮肤对象自己始终保存在 96-DPI 逻辑坐标；skin_ 只持有当前 DPI 的派生镜像，
+    // 这样换 DPI 只需换换算因子，不会对已放大的值二次累乘。
+    // LegacySkin 不可拷贝（拷贝构造已删除），只能搬进去。
+    logical_skin_.emplace(std::move(next));
+    current_scale_ = ui::ResolveScaleForWindow(window_);
+    skin_.emplace(logical_skin_->AtDpi(current_scale_));
     // 诊断：确认 <browser_window> 段确实跟着 LegacySkin 一起搬了过来。
     // LegacySkin 的 move 赋值是手写逐成员搬运，曾漏掉 browser_ —— 结果是音乐窗
     // 永远拿不到皮肤段（ActiveSkin 返回 nullptr），退回自绘外框，而那个外框早期
@@ -2167,6 +2181,51 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     if (window_ && (profile_loaded || !restore_profile)) ApplySkinProfileWindowState();
     previous.reset();
     return true;
+}
+
+void PlayerWindow::ApplyDpiScale(const ui::DpiScale& scale) {
+    if (scale.dpi == current_scale_.dpi) return;
+    current_scale_ = scale;
+    settings_.player.window_dpi = scale.dpi;
+    // Newly decoded assets (@Nx) should target the monitor we are now on.
+    ui::SetSessionDpi(scale.dpi);
+    if (!logical_skin_) return;
+    // 皮肤源对象始终是 96-DPI 逻辑坐标，这里只是换一个换算因子重新派生镜像，
+    // 不会对已经放大过的值二次累乘（docs/HIGH_DPI_SKIN_SPEC.md §5.2）。
+    desktop_lyrics_.SetSkin(nullptr);  // 释放借用的位图后再销毁旧镜像
+    skin_.emplace(logical_skin_->AtDpi(current_scale_));
+    if (!window_ || !IsWindow(window_)) return;
+    // saved_bounds=false：保留当前位置，只按新的物理尺寸重新定框/重建区域。
+    ApplyLoadedSkin(false, false);
+}
+
+void PlayerWindow::MigrateSavedWindowGeometry(int current_dpi) {
+    const int saved_dpi = settings_.player.window_dpi;
+    if (saved_dpi <= 0 || current_dpi <= 0 || saved_dpi == current_dpi) {
+        // Legacy configs carry no DPI. Rescaling them would apply a guessed
+        // factor, so they are left exactly as they were before High-DPI work;
+        // only the recorded DPI is refreshed so the next save is migratable.
+        if (current_dpi > 0) settings_.player.window_dpi = current_dpi;
+        return;
+    }
+    // Rectangles are physical pixels: rescale both origin and extent so the
+    // window keeps its logical size and stays on the same monitor corner.
+    const auto rescale = [saved_dpi, current_dpi](RECT& value) {
+        if (value.right <= value.left || value.bottom <= value.top) return;
+        value.left = ::MulDiv(value.left, current_dpi, saved_dpi);
+        value.top = ::MulDiv(value.top, current_dpi, saved_dpi);
+        value.right = ::MulDiv(value.right, current_dpi, saved_dpi);
+        value.bottom = ::MulDiv(value.bottom, current_dpi, saved_dpi);
+    };
+    rescale(settings_.player.player_window);
+    rescale(settings_.player.mini_player_window);
+    rescale(settings_.player.lyric_window);
+    rescale(settings_.player.mini_lyric_window);
+    rescale(settings_.player.playlist_window);
+    rescale(settings_.player.equalizer_window);
+    rescale(settings_.player.browser_window);
+    rescale(settings_.player.desktop_lyric_window);
+    settings_.player.window_dpi = current_dpi;
 }
 
 void PlayerWindow::ReloadApplicationIcons() {
@@ -2304,6 +2363,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
     mini_mode_ = skinned && settings_.player.mini_mode &&
                  skin_->SupportsMiniMode();
     settings_.player.mini_mode = mini_mode_;
+    MigrateSavedWindowGeometry(ui::ResolveScaleForWindow(nullptr).dpi);
     normal_window_bounds_ = settings_.player.player_window;
     mini_window_bounds_ = settings_.player.mini_player_window;
     have_normal_window_bounds_ = normal_window_bounds_.right > normal_window_bounds_.left &&
@@ -2522,6 +2582,17 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         // DefWindowProc must still generate WM_SIZE/WM_MOVE for skin layout.
         break;
     case WM_CREATE:
+        // LoadSkin may have run before this HWND existed and fallen back to
+        // the system DPI. Re-derive the scaled skin mirror now that the
+        // per-monitor DPI is resolvable, before any control is laid out.
+        if (logical_skin_) {
+            const auto scale = ui::ResolveScaleForWindow(window_);
+            if (scale.dpi != current_scale_.dpi) {
+                current_scale_ = scale;
+                desktop_lyrics_.SetSkin(nullptr);
+                skin_.emplace(logical_skin_->AtDpi(current_scale_));
+            }
+        }
         audio_->SetDspParentWindow(window_);
         CreateControls();
         visual_window_ = CreateWindowExW(0, kVisualWindowClass, nullptr,
@@ -2578,6 +2649,35 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             UpdateVisualFrame();
         }
         return 0;
+    case kMsgGetDpiScaledSize: {
+        // WM_GETDPISCALEDSIZE: the OS asks which size this window wants at the
+        // incoming DPI *before* it sends WM_DPICHANGED. The default projection
+        // scales the current rectangle linearly, which rounds every nine-grid
+        // patch independently and drifts a pixel or two on 125%/150%. Derive
+        // the answer from the skin instead (§6.12 of the High-DPI spec).
+        const UINT dpi = LOWORD(wparam);
+        auto* requested = reinterpret_cast<SIZE*>(lparam);
+        if (!dpi || !requested || !logical_skin_) break;
+        const ui::DpiScale scale{static_cast<int>(dpi)};
+        *requested = scale.Size(mini_mode_ ? logical_skin_->MiniWindowSize()
+                                           : logical_skin_->WindowSize());
+        return TRUE;
+    }
+    case WM_DPICHANGED: {
+        // wParam's LOWORD is the new DPI; lParam is the suggested window rect
+        // (already scaled by the OS for Per-Monitor V2). Move first, then
+        // rebuild every DPI-derived resource. See docs/HIGH_DPI_SKIN_SPEC.md §6.12.
+        const UINT dpi = LOWORD(wparam);
+        if (auto* suggested = reinterpret_cast<RECT*>(lparam)) {
+            SetWindowPos(window_, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (!dpi || dpi == static_cast<UINT>(current_scale_.dpi)) return 0;
+        ApplyDpiScale(ui::DpiScale{static_cast<int>(dpi)});
+        return 0;
+    }
     case WM_SETTINGCHANGE:
         if (wparam == SPI_SETWORKAREA && fullscreen_mode_ != 0)
             UpdateFullScreenLayout();
@@ -3342,6 +3442,8 @@ void PlayerWindow::CaptureWindowState() {
     settings_.player.playlist_visible = playlist_visible;
     settings_.player.equalizer_window = equalizer_bounds;
     settings_.player.equalizer_visible = equalizer_visible;
+    // 这些矩形是物理像素；记录捕获时的 DPI，下次启动若 DPI 变了就按它换算回来。
+    settings_.player.window_dpi = current_scale_.dpi;
 }
 
 std::filesystem::path PlayerWindow::CurrentSkinProfilePath() const {
@@ -3822,7 +3924,7 @@ void PlayerWindow::DrawSkinElement(HDC dc, const skin::SkinElement& element, int
     const RECT bounds{element.bounds.left, element.bounds.top,
         element.bounds.left + width, element.bounds.top + height};
     if (element.name == L"progress" || element.name == L"volume")
-        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor());
+        DrawElementFrame(dc, element, bounds, state, skin_->TransparentColor(), current_scale_);
     else DrawAnimatedSkinFrame(dc, element, bounds, state, window_);
 }
 
@@ -5701,6 +5803,7 @@ void PlayerWindow::ApplySkinProfileWindowState() {
     // consumed later by FUN_00464B6C. Keep the cached toggle rectangles in
     // lockstep; otherwise the main mini window comes from the previous skin
     // while LyricWnd2 comes from the new one.
+    MigrateSavedWindowGeometry(ui::ResolveScaleForWindow(window_).dpi);
     normal_window_bounds_ = settings_.player.player_window;
     mini_window_bounds_ = settings_.player.mini_player_window;
     have_normal_window_bounds_ = normal_window_bounds_.right > normal_window_bounds_.left &&

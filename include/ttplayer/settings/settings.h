@@ -77,6 +77,9 @@ struct PlayerSettings {
     // 音乐窗（查看 → 音乐窗 / F11）的位置，随皮肤 sidecar 一起保存。
     RECT browser_window{};
     bool browser_top_most{};
+    // 上面各窗口矩形保存时所用的 DPI（物理像素）。0 = 旧版配置，无 DPI 信息，
+    // 不做迁移以保证老配置行为不变（docs/HIGH_DPI_SKIN_SPEC.md §8）。
+    int window_dpi{};
     int playlist_scan_count{100};
     int active_playlist{};
     int playing_time{};

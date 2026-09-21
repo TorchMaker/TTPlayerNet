@@ -88,6 +88,14 @@ constexpr int kFullscreenEscapeHotkey = 0x7f0;
 // CPlayerWnd::OnCreate writes 0x7e8 into NOTIFYICONDATA::uCallbackMessage.
 constexpr UINT kTrayCallbackMessage = 0x7e8;
 constexpr UINT kTrayIconIdentifier = 1;
+// WM_GETDPISCALEDSIZE lets a Per-Monitor V2 window report the size it wants at
+// the incoming DPI instead of accepting the OS linear projection. Only recent
+// SDKs define it.
+#ifndef WM_GETDPISCALEDSIZE
+constexpr UINT kMsgGetDpiScaledSize = 0x02e4;
+#else
+constexpr UINT kMsgGetDpiScaledSize = WM_GETDPISCALEDSIZE;
+#endif
 // CLyricCtrl uses timer 0x7b independently from CPlayerWnd's timer 10.
 // FUN_0043EDE6 selects 20 ms for the horizontal stream and 50 ms for the
 // vertical row layout.
@@ -473,27 +481,31 @@ void DrawSolidFrame(HDC target, const RECT& bounds, COLORREF color);
 // (ttplayer/skin/skin_frame.h)，主窗口各子窗与音乐窗共用同一份实现。
 inline void DrawResizableSkinBitmap(HDC target, const skin::SkinBitmap& bitmap,
                                     RECT resize_rect, int width, int height,
-                                    bool tile) {
-    skin::DrawFrameBackground(target, bitmap, resize_rect, width, height, tile);
+                                    bool tile, const ui::DpiScale& scale) {
+    skin::DrawFrameBackground(target, bitmap, resize_rect, width, height, tile, scale);
 }
 inline HRGN CreateSkinWindowRegion(const skin::SkinBitmap& bitmap,
                                    RECT resize_rect, int width, int height,
-                                   bool tile, COLORREF transparent) {
+                                   bool tile, COLORREF transparent,
+                                   const ui::DpiScale& scale) {
     return skin::CreateFrameRegion(bitmap, resize_rect, width, height, tile,
-                                   transparent);
+                                   transparent, scale);
 }
 // Independent, initial-state main-window preview (0049A6EF), never live state.
 HBITMAP RenderSkinPreview(const skin::LegacySkin& source,
                           HMODULE resources = nullptr, HICON fallback_icon = nullptr);
 RECT ResolveAlignedRect(RECT bounds, unsigned int alignment, SIZE native,
-                        int width, int height, SIZE image_size = {});
+                        int width, int height, SIZE image_size = {},
+                        const ui::DpiScale& scale = ui::DpiScale{});
 inline void DrawElementFrame(HDC target, const skin::SkinElement& element,
-                             RECT bounds, int state, COLORREF transparent) {
-    skin::DrawFrameButton(target, element, bounds, state, transparent);
+                             RECT bounds, int state, COLORREF transparent,
+                             const ui::DpiScale& scale = ui::DpiScale{}) {
+    skin::DrawFrameButton(target, element, bounds, state, transparent, scale);
 }
 PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
                                       int split_on_lists, int width, int height,
-                                      size_t track_count);
+                                      size_t track_count,
+                                      const ui::DpiScale& scale = ui::DpiScale{});
 void ApplyPlaylistSkinDefaults(const skin::PlaylistSkin& source,
                                settings::PlaylistSettings& target);
 void ApplyLyricSkinDefaults(const skin::LyricSkin& source,

@@ -112,7 +112,8 @@ Layout ComputeLayout(const DlgState* s, const RECT& client) {
     layout.client = client;
     if (const skin::BrowserSkin* browser = ActiveSkin(s)) {
         layout.skinned = true;
-        layout.skin = frame::Map(client, *browser);
+        layout.skin = frame::Map(client, *browser,
+                                 ui::ResolveScaleForWindow(s->hwnd));
         layout.content = layout.skin.content;
         layout.close = layout.skin.close;
         layout.title = {client.left, client.top, client.right, layout.content.top};
@@ -634,7 +635,8 @@ void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
         GetClientRect(hwnd, &client);
         const Layout layout = ComputeLayout(&state, client);
         frame::ApplyWindowRegion(hwnd, *browser, layout.skin, client,
-                                 frame::TransparentColor(legacy, *browser));
+                                 frame::TransparentColor(legacy, *browser),
+                                 ui::ResolveScaleForWindow(hwnd));
     }
 
     HFONT ui_font = state.ui_font;

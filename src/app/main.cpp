@@ -3,6 +3,7 @@
 #include "ttplayer/app/runtime.h"
 #include "ttplayer/app/single_instance.h"
 #include "ttplayer/app/worker_process.h"
+#include "ttplayer/platform/optional_windows_api.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/settings/settings.h"
 #include "../ui/file_info_probe_client.h"
@@ -141,6 +142,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     // applies before both normal startup and embedded plugin workers.
     // AlwaysOn/AlwaysOff or externally imposed process policy takes precedence.
     SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
+    // Enable per-monitor (V2) DPI awareness as early as possible, before any
+    // window is created. V2 gives us WM_DPICHANGED per window and proper
+    // dialog/Menu/Tooltip scaling; the manifest declares the same so a
+    // pre-wWinMain path also takes effect. Layout/scaling is implemented in
+    // the skin layer (docs/HIGH_DPI_SKIN_SPEC.md), so the OS no longer has to
+    // bitmap-stretch a DPI-unaware window.
+    {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declared as
+        // void* to avoid depending on a Win10 SDK DPI_AWARENESS_CONTEXT typedef.
+        // reinterpret_cast is not a constant expression under /W4; a plain
+        // local (not constexpr) is enough here.
+        void* kPerMonitorV2 = reinterpret_cast<void*>(-4);
+        if (!ttplayer::platform::SetProcessDpiAwarenessContext(kPerMonitorV2)) {
+            // PROCESS_PER_MONITOR_DPI_AWARE == 2 (Win8.1 fallback).
+            if (FAILED(ttplayer::platform::SetProcessDpiAwareness(2)))
+                SetProcessDPIAware(); // XP/Win7 final fallback keeps system DPI.
+        }
+    }
     int count{};
     wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &count);
     // Private workers bypass DLL startup, single-instance IPC, settings and

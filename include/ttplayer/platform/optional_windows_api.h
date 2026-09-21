@@ -34,4 +34,16 @@ HRESULT PropVariantToUInt32(REFPROPVARIANT value, ULONG* result);
 HRESULT PropVariantToUInt64(REFPROPVARIANT value, ULONGLONG* result);
 HRESULT PropVariantToString(REFPROPVARIANT value, PWSTR result, UINT size);
 HRESULT PropVariantToStringAlloc(REFPROPVARIANT value, PWSTR* result);
+
+// High-DPI awareness. These are absent on XP/Win7; resolving them dynamically
+// keeps the import table clean and lets the player fall back to system-DPI
+// awareness. See docs/HIGH_DPI_SKIN_SPEC.md §9.
+BOOL SetProcessDpiAwarenessContext(void* value);
+HRESULT SetProcessDpiAwareness(int value);
+UINT GetDpiForWindow(HWND hwnd);
+HRESULT GetDpiForMonitor(HMONITOR monitor, int dpi_type, UINT* dpi_x, UINT* dpi_y);
+UINT GetDpiForSystem();
+int GetSystemMetricsForDpi(int index, UINT dpi);
+BOOL SystemParametersInfoForDpi(UINT action, UINT param, void* pvparam,
+                                UINT fwinini, UINT dpi);
 } // namespace ttplayer::platform

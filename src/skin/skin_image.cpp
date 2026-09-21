@@ -1,15 +1,50 @@
 #include "ttplayer/skin/skin_image.h"
 
+#include "ttplayer/platform/optional_windows_api.h"
+#include "ttplayer/ui/dpi_scale.h"
+
 #include <objidl.h>
 #include <gdiplus.h>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <system_error>
 #include <vector>
 
 namespace ttplayer::skin {
 namespace {
+
+// Choose an @Nx sibling when present, nearest the system effective DPI. An @Nx
+// asset's source pixels equal logical * N, so nine-grid split and frame offsets
+// stay correct without touching the XML (docs/HIGH_DPI_SKIN_SPEC.md §7). Returns
+// the chosen path and writes *multiplier (1, 2 or 3).
+std::filesystem::path PickHiResPath(const std::filesystem::path& original, int* multiplier) {
+    *multiplier = 1;
+    // GetDpiForSystem is a plain function (lazily resolved import), not a
+    // function pointer: call it and test the returned value. Prefer the
+    // session DPI (the main window's monitor) over the system DPI.
+    int system_dpi = ui::SessionDpi();
+    if (system_dpi <= 0) system_dpi = 96;
+    if (system_dpi <= 0) system_dpi = 96;
+    const double factor = static_cast<double>(system_dpi) / 96.0;
+    const int wanted = factor >= 2.25 ? 3 : (factor >= 1.5 ? 2 : 1);
+    if (wanted <= 1) return original;
+    auto with_suffix = [&](int n) {
+        std::filesystem::path candidate = original;
+        candidate.replace_extension(L"@" + std::to_wstring(n) + original.extension().wstring());
+        return candidate;
+    };
+    std::error_code ec;
+    if (wanted == 3) {
+        const auto p3 = with_suffix(3);
+        if (std::filesystem::exists(p3, ec)) { *multiplier = 3; return p3; }
+    }
+    const auto p2 = with_suffix(2);
+    if (std::filesystem::exists(p2, ec)) { *multiplier = 2; return p2; }
+    return original;
+}
 struct GraphicsRuntime {
     ULONG_PTR token{};
     GraphicsRuntime() {
@@ -46,7 +81,9 @@ struct SkinImage::Storage {
 
 SkinImage SkinImage::Load(const std::filesystem::path& path) {
     SkinImage result;
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    int multiplier = 1;
+    const std::filesystem::path chosen = PickHiResPath(path, &multiplier);
+    std::ifstream input(chosen, std::ios::binary | std::ios::ate);
     if (!input) return result;
     const auto length = input.tellg();
     // Bound allocation and decoded dimensions for malformed skin packages.
@@ -106,6 +143,7 @@ SkinImage SkinImage::Load(const std::filesystem::path& path) {
         data->image->UnlockBits(&locked);
     }
     result.storage_ = std::move(data);
+    result.source_scale_ = multiplier;
     return result;
 }
 
@@ -164,8 +202,14 @@ bool SkinImage::Draw(HDC dc, int x, int y, int width, int height,
     if (IsGdiPlus()) {
         // 0046A938/0046A9F6: native pixels, nearest-neighbour + half-pixel
         // offset, source-over alpha; the BMP magenta key does NOT apply.
+        // @Nx assets (source_scale_ > 1) instead use bicubic so the extra
+        // resolution survives downscaling to the on-screen DPI. The layout
+        // multiplier (ui::DpiScale) is decoupled from the asset multiplier
+        // (source_scale_) — see docs/HIGH_DPI_SKIN_SPEC.md §7.
         Gdiplus::Graphics graphics(dc);
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+        graphics.SetInterpolationMode(source_scale_ > 1
+            ? Gdiplus::InterpolationModeHighQualityBicubic
+            : Gdiplus::InterpolationModeNearestNeighbor);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         Gdiplus::ImageAttributes attributes;
         Gdiplus::ColorMatrix matrix{};

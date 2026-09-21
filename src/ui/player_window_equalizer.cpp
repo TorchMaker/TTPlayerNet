@@ -542,7 +542,7 @@ void PlayerWindow::UpdateEqualizerWindowRegion() {
     if (!equalizer_window_ || !skin_ || !skin_->Equalizer().valid) return;
     const auto& background = skin_->Equalizer().background;
     HRGN region = CreateSkinWindowRegion(background, {},
-        background.size.cx, background.size.cy, false, skin_->TransparentColor());
+        background.size.cx, background.size.cy, false, skin_->TransparentColor(), current_scale_);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(equalizer_window_, region, TRUE)) {
@@ -754,7 +754,7 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
         return equalizer_hover_ == hit ? 1 : 0;
     };
     DrawElementFrame(canvas, layout.title, EqualizerElementBounds(layout.title),
-                     0, skin_->TransparentColor());
+                     0, skin_->TransparentColor(), current_scale_);
     DrawAnimatedSkinFrame(canvas, layout.close, EqualizerElementBounds(layout.close),
                      button_state(kEqHitClose), equalizer_window_);
     DrawAnimatedSkinFrame(canvas, layout.enabled, EqualizerElementBounds(layout.enabled),

@@ -119,6 +119,7 @@ add_library(ttplayer_core
   src/skin/skin.cpp
   src/skin/skin_image.cpp
   src/skin/skin_package.cpp
+  src/ui/dpi_scale.cpp
   src/ui/desktop_lyrics.cpp
   src/ui/directory_change_monitor.cpp
   src/ui/file_info_probe_client.cpp
@@ -160,7 +161,7 @@ target_include_directories(ttplayer_core
   PRIVATE "${TTPLAYER_GENERATED_INCLUDE_DIR}"
 )
 add_dependencies(ttplayer_core ttplayer_build_date)
-target_compile_definitions(ttplayer_core PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(ttplayer_core PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WTL_DPI_SUPPORT)
 target_compile_options(ttplayer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
 target_link_libraries(ttplayer_core PUBLIC
   ttplayer_wtl_headers

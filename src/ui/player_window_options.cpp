@@ -6465,7 +6465,14 @@ INT_PTR PlayerWindow::HandleOptionsPageDialog(
                     // FUN_0049A9A3 only enters its resize branch when the
                     // fitted ratio is below 1.0.  Small skins remain at their
                     // native dimensions; the preview never enlarges them.
-                    const double scale = std::min(1.0, std::min(
+                    // On a high-DPI display the box itself is larger, so the
+                    // cap is raised by the DPI factor — at 96 DPI this is
+                    // exactly the original "never enlarge" behaviour, while a
+                    // 200% display lets the thumbnail fill its (now doubled)
+                    // box instead of sitting in it at half size.
+                    const double dpi_factor =
+                        ui::ResolveScaleForWindow(item->hwndItem).factor();
+                    const double scale = std::min(dpi_factor, std::min(
                         static_cast<double>(available_width) / bitmap.bmWidth,
                         static_cast<double>(available_height) / bitmap.bmHeight));
                     const int width = std::max(1, static_cast<int>(

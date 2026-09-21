@@ -25,6 +25,7 @@
 
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/skin/skin_frame.h"
+#include "ttplayer/ui/dpi_scale.h"
 
 namespace ttplayer::musicfree::frame {
 
@@ -52,7 +53,10 @@ inline COLORREF TransparentColor(const skin::LegacySkin* legacy,
 }
 
 // 把皮肤坐标映射到当前客户区。client 是客户区矩形（left/top 通常为 0）。
-inline Metrics Map(const RECT& client, const skin::BrowserSkin& browser) {
+// `scale` 只影响**代码自己推导的**尺寸（复选框右侧标签的间距与宽度），
+// 皮肤段里的矩形是位图坐标、`<browser>` 内容区也是位图坐标，都不参与缩放。
+inline Metrics Map(const RECT& client, const skin::BrowserSkin& browser,
+                   const ui::DpiScale& scale = ui::DpiScale{}) {
     Metrics metrics;
     metrics.skinned = true;
     metrics.natural = browser.background.size;
@@ -96,7 +100,12 @@ inline Metrics Map(const RECT& client, const skin::BrowserSkin& browser) {
     box.top += grow_y;
     box.bottom += grow_y;
     metrics.check_box = box;
-    metrics.check_label = {box.right + 6, box.top, box.right + 6 + 76, box.bottom};
+    // 标签没有皮肤矩形可用，只有代码里的兜底尺寸：间距 6px、宽度 76px，
+    // 都是 96-DPI 逻辑值（docs/HIGH_DPI_SKIN_SPEC.md §6.9）。
+    const int label_gap = scale.X(6);
+    const int label_width = scale.X(76);
+    metrics.check_label = {box.right + label_gap, box.top,
+                           box.right + label_gap + label_width, box.bottom};
 
     RECT link = browser.link.bounds;
     link.left += grow_x;
@@ -165,12 +174,13 @@ inline const char* HitCodeName(int code) {
 // 保证拉伸后的边框不会被区域裁掉。
 inline void ApplyWindowRegion(HWND hwnd, const skin::BrowserSkin& browser,
                               const Metrics& metrics, const RECT& client,
-                              COLORREF transparent) {
+                              COLORREF transparent,
+                              const ui::DpiScale& scale = ui::DpiScale{}) {
     if (!hwnd) return;
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     HRGN region = skin::CreateFrameRegion(browser.background, metrics.resize_rect,
-                                          width, height, false, transparent);
+                                          width, height, false, transparent, scale);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(hwnd, region, TRUE)) {

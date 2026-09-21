@@ -1401,53 +1401,11 @@ const SkinElement* LegacySkin::FindMini(std::wstring_view name) const {
     return found == mini_.elements.end() ? nullptr : &*found;
 }
 
-HRGN LegacySkin::CreateWindowRegion(bool mini) const {
-    const auto& image = mini ? mini_.background : background_;
-    const auto mask = image.IsGdiPlus() ? image.CoverageMask() : image;
-    const HBITMAP background = mask;
-    const COLORREF transparent = image.IsGdiPlus() ? RGB(0, 0, 0) : transparent_color_;
-    if (!background) return nullptr;
-    BITMAP info{};
-    GetObjectW(background, sizeof(info), &info);
-    BITMAPINFO bitmap_info{};
-    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmap_info.bmiHeader.biWidth = info.bmWidth;
-    bitmap_info.bmiHeader.biHeight = -info.bmHeight;
-    bitmap_info.bmiHeader.biPlanes = 1;
-    bitmap_info.bmiHeader.biBitCount = 32;
-    bitmap_info.bmiHeader.biCompression = BI_RGB;
-    std::vector<unsigned char> pixels(static_cast<size_t>(info.bmWidth) * info.bmHeight * 4);
-    const HDC dc = GetDC(nullptr);
-    GetDIBits(dc, background, 0, static_cast<UINT>(info.bmHeight), pixels.data(), &bitmap_info, DIB_RGB_COLORS);
-    ReleaseDC(nullptr, dc);
-
-    HRGN result = CreateRectRgn(0, 0, 0, 0);
-    for (int y = 0; y < info.bmHeight; ++y) {
-        int run = -1;
-        for (int x = 0; x <= info.bmWidth; ++x) {
-            bool opaque = false;
-            if (x < info.bmWidth) {
-                const size_t offset = (static_cast<size_t>(y) * info.bmWidth + x) * 4;
-                const COLORREF color = RGB(pixels[offset + 2], pixels[offset + 1], pixels[offset]);
-                opaque = color != transparent;
-            }
-            if (opaque && run < 0) run = x;
-            if (!opaque && run >= 0) {
-                const HRGN row = CreateRectRgn(run, y, x, y + 1);
-                CombineRgn(result, result, row, RGN_OR);
-                DeleteObject(row);
-                run = -1;
-            }
-        }
-    }
-    return result;
-}
-
 // --------------------------------------------------------------- 框体绘制
 namespace {
 
 void DrawBitmapPatch(HDC target, const SkinImage& source, const RECT& destination,
-                     const RECT& source_rect, bool tile) {
+                     const RECT& source_rect, bool tile, const ui::DpiScale& scale) {
     const int destination_width = destination.right - destination.left;
     const int destination_height = destination.bottom - destination.top;
     const int source_width = source_rect.right - source_rect.left;
@@ -1460,12 +1418,16 @@ void DrawBitmapPatch(HDC target, const SkinImage& source, const RECT& destinatio
                     source_rect.left, source_rect.top, source_width, source_height);
         return;
     }
+    // Tiled centre: each repeated patch is scaled to its on-screen size, not
+    // left at 1x source pixels (otherwise 200% showed a grid of 1px tiles).
+    const int step_x = scale.X(source_width);
+    const int step_y = scale.Y(source_height);
     const int saved = SaveDC(target);
     IntersectClipRect(target, destination.left, destination.top,
                       destination.right, destination.bottom);
-    for (int y = destination.top; y < destination.bottom; y += source_height) {
-        for (int x = destination.left; x < destination.right; x += source_width) {
-            source.Draw(target, x, y, source_width, source_height,
+    for (int y = destination.top; y < destination.bottom; y += step_y) {
+        for (int x = destination.left; x < destination.right; x += step_x) {
+            source.Draw(target, x, y, step_x, step_y,
                         source_rect.left, source_rect.top, source_width, source_height);
         }
     }
@@ -1518,30 +1480,42 @@ HRGN CreateColorKeyRegion(HBITMAP bitmap, int width, int height,
 } // namespace
 
 void DrawFrameBackground(HDC target, const SkinBitmap& bitmap, RECT resize_rect,
-                         int width, int height, bool tile) {
+                         int width, int height, bool tile,
+                         const ui::DpiScale& scale) {
     if (!bitmap.image || bitmap.size.cx <= 0 || bitmap.size.cy <= 0 ||
         width <= 0 || height <= 0) return;
+    const int n = bitmap.image.SourceScale();  // asset multiplier (@1x => 1)
+    // The background's natural size in logical (96-DPI) pixels. For @Nx assets
+    // the decoded bitmap is larger, so derive the logical size by dividing out
+    // the multiplier; resize_rect from the XML is always logical.
+    const int logical_w = n > 1 ? bitmap.size.cx / n : bitmap.size.cx;
+    const int logical_h = n > 1 ? bitmap.size.cy / n : bitmap.size.cy;
     if (resize_rect.right <= resize_rect.left ||
         resize_rect.bottom <= resize_rect.top ||
-        width < bitmap.size.cx || height < bitmap.size.cy) {
+        width < logical_w || height < logical_h) {
         // 没有可拉伸的中心区（或目标比原始位图更小）：整幅 1:1 缩放到目标。
         bitmap.image.Draw(target, 0, 0, width, height, 0, 0,
                           bitmap.size.cx, bitmap.size.cy);
         return;
     }
 
-    resize_rect.left = std::clamp<LONG>(resize_rect.left, 0, bitmap.size.cx);
-    resize_rect.right = std::clamp<LONG>(resize_rect.right,
-                                         resize_rect.left, bitmap.size.cx);
-    resize_rect.top = std::clamp<LONG>(resize_rect.top, 0, bitmap.size.cy);
-    resize_rect.bottom = std::clamp<LONG>(resize_rect.bottom,
-                                          resize_rect.top, bitmap.size.cy);
-    const int destination_right = width - (bitmap.size.cx - resize_rect.right);
-    const int destination_bottom = height - (bitmap.size.cy - resize_rect.bottom);
-    const int source_x[] = {0, resize_rect.left, resize_rect.right, bitmap.size.cx};
-    const int source_y[] = {0, resize_rect.top, resize_rect.bottom, bitmap.size.cy};
-    const int destination_x[] = {0, resize_rect.left, destination_right, width};
-    const int destination_y[] = {0, resize_rect.top, destination_bottom, height};
+    resize_rect.left = std::clamp<LONG>(resize_rect.left, 0, logical_w);
+    resize_rect.right = std::clamp<LONG>(resize_rect.right, resize_rect.left, logical_w);
+    resize_rect.top = std::clamp<LONG>(resize_rect.top, 0, logical_h);
+    resize_rect.bottom = std::clamp<LONG>(resize_rect.bottom, resize_rect.top, logical_h);
+    // Source split uses logical resize_rect * asset multiplier N; destination
+    // split uses logical resize_rect * display DPI. The two are independent
+    // (docs/HIGH_DPI_SKIN_SPEC.md §4 invariant).
+    const int source_left = resize_rect.left * n;
+    const int source_right = resize_rect.right * n;
+    const int source_top = resize_rect.top * n;
+    const int source_bottom = resize_rect.bottom * n;
+    const int destination_right = width - scale.X(logical_w - resize_rect.right);
+    const int destination_bottom = height - scale.Y(logical_h - resize_rect.bottom);
+    const int source_x[] = {0, source_left, source_right, bitmap.size.cx};
+    const int source_y[] = {0, source_top, source_bottom, bitmap.size.cy};
+    const int destination_x[] = {0, scale.X(resize_rect.left), destination_right, width};
+    const int destination_y[] = {0, scale.Y(resize_rect.top), destination_bottom, height};
 
     for (int row = 0; row < 3; ++row) {
         for (int column = 0; column < 3; ++column) {
@@ -1550,13 +1524,14 @@ void DrawFrameBackground(HDC target, const SkinBitmap& bitmap, RECT resize_rect,
             const RECT destination_patch{destination_x[column], destination_y[row],
                                          destination_x[column + 1], destination_y[row + 1]};
             DrawBitmapPatch(target, bitmap.image, destination_patch, source_patch,
-                            tile && (row == 1 || column == 1));
+                            tile && (row == 1 || column == 1), scale);
         }
     }
 }
 
 HRGN CreateFrameRegion(const SkinBitmap& bitmap, RECT resize_rect,
-                       int width, int height, bool tile, COLORREF transparent) {
+                       int width, int height, bool tile, COLORREF transparent,
+                       const ui::DpiScale& scale) {
     // 区域掩码必须和背景用完全相同的九宫格/平铺映射，否则拉伸后边框会错位。
     // PNG 的洋红像素不是 BMP 的颜色键，要改走 alpha 掩码。
     auto source = bitmap;
@@ -1578,7 +1553,7 @@ HRGN CreateFrameRegion(const SkinBitmap& bitmap, RECT resize_rect,
         const HBRUSH brush = CreateSolidBrush(transparent);
         FillRect(canvas, &bounds, brush);
         DeleteObject(brush);
-        DrawFrameBackground(canvas, source, resize_rect, width, height, tile);
+        DrawFrameBackground(canvas, source, resize_rect, width, height, tile, scale);
         SelectObject(canvas, old);
         region = CreateColorKeyRegion(rendered, width, height, transparent);
     }
@@ -1588,7 +1563,7 @@ HRGN CreateFrameRegion(const SkinBitmap& bitmap, RECT resize_rect,
 }
 
 void DrawFrameButton(HDC target, const SkinElement& element, RECT bounds,
-                     int state, COLORREF transparent) {
+                     int state, COLORREF transparent, const ui::DpiScale& scale) {
     if (!element.image || element.image_size.cx <= 0 ||
         element.image_size.cy <= 0) return;
     const int frames = std::max(1, element.frames);
@@ -1597,14 +1572,141 @@ void DrawFrameButton(HDC target, const SkinElement& element, RECT bounds,
     state = std::clamp(state, 0, frames - 1);
     // FUN_0040A35B copies a SkinButton frame at its native dimensions from
     // client origin (0,0); it does not stretch the frame to an XML rectangle
-    // that contains one or two pixels of padding.
-    const int destination_width = frames > 1 ? frame_width
+    // that contains one or two pixels of padding. Multi-frame buttons were
+    // previously drawn at 1x regardless of DPI; here the destination uses the
+    // on-screen scale while the source offset stays in source pixels (§2.4).
+    const int destination_width = frames > 1 ? scale.X(frame_width)
                                              : bounds.right - bounds.left;
-    const int destination_height = frames > 1 ? element.image_size.cy
+    const int destination_height = frames > 1 ? scale.Y(element.image_size.cy)
                                               : bounds.bottom - bounds.top;
     element.image.Draw(target, bounds.left, bounds.top, destination_width,
                        destination_height, state * frame_width, 0,
                        frame_width, element.image_size.cy, transparent);
+}
+
+// ----------------------------------------------------------------- 镜像缩放
+SkinElement ScaleElement(const SkinElement& e, const ui::DpiScale& s) {
+    SkinElement out = e;
+    out.bounds = s.Rect(e.bounds);
+    out.font_size = s.FontPx(e.font_size);
+    return out;
+}
+std::vector<SkinElement> ScaleElements(const std::vector<SkinElement>& in,
+                                       const ui::DpiScale& s) {
+    std::vector<SkinElement> out;
+    out.reserve(in.size());
+    for (const auto& e : in) out.push_back(ScaleElement(e, s));
+    return out;
+}
+void ScaleLogfont(LOGFONTW& lf, const ui::DpiScale& s) {
+    lf.lfHeight = s.LfHeight(lf.lfHeight);  // 负值 em 高度须保号
+    if (lf.lfWidth != 0) lf.lfWidth = s.LfHeight(lf.lfWidth);
+}
+
+LegacySkin LegacySkin::AtDpi(const ui::DpiScale& scale) const {
+    LegacySkin out;
+    out.transparent_color_ = transparent_color_;
+    out.icon_ = icon_;
+    out.window_size_ = scale.Size(window_size_);
+    out.background_ = background_;
+    out.bitmaps_ = bitmaps_;  // 共享 storage，不重新解码
+    out.elements_ = ScaleElements(elements_, scale);
+
+    out.mini_.background = mini_.background;
+    out.mini_.window_size = scale.Size(mini_.window_size);
+    out.mini_.elements = ScaleElements(mini_.elements, scale);
+
+    out.playlist_ = playlist_;
+    out.playlist_.position = scale.Rect(playlist_.position);
+    out.playlist_.list_bounds = scale.Rect(playlist_.list_bounds);
+    out.playlist_.toolbar_bounds = scale.Rect(playlist_.toolbar_bounds);
+    out.playlist_.close = ScaleElement(playlist_.close, scale);
+    out.playlist_.title = ScaleElement(playlist_.title, scale);
+    if (playlist_.toolbar_items) {
+        auto items = *playlist_.toolbar_items;
+        for (auto& item : items) item = scale.Rect(item);
+        out.playlist_.toolbar_items = items;
+    }
+
+    out.lyric_ = lyric_;
+    out.lyric_.position = scale.Rect(lyric_.position);
+    out.lyric_.lyric_bounds = scale.Rect(lyric_.lyric_bounds);
+    out.lyric_.mini_padding = scale.Rect(lyric_.mini_padding);
+    out.lyric_.title = ScaleElement(lyric_.title, scale);
+    out.lyric_.close = ScaleElement(lyric_.close, scale);
+    out.lyric_.ontop = ScaleElement(lyric_.ontop, scale);
+    out.lyric_.desklrc = ScaleElement(lyric_.desklrc, scale);
+    ScaleLogfont(out.lyric_.font, scale);
+    ScaleLogfont(out.lyric_.mini_font, scale);
+
+    out.desktop_lyric_bar_ = desktop_lyric_bar_;
+    out.desktop_lyric_bar_.icon = scale.Rect(desktop_lyric_bar_.icon);
+    out.desktop_lyric_bar_.play = ScaleElement(desktop_lyric_bar_.play, scale);
+    out.desktop_lyric_bar_.pause = ScaleElement(desktop_lyric_bar_.pause, scale);
+    out.desktop_lyric_bar_.previous = ScaleElement(desktop_lyric_bar_.previous, scale);
+    out.desktop_lyric_bar_.next = ScaleElement(desktop_lyric_bar_.next, scale);
+    out.desktop_lyric_bar_.list = ScaleElement(desktop_lyric_bar_.list, scale);
+    out.desktop_lyric_bar_.settings = ScaleElement(desktop_lyric_bar_.settings, scale);
+    out.desktop_lyric_bar_.karaoke = ScaleElement(desktop_lyric_bar_.karaoke, scale);
+    out.desktop_lyric_bar_.lines = ScaleElement(desktop_lyric_bar_.lines, scale);
+    out.desktop_lyric_bar_.lock = ScaleElement(desktop_lyric_bar_.lock, scale);
+    out.desktop_lyric_bar_.ontop = ScaleElement(desktop_lyric_bar_.ontop, scale);
+    out.desktop_lyric_bar_.zoom_in = ScaleElement(desktop_lyric_bar_.zoom_in, scale);
+    out.desktop_lyric_bar_.zoom_out = ScaleElement(desktop_lyric_bar_.zoom_out, scale);
+    out.desktop_lyric_bar_.return_to_window =
+        ScaleElement(desktop_lyric_bar_.return_to_window, scale);
+    out.desktop_lyric_bar_.close = ScaleElement(desktop_lyric_bar_.close, scale);
+
+    out.browser_ = browser_;
+    out.browser_.position = scale.Rect(browser_.position);
+    out.browser_.content_bounds = scale.Rect(browser_.content_bounds);
+    out.browser_.close = ScaleElement(browser_.close, scale);
+    out.browser_.backward = ScaleElement(browser_.backward, scale);
+    out.browser_.forward = ScaleElement(browser_.forward, scale);
+    out.browser_.refresh = ScaleElement(browser_.refresh, scale);
+    out.browser_.check = ScaleElement(browser_.check, scale);
+    out.browser_.link = ScaleElement(browser_.link, scale);
+
+    out.equalizer_ = equalizer_;
+    out.equalizer_.position = scale.Rect(equalizer_.position);
+    out.equalizer_.title = ScaleElement(equalizer_.title, scale);
+    out.equalizer_.close = ScaleElement(equalizer_.close, scale);
+    out.equalizer_.enabled = ScaleElement(equalizer_.enabled, scale);
+    out.equalizer_.profile = ScaleElement(equalizer_.profile, scale);
+    out.equalizer_.reset = ScaleElement(equalizer_.reset, scale);
+    out.equalizer_.balance = ScaleElement(equalizer_.balance, scale);
+    out.equalizer_.surround = ScaleElement(equalizer_.surround, scale);
+    out.equalizer_.preamp = ScaleElement(equalizer_.preamp, scale);
+    for (size_t i = 0; i < out.equalizer_.bands.size(); ++i)
+        out.equalizer_.bands[i] = ScaleElement(equalizer_.bands[i], scale);
+
+    out.visual_ = visual_;
+    if (out.visual_.font) ScaleLogfont(*out.visual_.font, scale);
+
+    // resize_rect / 位图源尺寸 / 字体字号字段（font_size 已是像素）保持逻辑，
+    // 由栅格化函数内部 ×N 与 ×scale 分别处理（docs/HIGH_DPI_SKIN_SPEC.md §5.2）。
+    return out;
+}
+
+HRGN LegacySkin::CreateWindowRegion(bool mini) const {
+    return CreateWindowRegion(mini, ui::DpiScale{96});
+}
+
+HRGN LegacySkin::CreateWindowRegion(bool mini, const ui::DpiScale& scale) const {
+    // 主窗/迷你窗背景是固定尺寸 SkinImage（非九宫格）。包成空 resize_rect 的
+    // SkinBitmap，复用 DrawFrameBackground 的整幅缩放退化分支按物理尺寸重绘，
+    // 再扫描颜色键/alpha 生成区域（docs/HIGH_DPI_SKIN_SPEC.md §6.11）。
+    const auto& image = mini ? mini_.background : background_;
+    const auto mask = image.IsGdiPlus() ? image.CoverageMask() : image;
+    if (!mask) return nullptr;
+    const COLORREF transparent = image.IsGdiPlus() ? RGB(0, 0, 0) : transparent_color_;
+    SkinBitmap frame{mask, mask.Size()};
+    // window_size_ is already in physical pixels: the window always consumes
+    // the AtDpi() mirror, never the 96-DPI source object. Scaling it again
+    // here would double-apply the factor.
+    const SIZE physical = mini ? mini_.window_size : window_size_;
+    return CreateFrameRegion(frame, RECT{}, physical.cx, physical.cy, false,
+                             transparent, scale);
 }
 
 } // namespace ttplayer::skin
