@@ -1,0 +1,271 @@
+#include "ttplayer/app/runtime.h"
+
+#include <commctrl.h>
+#include <iterator>
+#include <string_view>
+
+namespace ttplayer::app {
+namespace {
+constexpr UINT_PTR kTooltipSubclassId = 0x004B56E7;
+constexpr UINT_PTR kTooltipTopmostTimer = 0x7B;
+
+bool WindowClassEquals(HWND window, std::wstring_view expected) noexcept {
+    if (!window || expected.empty()) return false;
+    wchar_t name[1024]{};
+    const int length = GetClassNameW(window, name, static_cast<int>(std::size(name)));
+    return length > 0 && expected.size() == static_cast<size_t>(length) &&
+           CompareStringOrdinal(name, length, expected.data(),
+                                static_cast<int>(expected.size()), TRUE) ==
+               CSTR_EQUAL;
+}
+
+void SetTooltipTopmost(HWND window, bool topmost) noexcept {
+    const LONG_PTR extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    const bool current = (extended & WS_EX_TOPMOST) != 0;
+    if (current == topmost) return;
+    if (topmost) {
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        // FUN_004B5713 -> FUN_00405417 removes the extended-style bit
+        // directly when the tooltip is hidden; it does not reorder the
+        // window until the next paint makes it topmost again.
+        SetWindowLongPtrW(window, GWL_EXSTYLE,
+                          extended & ~static_cast<LONG_PTR>(WS_EX_TOPMOST));
+    }
+}
+
+LRESULT CALLBACK TooltipSubclassProc(HWND window, UINT message,
+                                     WPARAM wparam, LPARAM lparam,
+                                     UINT_PTR subclass_id,
+                                     DWORD_PTR reference_data) {
+    switch (message) {
+    case WM_TIMER:
+        if (wparam == kTooltipTopmostTimer) {
+            if ((GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) == 0)
+                SetTooltipTopmost(window, false);
+            return 0;
+        }
+        break;
+    case WM_PAINT:
+        SetTooltipTopmost(window, true);
+        // 004B5713 arms this once. Resetting it on every repaint can postpone
+        // the hidden-window check indefinitely during animation.
+        if (!reference_data && SetTimer(window, kTooltipTopmostTimer, 50, nullptr))
+            SetWindowSubclass(window, TooltipSubclassProc, subclass_id, 1);
+        break;
+    case WM_DESTROY:
+        KillTimer(window, kTooltipTopmostTimer);
+        break;
+    case WM_NCDESTROY: {
+        const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+        RemoveWindowSubclass(window, TooltipSubclassProc, subclass_id);
+        return result;
+    }
+    default:
+        break;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
+void AttachTooltipBehavior(HWND window) noexcept {
+    DWORD_PTR existing{};
+    if (GetWindowSubclass(window, TooltipSubclassProc, kTooltipSubclassId,
+                          &existing))
+        return;
+    SetWindowSubclass(window, TooltipSubclassProc, kTooltipSubclassId, 0);
+}
+
+constexpr UINT_PTR kMenuBorderSubclassId = 0x00450E67;
+
+bool IsLegacyPushButton(HWND window) noexcept {
+    // 004B5858 excludes checks, radios and group boxes; 004B591D also
+    // excludes owner-drawn buttons. The surviving low-nibble types are
+    // BS_PUSHBUTTON, BS_DEFPUSHBUTTON and the legacy BS_USERBUTTON.
+    const auto type = GetWindowLongPtrW(window, GWL_STYLE) & BS_TYPEMASK;
+    return type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON || type == BS_USERBUTTON;
+}
+
+LRESULT CALLBACK ButtonCursorSubclassProc(HWND window, UINT message,
+    WPARAM wparam, LPARAM lparam, UINT_PTR identifier, DWORD_PTR) {
+    if (message == WM_SETCURSOR && reinterpret_cast<HWND>(wparam) == window &&
+        LOWORD(lparam) == HTCLIENT && IsWindowEnabled(window) && IsLegacyPushButton(window)) {
+        // 004C119B -> 00466427 -> 004664CD: all eligible buttons, including
+        // text-only buttons in resource dialogs, use the shared hand cursor.
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return TRUE;
+    }
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, ButtonCursorSubclassProc, identifier);
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
+void AttachButtonCursor(HWND window) noexcept {
+    constexpr UINT_PTR identifier = 0x004664CD;
+    DWORD_PTR existing{};
+    if (IsLegacyPushButton(window) &&
+        !GetWindowSubclass(window, ButtonCursorSubclassProc, identifier, &existing))
+        SetWindowSubclass(window, ButtonCursorSubclassProc, identifier, 0);
+}
+
+void PaintMenuBorder(HWND window, HDC dc) noexcept {
+    if (!dc) return;
+    const int saved = SaveDC(dc);
+    if (!saved) return;
+    RECT bounds{}, client{};
+    GetWindowRect(window, &bounds);
+    GetClientRect(window, &client);
+    MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&client), 2);
+    OffsetRect(&client, -bounds.left, -bounds.top);
+    OffsetRect(&bounds, -bounds.left, -bounds.top);
+    SetWindowOrgEx(dc, 0, 0, nullptr);
+    ExcludeClipRect(dc, client.left, client.top, client.right, client.bottom);
+    SetDCBrushColor(dc, 0x00F9FCFC);
+    FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    SetDCBrushColor(dc, GetSysColor(COLOR_BTNSHADOW));
+    FrameRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    RestoreDC(dc, saved);
+}
+
+LRESULT CALLBACK MenuBorderSubclassProc(HWND window, UINT message,
+    WPARAM wparam, LPARAM lparam, UINT_PTR identifier, DWORD_PTR) {
+    if (message == WM_NCPAINT) {
+        const HDC dc = GetWindowDC(window);
+        PaintMenuBorder(window, dc);
+        if (dc) ReleaseDC(window, dc);
+        return 0;
+    }
+    const auto result = DefSubclassProc(window, message, wparam, lparam);
+    if (message == WM_PRINT && (lparam & PRF_NONCLIENT) != 0)
+        PaintMenuBorder(window, reinterpret_cast<HDC>(wparam));
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, MenuBorderSubclassProc, identifier);
+    return result;
+}
+} // namespace
+
+std::filesystem::path RuntimePath(const std::filesystem::path& relative) {
+    // TTPlayer_wWinMain (004C0E8F), CPlayerApp_InitializeResources
+    // (004C077E) and the skin enumerator (0045E518) all build paths from the
+    // executable module directory.  In particular, they never search the
+    // process working directory or repository parents.
+    std::wstring executable(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(),
+                                            static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size()) return {};
+    executable.resize(length);
+    return std::filesystem::path(executable).parent_path() / relative;
+}
+
+std::filesystem::path FindRuntimePath(const std::filesystem::path& relative) {
+    const auto candidate = RuntimePath(relative);
+    if (candidate.empty()) return {};
+    std::error_code error;
+    if (std::filesystem::exists(candidate, error) && !error) return candidate;
+    return {};
+}
+
+TtpCommRuntime::~TtpCommRuntime() { Shutdown(); }
+bool TtpCommRuntime::Initialize() {
+    if (api_.module) return true;
+    const auto path = FindRuntimePath(L"ttpcomm.dll");
+    return !path.empty() && TtpComm_LoadApi(&api_, path.c_str());
+}
+void TtpCommRuntime::Shutdown() { if (api_.module) TtpComm_UnloadApi(&api_); }
+
+ResourceRuntime::~ResourceRuntime() { Shutdown(); }
+bool ResourceRuntime::Initialize() {
+    const auto path = FindRuntimePath(L"ttpres.dll");
+    if (path.empty()) return false;
+    // CPlayerApp_InitializeResources (004C077E) uses LoadLibraryW and keeps
+    // this module live through the whole player session.  Loading the DLL is
+    // not sufficient: the original also reads string 0x80 and accepts only
+    // its simplified/traditional product names or the neutral TTPlayer name.
+    // This prevents an unrelated DLL with the same filename from becoming the
+    // process resource module.
+    module_ = LoadLibraryW(path.c_str());
+    if (!module_) return false;
+
+    const wchar_t* title{};
+    const int title_length = LoadStringW(module_, 0x80,
+        reinterpret_cast<LPWSTR>(&title), 0);
+    const std::wstring_view value = title_length > 0 && title
+        ? std::wstring_view(title, static_cast<size_t>(title_length))
+        : std::wstring_view{};
+    if (value != L"千千静听" && value != L"千千靜聽" && value != L"TTPlayer") {
+        FreeLibrary(module_);
+        module_ = nullptr;
+        return false;
+    }
+    return true;
+}
+void ResourceRuntime::Shutdown() { if (module_) { FreeLibrary(module_); module_ = nullptr; } }
+
+HRESULT SoundLibraryRuntime::Initialize(const std::filesystem::path& addin_directory) {
+    try {
+        return manager_.Load(addin_directory);
+    } catch (const std::exception&) {
+        manager_.Shutdown();
+        return E_FAIL;
+    }
+}
+SoundLibraryRuntime::~SoundLibraryRuntime() { Shutdown(); }
+void SoundLibraryRuntime::Shutdown() { manager_.Shutdown(); }
+
+ThreadMessageHooksRuntime::~ThreadMessageHooksRuntime() { Shutdown(); }
+
+bool ThreadMessageHooksRuntime::Install() {
+    const DWORD thread = GetCurrentThreadId();
+    if (!call_window_hook_)
+        call_window_hook_ = SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHook, nullptr, thread);
+    if (!cbt_hook_)
+        cbt_hook_ = SetWindowsHookExW(WH_CBT, CbtHook, nullptr, thread);
+    return call_window_hook_ && cbt_hook_;
+}
+
+void ThreadMessageHooksRuntime::Shutdown() {
+    if (cbt_hook_) { UnhookWindowsHookEx(cbt_hook_); cbt_hook_ = nullptr; }
+    if (call_window_hook_) { UnhookWindowsHookEx(call_window_hook_); call_window_hook_ = nullptr; }
+}
+
+LRESULT CALLBACK ThreadMessageHooksRuntime::CallWndProcHook(
+    int code, WPARAM wparam, LPARAM lparam) {
+    // The final WM_CREATE branch of 004B591D compares against the literal
+    // "tooltips_class32" (0x0051A750), subclasses the tooltip and keeps it
+    // topmost while painted.  Reproduce the complete observable timer/style
+    // behavior without fabricating the private WTL object's binary layout.
+    if (code == HC_ACTION && lparam != 0) {
+        const auto* event = reinterpret_cast<const CWPSTRUCT*>(lparam);
+        if (event->message == WM_CREATE &&
+            WindowClassEquals(event->hwnd, TOOLTIPS_CLASSW))
+            AttachTooltipBehavior(event->hwnd);
+        if (event->message == WM_CREATE &&
+            WindowClassEquals(event->hwnd, WC_BUTTONW))
+            AttachButtonCursor(event->hwnd);
+    }
+
+    // Menu ownership and button painting stay in their existing adapters.
+    // This separate subclass owns no bitmap, theme or business state.
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+LRESULT CALLBACK ThreadMessageHooksRuntime::CbtHook(int code, WPARAM wparam, LPARAM lparam) {
+    // 004B5B13 checks SPI_GETFLATMENU (0x1022), then class #32768
+    // (0051E874). It supplies a classic popup-menu border, not the player
+    // window's drop shadow. 00450EF7 handles WM_NCPAINT and WM_PRINT.
+    if (code == HCBT_CREATEWND) {
+        const auto window = reinterpret_cast<HWND>(wparam);
+        BOOL flat = FALSE;
+        SystemParametersInfoW(SPI_GETFLATMENU, 0, &flat, 0);
+        if (!flat && WindowClassEquals(window, L"#32768")) {
+            DWORD_PTR existing{};
+            if (!GetWindowSubclass(window, MenuBorderSubclassProc,
+                                   kMenuBorderSubclassId, &existing) &&
+                SetWindowSubclass(window, MenuBorderSubclassProc, kMenuBorderSubclassId, 0))
+                SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+} // namespace ttplayer::app
