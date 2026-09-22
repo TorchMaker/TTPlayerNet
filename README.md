@@ -317,11 +317,6 @@ rebuild/build/resources/AddIn/ttpres.dll
 也可以直接把音频或播放列表路径当参数传进去。程序会先绘制原版 327x141 默认皮肤；
 只有在皮肤包加载失败时才退回原生深色窗口兜底。
 
-### CI 手动构建
-
-工作流进入默认分支后，从 **Actions → Manual Windows Build → Run workflow** 手动触发。
-产出 x86 播放器 EXE，**不打包原版 DLL 与私有配置**。输入项与干净检出构建见 [`docs/BUILDING.md`](docs/BUILDING.md)。
-
 ### 自检与日志
 
 音乐窗链路可以在**无界面**模式下自检，结果写进 `%TEMP%\ttplayer_mf_http.log`，

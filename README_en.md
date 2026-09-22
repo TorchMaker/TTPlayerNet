@@ -351,12 +351,6 @@ Runtime files are always resolved **relative to the executable**, independent of
 You can also pass a supported audio or playlist path as an argument. The program first paints the original
 327x141 default skin, and only falls back to a native dark window if the skin package fails to load.
 
-### Manual CI build
-
-Once the workflow is on the default branch, trigger it from **Actions → Manual Windows Build → Run workflow**.
-It produces an x86 player EXE and **does not package original DLLs or private configuration**.
-Inputs and clean-checkout builds are documented in [`docs/BUILDING.md`](docs/BUILDING.md).
-
 ### Self-test and logs
 
 The music window chain can be self-tested **without a UI**, writing to `%TEMP%\ttplayer_mf_http.log`

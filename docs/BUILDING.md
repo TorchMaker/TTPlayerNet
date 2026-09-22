@@ -16,6 +16,13 @@ git submodule update --init --recursive -- tests
 
 ## GitHub Actions
 
+> **注意：`.github/workflows/manual-build.yml` 当前不在仓库里。**
+> 推送带 workflow 文件的分支需要令牌具备 `workflow` / `Workflows: Read and write` 权限，
+> 为避免给发布者增设这一权限门槛，该文件已从仓库移除，本节保留作为重新启用 CI 时的参考。
+> 另外原文件 Release 说明里的原版 5.7.9 下载链接已经 404（见
+> [`FEATURE_AND_LINK_AUDIT.md`](FEATURE_AND_LINK_AUDIT.md) 的 P0 项），重新启用前需要先修掉。
+> 现在请按本页其余小节在本地构建。
+
 本地 `rebuild` 是独立 Git 仓库；它在 GitHub 上就是仓库根目录。
 工作流位于 `.github/workflows/manual-build.yml`，不配置 push/PR 自动触发，
 默认只构建；可勾选 **Release a Version (GitHub)** 或 **Publish Release to Gitee**
