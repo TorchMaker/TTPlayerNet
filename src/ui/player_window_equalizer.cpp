@@ -88,6 +88,16 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
     case WM_ACTIVATE:
         RaiseSkinOwnerOnActivation(equalizer_window_, wparam, lparam);
         break;
+    case WM_DPICHANGED: {
+        // Strategy C: this window owns its monitor DPI (see LyricWindowProc).
+        const int dpi = static_cast<int>(HIWORD(wparam));
+        if (dpi <= 0 || dpi == equalizer_scale_.dpi) return 0;
+        RECT bounds{};
+        if (equalizer_window_ && GetWindowRect(equalizer_window_, &bounds))
+            settings_.player.equalizer_window = bounds;
+        UpdateEqualizerWindowSkin(true);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_NCHITTEST:
@@ -220,10 +230,10 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
             BeginSkinBackgroundDrag(equalizer_window_, point);
         } else if (is_slider(hit)) {
             const RECT thumb = EqualizerSliderThumbRect(hit);
-            const bool vertical = skin_ && (hit == kEqSliderPreamp ||
+            const bool vertical = EqualizerSkin() && (hit == kEqSliderPreamp ||
                 (hit >= kEqSliderFirstBand && hit <= kEqSliderLastBand) ||
-                (hit == kEqSliderSurround && skin_->Equalizer().surround.vertical) ||
-                (hit == kEqSliderBalance && skin_->Equalizer().balance.vertical));
+                (hit == kEqSliderSurround && EqualizerSkin()->Equalizer().surround.vertical) ||
+                (hit == kEqSliderBalance && EqualizerSkin()->Equalizer().balance.vertical));
             equalizer_focused_slider_ = hit;
             equalizer_pressed_ = 0;
             equalizer_slider_initial_value_ = EqualizerSliderValue(hit);
@@ -319,10 +329,10 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
             bool vertical = equalizer_focused_slider_ == kEqSliderPreamp ||
                 (equalizer_focused_slider_ >= kEqSliderFirstBand &&
                  equalizer_focused_slider_ <= kEqSliderLastBand);
-            if (skin_ && equalizer_focused_slider_ == kEqSliderBalance)
-                vertical = skin_->Equalizer().balance.vertical;
-            if (skin_ && equalizer_focused_slider_ == kEqSliderSurround)
-                vertical = skin_->Equalizer().surround.vertical;
+            if (EqualizerSkin() && equalizer_focused_slider_ == kEqSliderBalance)
+                vertical = EqualizerSkin()->Equalizer().balance.vertical;
+            if (EqualizerSkin() && equalizer_focused_slider_ == kEqSliderSurround)
+                vertical = EqualizerSkin()->Equalizer().surround.vertical;
             if ((vertical && wparam != VK_UP && wparam != VK_DOWN) ||
                 (!vertical && wparam != VK_LEFT && wparam != VK_RIGHT))
                 return 0;
@@ -389,8 +399,8 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
 
 bool PlayerWindow::CreateEqualizerWindow() {
     if (equalizer_window_) return true;
-    if (!skin_ || !skin_->Equalizer().valid) return false;
-    const auto& layout = skin_->Equalizer();
+    if (!EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return false;
+    const auto& layout = EqualizerSkin()->Equalizer();
     RECT player{};
     GetWindowRect(window_, &player);
     int x = player.left + layout.position.left;
@@ -417,8 +427,8 @@ bool PlayerWindow::CreateEqualizerWindow() {
 }
 
 void PlayerWindow::CreateEqualizerControls() {
-    if (!equalizer_window_ || !skin_ || !skin_->Equalizer().valid) return;
-    const auto& layout = skin_->Equalizer();
+    if (!equalizer_window_ || !EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return;
+    const auto& layout = EqualizerSkin()->Equalizer();
     const auto create = [this](int hit, int identifier,
                                const skin::SkinElement& element,
                                const wchar_t* class_name) {
@@ -505,7 +515,8 @@ void PlayerWindow::ToggleEqualizerWindow() {
 }
 
 void PlayerWindow::UpdateEqualizerWindowSkin(bool saved_bounds) {
-    if (!skin_ || !skin_->Equalizer().valid) {
+    RefreshWindowSkins();
+    if (!EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) {
         if (equalizer_window_) {
             ShowWindow(equalizer_window_, SW_HIDE);
             // The native LX-iPlay switch retains the Equalizer HWND at an
@@ -517,7 +528,7 @@ void PlayerWindow::UpdateEqualizerWindowSkin(bool saved_bounds) {
         return;
     }
     if (!equalizer_window_ && !CreateEqualizerWindow()) return;
-    const auto& layout = skin_->Equalizer();
+    const auto& layout = EqualizerSkin()->Equalizer();
     ScopedSkinRedraw redraw(equalizer_window_);
     RECT player{};
     GetWindowRect(window_, &player);
@@ -539,10 +550,10 @@ void PlayerWindow::UpdateEqualizerWindowSkin(bool saved_bounds) {
 }
 
 void PlayerWindow::UpdateEqualizerWindowRegion() {
-    if (!equalizer_window_ || !skin_ || !skin_->Equalizer().valid) return;
-    const auto& background = skin_->Equalizer().background;
+    if (!equalizer_window_ || !EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return;
+    const auto& background = EqualizerSkin()->Equalizer().background;
     HRGN region = CreateSkinWindowRegion(background, {},
-        background.size.cx, background.size.cy, false, skin_->TransparentColor(), current_scale_);
+        background.size.cx, background.size.cy, false, EqualizerSkin()->TransparentColor(), equalizer_scale_);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(equalizer_window_, region, TRUE)) {
@@ -553,7 +564,7 @@ void PlayerWindow::UpdateEqualizerWindowRegion() {
 void PlayerWindow::UpdateEqualizerToolRects() {
     if (!equalizer_window_ || !CreateToolTipWindow()) return;
     RemoveToolTipTools(equalizer_window_);
-    if (!skin_ || !skin_->Equalizer().valid) return;
+    if (!EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return;
     for (const auto& [hit, control] : equalizer_controls_) {
         UINT_PTR identifier{};
         if (hit == kEqHitEnabled) identifier = kEqCommandEnable;
@@ -616,8 +627,8 @@ void PlayerWindow::SetEqualizerTrackingStatus(int slider, bool tracking) {
 }
 
 RECT PlayerWindow::EqualizerElementBounds(const skin::SkinElement& element) const {
-    if (!skin_) return element.bounds;
-    const SIZE native = skin_->Equalizer().background.size;
+    if (!EqualizerSkin()) return element.bounds;
+    const SIZE native = EqualizerSkin()->Equalizer().background.size;
     return ResolveAlignedRect(element.bounds, element.alignment, native,
                               native.cx, native.cy,
                               element.name == L"title" ? element.image_size : SIZE{});
@@ -663,8 +674,8 @@ void PlayerWindow::ReleaseEqualizerCapture() {
 }
 
 RECT PlayerWindow::EqualizerSliderThumbRect(int slider) const {
-    if (!skin_) return {};
-    const auto& layout = skin_->Equalizer();
+    if (!EqualizerSkin()) return {};
+    const auto& layout = EqualizerSkin()->Equalizer();
     const skin::SkinElement* element = nullptr;
     int minimum{};
     int maximum{};
@@ -701,8 +712,8 @@ RECT PlayerWindow::EqualizerSliderThumbRect(int slider) const {
 }
 
 int PlayerWindow::EqualizerHitTest(POINT point) const {
-    if (!skin_ || !skin_->Equalizer().valid) return 0;
-    const auto& layout = skin_->Equalizer();
+    if (!EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return 0;
+    const auto& layout = EqualizerSkin()->Equalizer();
     const struct ButtonHit { int hit; const skin::SkinElement* element; } buttons[] = {
         {kEqHitClose, &layout.close}, {kEqHitEnabled, &layout.enabled},
         {kEqHitProfile, &layout.profile}, {kEqHitReset, &layout.reset}
@@ -737,8 +748,8 @@ int PlayerWindow::EqualizerHitTest(POINT point) const {
 }
 
 void PlayerWindow::PaintEqualizer(HDC dc) const {
-    if (!skin_ || !skin_->Equalizer().valid) return;
-    const auto& layout = skin_->Equalizer();
+    if (!EqualizerSkin() || !EqualizerSkin()->Equalizer().valid) return;
+    const auto& layout = EqualizerSkin()->Equalizer();
     const SIZE size = layout.background.size;
     const HDC canvas = CreateCompatibleDC(dc);
     const HBITMAP buffer = CreateCompatibleBitmap(dc, size.cx, size.cy);
@@ -754,7 +765,7 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
         return equalizer_hover_ == hit ? 1 : 0;
     };
     DrawElementFrame(canvas, layout.title, EqualizerElementBounds(layout.title),
-                     0, skin_->TransparentColor(), current_scale_);
+                     0, EqualizerSkin()->TransparentColor(), equalizer_scale_);
     DrawAnimatedSkinFrame(canvas, layout.close, EqualizerElementBounds(layout.close),
                      button_state(kEqHitClose), equalizer_window_);
     DrawAnimatedSkinFrame(canvas, layout.enabled, EqualizerElementBounds(layout.enabled),
@@ -793,7 +804,7 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
                 if (height > 0) element.fill_image.Draw(canvas, fill_x,
                     fill_y + source_y, element.fill_size.cx, height,
                     0, source_y, element.fill_size.cx, height,
-                    skin_->TransparentColor());
+                    EqualizerSkin()->TransparentColor());
             } else {
                 // The horizontal fill is likewise kept at bitmap height and
                 // cropped from its left edge to the thumb centre.
@@ -802,7 +813,7 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
                     static_cast<int>(element.fill_size.cx));
                 if (width > 0) element.fill_image.Draw(canvas, fill_x, fill_y,
                     width, element.fill_size.cy, 0, 0, width,
-                    element.fill_size.cy, skin_->TransparentColor());
+                    element.fill_size.cy, EqualizerSkin()->TransparentColor());
             }
         }
         if (element.thumb_image && thumb.right > thumb.left && thumb.bottom > thumb.top) {
@@ -812,7 +823,7 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
             element.thumb_image.Draw(canvas, thumb.left, thumb.top,
                 thumb.right - thumb.left, thumb.bottom - thumb.top,
                 frame * frame_width, 0, frame_width,
-                element.thumb_size.cy, skin_->TransparentColor());
+                element.thumb_size.cy, EqualizerSkin()->TransparentColor());
         }
     };
     draw_slider(kEqSliderBalance, layout.balance);
@@ -854,8 +865,8 @@ void PlayerWindow::SetEqualizerSliderValue(int slider, int value,
 
 void PlayerWindow::SetEqualizerSliderFromPoint(int slider, POINT point,
                                                 bool tracking) {
-    if (!skin_) return;
-    const auto& layout = skin_->Equalizer();
+    if (!EqualizerSkin()) return;
+    const auto& layout = EqualizerSkin()->Equalizer();
     const skin::SkinElement* element = nullptr;
     int minimum{};
     int maximum{};
@@ -1041,8 +1052,8 @@ void PlayerWindow::InvokeEqualizerControl(int control, POINT screen_point) {
         // FUN_00429EF4 anchors the button popup at the profile HWND's
         // screen-space left/bottom corner.  Only WM_CONTEXTMENU uses the raw
         // cursor point (FUN_00429D20).
-        if (skin_) {
-            RECT bounds = EqualizerElementBounds(skin_->Equalizer().profile);
+        if (EqualizerSkin()) {
+            RECT bounds = EqualizerElementBounds(EqualizerSkin()->Equalizer().profile);
             POINT anchor{bounds.left, bounds.bottom};
             ClientToScreen(equalizer_window_, &anchor);
             screen_point = anchor;

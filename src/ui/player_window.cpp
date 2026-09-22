@@ -10,6 +10,7 @@
 
 #include "ttplayer/audio/cue_sheet.h"
 #include "ttplayer/audio/online_stream_descriptor.h"
+#include "ttplayer/app/product.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/musicfree/musicfree_browser_window.h"
@@ -2054,8 +2055,12 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     // 这样换 DPI 只需换换算因子，不会对已放大的值二次累乘。
     // LegacySkin 不可拷贝（拷贝构造已删除），只能搬进去。
     logical_skin_.emplace(std::move(next));
+    // Mirrors are derived from the previous package's logical skin; drop them
+    // so the auxiliary windows never keep drawing the skin we just replaced.
+    dpi_mirrors_.clear();
     current_scale_ = ui::ResolveScaleForWindow(window_);
     skin_.emplace(logical_skin_->AtDpi(current_scale_));
+    RefreshWindowSkins();
     // 诊断：确认 <browser_window> 段确实跟着 LegacySkin 一起搬了过来。
     // LegacySkin 的 move 赋值是手写逐成员搬运，曾漏掉 browser_ —— 结果是音乐窗
     // 永远拿不到皮肤段（ActiveSkin 返回 nullptr），退回自绘外框，而那个外框早期
@@ -2183,6 +2188,31 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     return true;
 }
 
+const skin::LegacySkin* PlayerWindow::SkinForDpi(int dpi) {
+    if (!logical_skin_) return nullptr;
+    if (dpi <= 0) dpi = ui::DpiScale::kBaseDpi;
+    const auto existing = dpi_mirrors_.find(dpi);
+    if (existing != dpi_mirrors_.end()) return existing->second.get();
+    auto mirror = std::make_unique<skin::LegacySkin>(
+        logical_skin_->AtDpi(ui::DpiScale{dpi}));
+    const skin::LegacySkin* raw = mirror.get();
+    dpi_mirrors_.emplace(dpi, std::move(mirror));
+    return raw;
+}
+
+const skin::LegacySkin* PlayerWindow::SkinForWindow(HWND hwnd) {
+    return SkinForDpi(ui::ResolveScaleForWindow(hwnd).dpi);
+}
+
+void PlayerWindow::RefreshWindowSkins() {
+    lyric_skin_ = SkinForWindow(lyric_window_);
+    playlist_skin_ = SkinForWindow(playlist_window_);
+    equalizer_skin_ = SkinForWindow(equalizer_window_);
+    lyric_scale_ = ui::ResolveScaleForWindow(lyric_window_);
+    playlist_scale_ = ui::ResolveScaleForWindow(playlist_window_);
+    equalizer_scale_ = ui::ResolveScaleForWindow(equalizer_window_);
+}
+
 void PlayerWindow::ApplyDpiScale(const ui::DpiScale& scale) {
     if (scale.dpi == current_scale_.dpi) return;
     current_scale_ = scale;
@@ -2194,6 +2224,9 @@ void PlayerWindow::ApplyDpiScale(const ui::DpiScale& scale) {
     // 不会对已经放大过的值二次累乘（docs/HIGH_DPI_SKIN_SPEC.md §5.2）。
     desktop_lyrics_.SetSkin(nullptr);  // 释放借用的位图后再销毁旧镜像
     skin_.emplace(logical_skin_->AtDpi(current_scale_));
+    // Auxiliary windows may sit on a monitor with a different DPI; the cache is
+    // keyed by DPI so they keep their own scale instead of the main window's.
+    RefreshWindowSkins();
     if (!window_ || !IsWindow(window_)) return;
     // saved_bounds=false：保留当前位置，只按新的物理尺寸重新定框/重建区域。
     ApplyLoadedSkin(false, false);
@@ -2681,6 +2714,9 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
     case WM_SETTINGCHANGE:
         if (wparam == SPI_SETWORKAREA && fullscreen_mode_ != 0)
             UpdateFullScreenLayout();
+        // The user can change the system scale factor from Settings; on some
+        // paths only WM_SETTINGCHANGE arrives. See WM_DISPLAYCHANGE above.
+        ApplyDpiScale(ui::ResolveScaleForWindow(window_));
         return 0;
     case WM_HOTKEY:
         if (static_cast<int>(wparam) == kFullscreenEscapeHotkey &&
@@ -3435,6 +3471,10 @@ void PlayerWindow::CaptureWindowState() {
             browser_bounds.bottom > browser_bounds.top)
             settings_.player.browser_window = browser_bounds;
     }
+    // 开关状态同样回读真实可见性：关闭音乐窗的路径不止一条（窗自己的关闭按钮、
+    // F11/pressed 按钮、CloseMusicFreeBrowser），逐点打标记容易漏，回读窗口反而
+    // 是唯一真相 —— 音乐窗被销毁时这里自然就是 false。
+    settings_.player.browser_visible = musicfree::IsMusicFreeBrowserVisible();
     settings_.player.player_window = normal_window_bounds_;
     settings_.player.mini_player_window = mini_window_bounds_;
     settings_.player.mini_mode = mini_mode_;
@@ -5139,6 +5179,15 @@ void PlayerWindow::ShowMusicFreeBrowserWindow(const std::wstring& query) {
             return AddOnlineTrack(hit, url,
                 action == musicfree::OnlineTrackAction::play);
         }, query);
+}
+
+void PlayerWindow::RestoreStartupMusicBrowserWindow() {
+    // 音乐窗归 MusicFree 兼容层所有，它的开关状态随皮肤 sidecar / TTPlayerRebuild.xml
+    // 的 Player/BrowserVisible 持久化（见 CaptureWindowState）。这里只负责在启动时
+    // 按上次退出时的状态把它重新打开一次，避免用户每次都要手动按 F11。
+    if (!settings_.player.browser_visible) return;
+    if (musicfree::IsMusicFreeBrowserVisible()) return;
+    ShowMusicFreeBrowserWindow({});
 }
 
 bool PlayerWindow::HandleContextCommand(UINT command, HWND fullscreen_origin) {
@@ -6851,11 +6900,13 @@ void PlayerWindow::Stop() {
 }
 
 std::wstring PlayerWindow::DefaultPlayerTitle() const {
+    // 名字优先取资源 DLL（0x80 = 本地化的「千千静听」），取不到才退回产品常量。
+    // 版本号固定用产品常量 2026：资源 0x8299 里是原版的 "5.5"，不再是本产品的版本。
+    // 名字与年份紧排成产品全名「千千静听2026」（不再带任何 TTPlayer / 重建版字样）。
     auto title = ResourceText(0x80);
-    const auto version = ResourceText(0x8299);
-    if (!title.empty() && !version.empty()) title += L" ";
-    title += version;
-    return title.empty() ? L"TTPlayer" : title;
+    if (title.empty()) return app::kProductDisplayName;
+    title += app::kProductVersion;
+    return title;
 }
 
 std::wstring PlayerWindow::LyricFallbackText(bool desktop) const {

@@ -868,6 +868,7 @@ Settings LoadLegacyXml(const std::filesystem::path& path) {
         s.player.equalizer_visible=IntAttr(n,L"EqualizerVisible",0)!=0;
         s.player.browser_window=RectAttr(n,L"BrowserWnd");
         s.player.browser_top_most=IntAttr(n,L"BrowserTopMost",0)!=0;
+        s.player.browser_visible=IntAttr(n,L"BrowserVisible",0)!=0;
         s.player.window_dpi=IntAttr(n,L"WindowDpi",0);
         s.player.playlist_scan_count=IntAttr(n,L"PlayLists",100);
         s.player.active_playlist=IntAttr(n,L"ActiveList",0);
@@ -1511,6 +1512,7 @@ bool LoadSkinVisualProfile(const std::filesystem::path& path,
             next_player.playlist_visible=IntAttr(n,L"PlayListVisible",next_player.playlist_visible)!=0;
             next_player.equalizer_visible=IntAttr(n,L"EqualizerVisible",next_player.equalizer_visible)!=0;
             next_player.browser_top_most=IntAttr(n,L"BrowserTopMost",next_player.browser_top_most?1:0)!=0;
+            next_player.browser_visible=IntAttr(n,L"BrowserVisible",next_player.browser_visible?1:0)!=0;
         }
         if(auto node=SelectOwned(document.Get(),L"/ttplayer/PlayList")) {
             auto* n=node.Get();
@@ -1582,9 +1584,10 @@ bool SaveSkinVisualProfile(const std::filesystem::path& path,
     }
     // FUN_0045D5FA sets DAT_00547744 while invoking the common settings
     // serializer. In that branch the sidecar is a per-skin visual snapshot:
-    // six window rectangles, the three normal auxiliary visibility flags,
-    // lyric font/colours and playlist font/colours. Global playback and mini
-    // visibility/top-most values remain in TTPlayer.xml.
+    // six window rectangles, the three normal auxiliary visibility flags and
+    // the music window's own visibility, lyric font/colours and playlist
+    // font/colours. Global playback and mini visibility/top-most values remain
+    // in TTPlayer.xml.
     if(auto* element=EnsureElement(document,L"Player")) {
         auto element_owner=AdoptCom(element);
         SetAttribute(element,L"PlayerWnd",RectangleText(player.player_window));
@@ -1594,6 +1597,7 @@ bool SaveSkinVisualProfile(const std::filesystem::path& path,
         SetAttribute(element,L"EqualizerWnd",RectangleText(player.equalizer_window));
         SetAttribute(element,L"PlayListWnd",RectangleText(player.playlist_window));
         SetAttribute(element,L"BrowserWnd",RectangleText(player.browser_window));
+        SetAttribute(element,L"BrowserVisible",player.browser_visible ? 1 : 0);
         SetAttribute(element,L"WindowDpi",player.window_dpi);
         SetAttribute(element,L"LyricVisible",player.lyric_visible ? 1 : 0);
         SetAttribute(element,L"EqualizerVisible",player.equalizer_visible ? 1 : 0);
@@ -1653,6 +1657,7 @@ void SaveWindowState(const std::filesystem::path& path,
         SetAttribute(element,L"EqualizerWnd",RectangleText(player.equalizer_window));
         SetAttribute(element,L"BrowserWnd",RectangleText(player.browser_window));
         SetAttribute(element,L"BrowserTopMost",player.browser_top_most ? 1 : 0);
+        SetAttribute(element,L"BrowserVisible",player.browser_visible ? 1 : 0);
         SetAttribute(element,L"WindowDpi",player.window_dpi);
         SetAttribute(element,L"MiniMode",player.mini_mode ? 1 : 0);
         SetAttribute(element,L"TopMost",player.top_most ? 1 : 0);

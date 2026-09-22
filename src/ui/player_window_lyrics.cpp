@@ -627,6 +627,19 @@ LRESULT PlayerWindow::HandleLyricMessage(UINT message, WPARAM wparam,
     case WM_ACTIVATE:
         RaiseSkinOwnerOnActivation(lyric_window_, wparam, lparam);
         break;
+    case WM_DPICHANGED: {
+        // Strategy C: this window owns its monitor DPI. Re-resolve its own skin
+        // mirror and rebuild around the live rectangle — the system's suggested
+        // rect is a linear projection that rounds every nine-slice block
+        // independently, which drifts a skinned frame by a pixel or two.
+        const int dpi = static_cast<int>(HIWORD(wparam));
+        if (dpi <= 0 || dpi == lyric_scale_.dpi) return 0;
+        RECT bounds{};
+        if (lyric_window_ && GetWindowRect(lyric_window_, &bounds))
+            ActiveLyricWindowBounds() = bounds;
+        UpdateLyricWindowSkin(true);
+        return 0;
+    }
     case WM_ERASEBKGND:
         if (wparam) PaintLyricWindow(reinterpret_cast<HDC>(wparam));
         return 1;
@@ -636,7 +649,7 @@ LRESULT PlayerWindow::HandleLyricMessage(UINT message, WPARAM wparam,
         return 0;
     case WM_GETMINMAXINFO: {
         auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
-        if (!limits || !skin_ || !skin_->Lyric().valid) return 0;
+        if (!limits || !LyricSkin() || !LyricSkin()->Lyric().valid) return 0;
         if (mini_mode_) {
             RECT player{};
             GetWindowRect(window_, &player);
@@ -648,7 +661,7 @@ LRESULT PlayerWindow::HandleLyricMessage(UINT message, WPARAM wparam,
                 std::max<LONG>(10, work.right - work.left), fixed_height};
             return 0;
         }
-        const auto& layout = skin_->Lyric();
+        const auto& layout = LyricSkin()->Lyric();
         limits->ptMinTrackSize = {layout.background.size.cx,
                                   layout.background.size.cy};
         if (layout.resize_rect.right <= layout.resize_rect.left ||
@@ -909,34 +922,34 @@ bool PlayerWindow::ActiveLyricTransparent() const noexcept {
 COLORREF PlayerWindow::ActiveLyricTextColor() const noexcept {
     if (fullscreen_lyric_detached_)
         return settings_.lyric.fullscreen_text_color;
-    if (mini_mode_ && skin_ && skin_->Lyric().mini_text_color != CLR_INVALID)
-        return skin_->Lyric().mini_text_color;
+    if (mini_mode_ && LyricSkin() && LyricSkin()->Lyric().mini_text_color != CLR_INVALID)
+        return LyricSkin()->Lyric().mini_text_color;
     if (settings_.lyric.text_color != CLR_INVALID)
         return settings_.lyric.text_color;
-    return skin_ && skin_->Lyric().valid
-        ? skin_->Lyric().text_color : RGB(255, 255, 255);
+    return LyricSkin() && LyricSkin()->Lyric().valid
+        ? LyricSkin()->Lyric().text_color : RGB(255, 255, 255);
 }
 
 COLORREF PlayerWindow::ActiveLyricHighlightColor() const noexcept {
     if (fullscreen_lyric_detached_)
         return settings_.lyric.fullscreen_highlight_color;
-    if (mini_mode_ && skin_ && skin_->Lyric().mini_highlight_color != CLR_INVALID)
-        return skin_->Lyric().mini_highlight_color;
+    if (mini_mode_ && LyricSkin() && LyricSkin()->Lyric().mini_highlight_color != CLR_INVALID)
+        return LyricSkin()->Lyric().mini_highlight_color;
     if (settings_.lyric.highlight_color != CLR_INVALID)
         return settings_.lyric.highlight_color;
-    return skin_ && skin_->Lyric().valid
-        ? skin_->Lyric().highlight_color : RGB(255, 255, 255);
+    return LyricSkin() && LyricSkin()->Lyric().valid
+        ? LyricSkin()->Lyric().highlight_color : RGB(255, 255, 255);
 }
 
 COLORREF PlayerWindow::ActiveLyricBackgroundColor() const noexcept {
     if (fullscreen_lyric_detached_)
         return settings_.lyric.fullscreen_background_color;
-    if (mini_mode_ && skin_ && skin_->Lyric().mini_background_color != CLR_INVALID)
-        return skin_->Lyric().mini_background_color;
+    if (mini_mode_ && LyricSkin() && LyricSkin()->Lyric().mini_background_color != CLR_INVALID)
+        return LyricSkin()->Lyric().mini_background_color;
     if (settings_.lyric.background_color != CLR_INVALID)
         return settings_.lyric.background_color;
-    return skin_ && skin_->Lyric().valid
-        ? skin_->Lyric().background_color : RGB(0, 0, 0);
+    return LyricSkin() && LyricSkin()->Lyric().valid
+        ? LyricSkin()->Lyric().background_color : RGB(0, 0, 0);
 }
 
 void PlayerWindow::UpdateLyricScrollTimer() {
@@ -956,7 +969,7 @@ void PlayerWindow::CaptureActiveLyricWindowState() {
 }
 
 void PlayerWindow::ApplyActiveLyricWindowState() {
-    if (!lyric_window_ || !skin_ || !skin_->Lyric().valid) return;
+    if (!lyric_window_ || !LyricSkin() || !LyricSkin()->Lyric().valid) return;
     // 00464B6C swaps the active lyric object before installing its settings.
     // A drag cannot cross that swap, and the new ScrollMode/ScrollMode2 must
     // also select its own animation cadence immediately.
@@ -964,7 +977,7 @@ void PlayerWindow::ApplyActiveLyricWindowState() {
     lyric_line_drag_offset_ = 0;
     if (lyric_control_ && GetCapture() == lyric_control_) ReleaseCapture();
     UpdateLyricScrollTimer();
-    const auto& layout = skin_->Lyric();
+    const auto& layout = LyricSkin()->Lyric();
     RECT target = ActiveLyricWindowBounds();
     const bool have_target = target.right > target.left &&
                              target.bottom > target.top;
@@ -1015,8 +1028,8 @@ void PlayerWindow::ApplyActiveLyricWindowState() {
 
 bool PlayerWindow::CreateLyricWindow() {
     if (lyric_window_) return true;
-    if (!skin_ || !skin_->Lyric().valid) return false;
-    const auto& layout = skin_->Lyric();
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) return false;
+    const auto& layout = LyricSkin()->Lyric();
     RECT player{};
     GetWindowRect(window_, &player);
     int x = player.left + layout.position.left;
@@ -1130,7 +1143,7 @@ void PlayerWindow::LeaveDesktopLyricMode() {
 }
 
 void PlayerWindow::CreateLyricControls() {
-    if (!lyric_window_ || !skin_ || !skin_->Lyric().valid) return;
+    if (!lyric_window_ || !LyricSkin() || !LyricSkin()->Lyric().valid) return;
 
     const auto create_button = [this](HWND& destination, UINT command,
                                       bool tab_stop = true) {
@@ -1167,10 +1180,10 @@ void PlayerWindow::CreateLyricControls() {
     if (lyric_editor_) {
         const bool modified = SendMessageW(lyric_editor_, EM_GETMODIFY, 0, 0) != 0;
         SetLyricEditorFont(settings_.lyric.font_valid
-            ? settings_.lyric.font : skin_->Lyric().font);
+            ? settings_.lyric.font : LyricSkin()->Lyric().font);
         SendMessageW(lyric_editor_, EM_SETBKGNDCOLOR, 0,
             settings_.lyric.background_color != CLR_INVALID
-                ? settings_.lyric.background_color : skin_->Lyric().background_color);
+                ? settings_.lyric.background_color : LyricSkin()->Lyric().background_color);
         FormatLyricEditorAll();
         SendMessageW(lyric_editor_, EM_SETMODIFY, modified, 0);
     }
@@ -1179,14 +1192,14 @@ void PlayerWindow::CreateLyricControls() {
 }
 
 void PlayerWindow::RebuildLyricFont(bool repaint) {
-    if (!skin_ || !skin_->Lyric().valid) return;
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) return;
 
     LOGFONTW font = fullscreen_lyric_detached_
         ? settings_.lyric.fullscreen_font
         : (settings_.lyric.font_valid
-            ? settings_.lyric.font : skin_->Lyric().font);
-    if (!fullscreen_lyric_detached_ && mini_mode_ && skin_->Lyric().mini_font_valid)
-        font = skin_->Lyric().mini_font;
+            ? settings_.lyric.font : LyricSkin()->Lyric().font);
+    if (!fullscreen_lyric_detached_ && mini_mode_ && LyricSkin()->Lyric().mini_font_valid)
+        font = LyricSkin()->Lyric().mini_font;
     // FUN_004499AD/FUN_0043F197 apply AutoFontFS only to the detached
     // vertical layout.  The first pass deliberately uses the control's
     // current font to choose one widest row.  Only when that raw extent does
@@ -1337,9 +1350,10 @@ void PlayerWindow::ToggleLyricWindow() {
 }
 
 void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
+    RefreshWindowSkins();
     const bool desktop_was_visible =
         desktop_lyric_mode_ && desktop_lyrics_.Visible();
-    if (!skin_ || !skin_->Lyric().valid) {
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) {
         if (lyric_window_) {
             ShowWindow(lyric_window_, SW_HIDE);
         }
@@ -1361,7 +1375,7 @@ void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
         }
         return;
     }
-    const auto& layout = skin_->Lyric();
+    const auto& layout = LyricSkin()->Lyric();
     RECT player{};
     GetWindowRect(window_, &player);
     int width = layout.background.size.cx;
@@ -1401,35 +1415,35 @@ void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
 RECT PlayerWindow::LyricElementBounds(const skin::SkinElement& element) const {
     RECT client{};
     if (lyric_window_) GetClientRect(lyric_window_, &client);
-    const SIZE native = skin_ ? skin_->Lyric().background.size : SIZE{};
+    const SIZE native = LyricSkin() ? LyricSkin()->Lyric().background.size : SIZE{};
     return ResolveAlignedRect(element.bounds, element.alignment, native,
                               client.right, client.bottom,
                               element.name == L"title" ? element.image_size : SIZE{});
 }
 
 RECT PlayerWindow::LyricTextBounds() const {
-    if (!skin_ || !skin_->Lyric().valid) return {};
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) return {};
     if (mini_mode_) {
         RECT client{};
         if (lyric_window_) GetClientRect(lyric_window_, &client);
         // Defaults reproduce FUN_004495C8: InflateRect(-2,-2), right -= 2.
         // Converted dialog skins can supply their own mini-only padding.
-        const auto& padding = skin_->Lyric().mini_padding;
+        const auto& padding = LyricSkin()->Lyric().mini_padding;
         const LONG left = std::min(padding.left, client.right);
         const LONG top = std::min(padding.top, client.bottom);
         return {left, top, std::max(left, client.right - padding.right),
                 std::max(top, client.bottom - padding.bottom)};
     }
-    RECT result = skin_->Lyric().lyric_bounds;
+    RECT result = LyricSkin()->Lyric().lyric_bounds;
     RECT client{};
     if (lyric_window_) GetClientRect(lyric_window_, &client);
-    result.right += std::max<LONG>(0, client.right - skin_->Lyric().background.size.cx);
-    result.bottom += std::max<LONG>(0, client.bottom - skin_->Lyric().background.size.cy);
+    result.right += std::max<LONG>(0, client.right - LyricSkin()->Lyric().background.size.cx);
+    result.bottom += std::max<LONG>(0, client.bottom - LyricSkin()->Lyric().background.size.cy);
     return result;
 }
 
 void PlayerWindow::LayoutLyricControls() {
-    if (!lyric_window_ || !skin_ || !skin_->Lyric().valid) return;
+    if (!lyric_window_ || !LyricSkin() || !LyricSkin()->Lyric().valid) return;
     const auto move = [this](HWND control, const skin::SkinElement& element) {
         if (!control) return;
         const RECT bounds = LyricElementBounds(element);
@@ -1452,13 +1466,13 @@ void PlayerWindow::LayoutLyricControls() {
                 std::max<LONG>(0, element.bounds.right - element.bounds.left),
                 std::max<LONG>(0, element.bounds.bottom - element.bounds.top), TRUE);
         };
-        park(lyric_close_, skin_->Lyric().close);
-        park(lyric_ontop_, skin_->Lyric().ontop);
-        park(lyric_desklrc_, skin_->Lyric().desklrc);
+        park(lyric_close_, LyricSkin()->Lyric().close);
+        park(lyric_ontop_, LyricSkin()->Lyric().ontop);
+        park(lyric_desklrc_, LyricSkin()->Lyric().desklrc);
     } else {
-        move(lyric_close_, skin_->Lyric().close);
-        move(lyric_ontop_, skin_->Lyric().ontop);
-        move(lyric_desklrc_, skin_->Lyric().desklrc);
+        move(lyric_close_, LyricSkin()->Lyric().close);
+        move(lyric_ontop_, LyricSkin()->Lyric().ontop);
+        move(lyric_desklrc_, LyricSkin()->Lyric().desklrc);
     }
     if (lyric_control_) {
         RECT bounds = LyricTextBounds();
@@ -1477,14 +1491,14 @@ void PlayerWindow::LayoutLyricControls() {
 void PlayerWindow::UpdateLyricToolRects() {
     if (!lyric_window_ || !CreateToolTipWindow()) return;
     RemoveToolTipTools(lyric_window_);
-    if (!skin_ || !skin_->Lyric().valid) return;
-    if (skin_->Lyric().close.image) AddToolTipControl(lyric_close_, kCmdShowLyrics);
-    if (skin_->Lyric().ontop.image) AddToolTipControl(lyric_ontop_, kCmdLyricTopMost);
-    if (skin_->Lyric().desklrc.image) AddToolTipControl(lyric_desklrc_, kCmdDesktopLyrics);
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) return;
+    if (LyricSkin()->Lyric().close.image) AddToolTipControl(lyric_close_, kCmdShowLyrics);
+    if (LyricSkin()->Lyric().ontop.image) AddToolTipControl(lyric_ontop_, kCmdLyricTopMost);
+    if (LyricSkin()->Lyric().desklrc.image) AddToolTipControl(lyric_desklrc_, kCmdDesktopLyrics);
 }
 
 void PlayerWindow::UpdateLyricWindowRegion() {
-    if (!lyric_window_ || !skin_ || !skin_->Lyric().valid) return;
+    if (!lyric_window_ || !LyricSkin() || !LyricSkin()->Lyric().valid) return;
     if (mini_mode_) {
         // FUN_00449577 removes the shaped normal-skin region in mini mode.
         SetWindowRgn(lyric_window_, nullptr, TRUE);
@@ -1495,9 +1509,9 @@ void PlayerWindow::UpdateLyricWindowRegion() {
     const int width = client.right;
     const int height = client.bottom;
     if (width <= 0 || height <= 0) return;
-    const auto& layout = skin_->Lyric();
+    const auto& layout = LyricSkin()->Lyric();
     HRGN region = CreateSkinWindowRegion(layout.background, layout.resize_rect,
-        width, height, layout.resize_tile, skin_->TransparentColor(), current_scale_);
+        width, height, layout.resize_tile, LyricSkin()->TransparentColor(), lyric_scale_);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(lyric_window_, region, TRUE)) {
@@ -1515,8 +1529,8 @@ void PlayerWindow::PaintLyricWindow(HDC dc) const {
     const HBITMAP buffer = CreateCompatibleBitmap(dc, width, height);
     const HGDIOBJ old_buffer = SelectObject(canvas, buffer);
     FillRect(canvas, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    if (skin_ && skin_->Lyric().valid) {
-        const auto& layout = skin_->Lyric();
+    if (LyricSkin() && LyricSkin()->Lyric().valid) {
+        const auto& layout = LyricSkin()->Lyric();
         const COLORREF background_color = ActiveLyricBackgroundColor();
         const bool text_only = settings_.lyric.transparent &&
                                settings_.lyric.transparent_skin;
@@ -1530,9 +1544,9 @@ void PlayerWindow::PaintLyricWindow(HDC dc) const {
             // FUN_00449313 takes the normal-mode branch through FUN_0044E8CC:
             // paint the lyric-window skin without consulting mini_border.
             DrawResizableSkinBitmap(canvas, layout.background, layout.resize_rect,
-                                    width, height, layout.resize_tile, current_scale_);
+                                    width, height, layout.resize_tile, lyric_scale_);
             DrawElementFrame(canvas, layout.title, LyricElementBounds(layout.title),
-                             0, skin_->TransparentColor(), current_scale_);
+                             0, LyricSkin()->TransparentColor(), lyric_scale_);
         } else {
             // mini_border belongs to FUN_00449313's DAT_0054775C (mini-mode)
             // branch and surrounds the lyric popup client, not LyricCtrl.
@@ -1573,8 +1587,8 @@ void PlayerWindow::PaintLyricControl(HWND control, HDC dc, bool present_layered)
     GetClientRect(control, &client);
     const int width = client.right;
     const int height = client.bottom;
-    if (width <= 0 || height <= 0 || !skin_ || !skin_->Lyric().valid) return;
-    const auto& layout = skin_->Lyric();
+    if (width <= 0 || height <= 0 || !LyricSkin() || !LyricSkin()->Lyric().valid) return;
+    const auto& layout = LyricSkin()->Lyric();
     const bool text_control = control == lyric_control_ ||
         GetDlgCtrlID(control) == kLyricControlId;
 
@@ -1616,9 +1630,9 @@ void PlayerWindow::PaintLyricControl(HWND control, HDC dc, bool present_layered)
         const HGDIOBJ old_parent = SelectObject(parent_dc, parent_bitmap);
         FillRect(parent_dc, &parent_client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         DrawResizableSkinBitmap(parent_dc, layout.background, layout.resize_rect,
-            parent_client.right, parent_client.bottom, layout.resize_tile, current_scale_);
+            parent_client.right, parent_client.bottom, layout.resize_tile, lyric_scale_);
         DrawElementFrame(parent_dc, layout.title, LyricElementBounds(layout.title),
-                         0, skin_->TransparentColor(), current_scale_);
+                         0, LyricSkin()->TransparentColor(), lyric_scale_);
         POINT origin{};
         MapWindowPoints(control, lyric_window_, &origin, 1);
         BitBlt(canvas, 0, 0, width, height, parent_dc,
@@ -1924,7 +1938,7 @@ std::wstring PlayerWindow::LyricLineText(size_t index) const {
 }
 
 int PlayerWindow::LyricLineExtent(HDC dc, size_t index) const {
-    if (!skin_ || !skin_->Lyric().valid) return 1;
+    if (!LyricSkin() || !LyricSkin()->Lyric().valid) return 1;
     if (ActiveLyricScrollMode() == 0) {
         LOGFONTW active_font{};
         const LONG font_height = lyric_font_ &&
@@ -1934,7 +1948,7 @@ int PlayerWindow::LyricLineExtent(HDC dc, size_t index) const {
                 ? settings_.lyric.fullscreen_font.lfHeight
                 : (settings_.lyric.font_valid
                     ? settings_.lyric.font.lfHeight
-                    : skin_->Lyric().font.lfHeight));
+                    : LyricSkin()->Lyric().font.lfHeight));
         return std::max(1L, std::labs(font_height)) +
                std::max(0, ActiveLyricRowInterval());
     }
@@ -2011,7 +2025,7 @@ std::optional<std::chrono::milliseconds> PlayerWindow::LyricDragTime(
 bool PlayerWindow::LyricTextHitTest(HWND control, POINT point) const {
     // Rendered-row geometry (also used by input regression tests). This does
     // not identify 00442360's separate actionable prompt/link entries.
-    if (!control || lyrics_.lines.empty() || !skin_ || !skin_->Lyric().valid)
+    if (!control || lyrics_.lines.empty() || !LyricSkin() || !LyricSkin()->Lyric().valid)
         return false;
     RECT client{};
     GetClientRect(control, &client);
@@ -2066,7 +2080,7 @@ bool PlayerWindow::LyricTextHitTest(HWND control, POINT point) const {
 }
 
 unsigned int PlayerWindow::LyricDragHitTest(POINT point) const {
-    if (!lyric_window_ || !skin_ || !skin_->Lyric().valid) return kDragMove;
+    if (!lyric_window_ || !LyricSkin() || !LyricSkin()->Lyric().valid) return kDragMove;
     if (mini_mode_) {
         // FUN_004495A0 collapses every generic resize hit except 0x10
         // (right edge) to the move code 1. Mini lyrics therefore resize only
@@ -2078,7 +2092,7 @@ unsigned int PlayerWindow::LyricDragHitTest(POINT point) const {
         return point.x >= client.right - margin && point.x <= client.right
             ? kDragRight : kDragMove;
     }
-    const RECT resize = skin_->Lyric().resize_rect;
+    const RECT resize = LyricSkin()->Lyric().resize_rect;
     if (resize.right <= resize.left || resize.bottom <= resize.top) return kDragMove;
     RECT client{};
     GetClientRect(lyric_window_, &client);
@@ -2221,7 +2235,7 @@ void PlayerWindow::SetLyricEditorFont(const LOGFONTW& font) {
     }
     const COLORREF text_color = settings_.lyric.text_color != CLR_INVALID
         ? settings_.lyric.text_color
-        : (skin_ ? skin_->Lyric().text_color : GetSysColor(COLOR_WINDOWTEXT));
+        : (LyricSkin() ? LyricSkin()->Lyric().text_color : GetSysColor(COLOR_WINDOWTEXT));
     CHARFORMAT2W format{sizeof(format)};
     format.dwMask = kLyricEditorCharacterMask;
     format.dwEffects = kLyricEditorCharacterEffects;
@@ -2268,7 +2282,7 @@ void PlayerWindow::FormatLyricEditorRange(LONG begin, LONG end) {
     SendMessageW(lyric_editor_, EM_EXGETSEL, 0,
                  reinterpret_cast<LPARAM>(&saved));
     const LOGFONTW font = settings_.lyric.font_valid
-        ? settings_.lyric.font : (skin_ ? skin_->Lyric().font : LOGFONTW{});
+        ? settings_.lyric.font : (LyricSkin() ? LyricSkin()->Lyric().font : LOGFONTW{});
     LONG height = 180;
     if (font.lfHeight != 0) {
         const HDC dc = GetDC(lyric_editor_);
@@ -2282,10 +2296,10 @@ void PlayerWindow::FormatLyricEditorRange(LONG begin, LONG end) {
     }
     const COLORREF text_color = settings_.lyric.text_color != CLR_INVALID
         ? settings_.lyric.text_color
-        : (skin_ ? skin_->Lyric().text_color : GetSysColor(COLOR_WINDOWTEXT));
+        : (LyricSkin() ? LyricSkin()->Lyric().text_color : GetSysColor(COLOR_WINDOWTEXT));
     const COLORREF tag_color = settings_.lyric.highlight_color != CLR_INVALID
         ? settings_.lyric.highlight_color
-        : (skin_ ? skin_->Lyric().highlight_color : RGB(0, 0, 255));
+        : (LyricSkin() ? LyricSkin()->Lyric().highlight_color : RGB(0, 0, 255));
 
     const auto apply = [this, &font, height](LONG first, LONG last,
                                              COLORREF color) {
@@ -2590,12 +2604,12 @@ bool PlayerWindow::EnterLyricEditor() {
     }
 
     LOGFONTW font = settings_.lyric.font_valid
-        ? settings_.lyric.font : skin_->Lyric().font;
+        ? settings_.lyric.font : LyricSkin()->Lyric().font;
     if (settings_.lyric.charset != 0)
         font.lfCharSet = static_cast<BYTE>(settings_.lyric.charset);
     SetLyricEditorFont(font);
     const COLORREF background = settings_.lyric.background_color != CLR_INVALID
-        ? settings_.lyric.background_color : skin_->Lyric().background_color;
+        ? settings_.lyric.background_color : LyricSkin()->Lyric().background_color;
     if (lyric_editor_document_)
         lyric_editor_document_->Undo(tomSuspend, nullptr);
     SendMessageW(lyric_editor_, EM_SETBKGNDCOLOR, 0,

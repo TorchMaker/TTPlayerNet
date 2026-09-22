@@ -75,6 +75,37 @@ END
 300 ICON "assets/AudioFile.ico"
 301 ICON "assets/PlaylistFile.ico"
 
+// Explorer's 属性 → 详细信息 页读取这里。产品名固定为「千千静听2026」，
+// FILEVERSION 只能放四段数字，故用 2026,0,0,0 并保留可读字符串 "2026"。
+// 不要在这里改 InternalName/OriginalFilename：文件关联与 AddIn 都按 TTPlayer.exe 走。
+1 VERSIONINFO
+FILEVERSION 2026,0,0,0
+PRODUCTVERSION 2026,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Sonic853"
+            VALUE "FileDescription", "千千静听2026 音乐播放器"
+            VALUE "FileVersion", "2026"
+            VALUE "InternalName", "TTPlayer"
+            VALUE "LegalCopyright", "Sonic853 千千静听2026"
+            VALUE "OriginalFilename", "TTPlayer.exe"
+            VALUE "ProductName", "千千静听2026"
+            VALUE "ProductVersion", "2026"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
 // New optional LAME DLL configuration; legacy AddIns keep their own dialogs.
 4090 DIALOGEX 0, 0, 202, 99
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU

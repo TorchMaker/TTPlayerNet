@@ -48,6 +48,11 @@ ParsedCommandLine ParseCommandLine() {
             parsed.smoke_test = true;
             continue;
         }
+        if (argument == L"--dpi-selftest") {
+            parsed.dpi_selftest = true;
+            parsed.smoke_test = true;
+            continue;
+        }
         if (!argument.empty() && (argument.front() == L'/' || argument.front() == L'-')) {
             argument.erase(argument.begin());
             parsed.switches.push_back(Lower(std::move(argument)));
@@ -93,6 +98,10 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
     // MusicFree 音源在启动时重建（部署内置 JS 依赖库 + 挂载上次导入的音源），
     // 使「查看 → 音乐窗」打开时即可直接搜索。
     musicfree::LoadMusicFreeSourcesOnStartup();
+    // 上次退出时音乐窗是开着的，就按同样的状态把它恢复出来 —— 必须排在音源挂载
+    // 之后（否则音乐窗打开时平台列表是空的）。无界面自检模式不弹窗，免得干扰
+    // --mf-selftest / --dpi-selftest 的日志与退出码。
+    if (!command_line.smoke_test) player.RestoreStartupMusicBrowserWindow();
 
     // TTPlayer_RunApplicationSession trims the working set and routes the
     // parsed startup path through the newly created player before publishing
@@ -100,6 +109,8 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
     // interleaving WM_COPYDATA with the first process's own startup request.
     SetProcessWorkingSetSize(GetCurrentProcess(),
                              static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    bool dpi_ok = true;
+    if (command_line.dpi_selftest) dpi_ok = player.RunDpiSelfTest();
     if (!command_line.mf_selftest.empty())
         player.RunMusicFreeSelfTest(command_line.mf_selftest);
     else if (!command_line.file.empty())
@@ -125,6 +136,9 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
     loop.RemoveMessageFilter(&filter);
     _Module.RemoveMessageLoop();
     single_instance.PublishWindow(nullptr);
+    // A geometry regression is only useful if CI can see it: fail the process
+    // when any High-DPI invariant broke, even though the UI itself is fine.
+    if (command_line.dpi_selftest && !dpi_ok) return 1;
     return result;
 }
 } // namespace ttplayer::app

@@ -89,6 +89,9 @@ public:
     // 走一遍真实的「搜索 → 解析 → 在线入列」，逐行记录音源返回值与入列后条目
     // 实际带上的字段。用来核对「在线歌曲用在线数据命名」而不需要截图。
     void RunMusicFreeSelfTest(const std::string& query);
+    // Headless High-DPI geometry regression (`--dpi-selftest`). Returns false
+    // when any invariant fails; see src/ui/player_window_dpi_selftest.cpp.
+    bool RunDpiSelfTest();
     void OpenCommandLinePath(const std::filesystem::path& path,
                              ULONG_PTR mode);
     int ShowRegistrationOptions(HINSTANCE instance);
@@ -97,6 +100,10 @@ public:
     // Called after Create has loaded the numbered playlists and shown the
     // windows. Command-line opens take precedence and skip this transaction.
     void RestoreStartupPlayback();
+    // 启动时按上次退出时的状态恢复音乐窗（Player/BrowserVisible）。
+    // 必须在 musicfree 音源挂载之后调用（见 app/application.cpp 的
+    // LoadMusicFreeSourcesOnStartup），否则音乐窗里一个可用音源都没有。
+    void RestoreStartupMusicBrowserWindow();
     [[nodiscard]] bool PreTranslateMessage(const MSG& message) const;
     [[nodiscard]] HWND Handle() const noexcept { return window_; }
 
@@ -738,6 +745,24 @@ private:
     // Re-derive the scaled skin mirror for a new DPI and rebind every
     // skin-backed HWND (region, size, child layouts). Position is preserved.
     void ApplyDpiScale(const ui::DpiScale& scale);
+    // Per-monitor skins (strategy C). Every auxiliary window resolves *its own*
+    // monitor DPI instead of borrowing the main window's `skin_`, so dragging
+    // e.g. the playlist onto a 200% screen no longer leaves it rendered at the
+    // main window's scale. Bitmaps are shared (shared_ptr), so a mirror only
+    // costs the scaled geometry; the cache is keyed by DPI and dropped when the
+    // package changes.
+    const skin::LegacySkin* SkinForDpi(int dpi);
+    const skin::LegacySkin* SkinForWindow(HWND hwnd);
+    void RefreshWindowSkins();
+    [[nodiscard]] const skin::LegacySkin* LyricSkin() const noexcept {
+        return lyric_skin_ ? lyric_skin_ : (skin_ ? &*skin_ : nullptr);
+    }
+    [[nodiscard]] const skin::LegacySkin* PlaylistSkin() const noexcept {
+        return playlist_skin_ ? playlist_skin_ : (skin_ ? &*skin_ : nullptr);
+    }
+    [[nodiscard]] const skin::LegacySkin* EqualizerSkin() const noexcept {
+        return equalizer_skin_ ? equalizer_skin_ : (skin_ ? &*skin_ : nullptr);
+    }
     // Saved window rectangles are physical pixels captured at
     // `settings_.player.window_dpi`. When the session starts on a different
     // DPI, rescale them once so a restored window keeps its logical size
@@ -880,6 +905,18 @@ private:
     // current-DPI scaled view consumed by all drawing/hit-test/region code.
     std::optional<skin::LegacySkin> logical_skin_;
     ui::DpiScale current_scale_{96};
+    // Per-DPI mirrors of `logical_skin_` plus the per-window pointer each
+    // auxiliary window actually consumes (see SkinForDpi / RefreshWindowSkins).
+    std::map<int, std::unique_ptr<skin::LegacySkin>> dpi_mirrors_;
+    const skin::LegacySkin* lyric_skin_{};
+    const skin::LegacySkin* playlist_skin_{};
+    const skin::LegacySkin* equalizer_skin_{};
+    // The DPI each of those mirrors was built for. Drawing helpers that take a
+    // `DpiScale` must use the owning window's scale, not `current_scale_`
+    // (which is the main window's).
+    ui::DpiScale lyric_scale_{96};
+    ui::DpiScale playlist_scale_{96};
+    ui::DpiScale equalizer_scale_{96};
     std::shared_ptr<VisualRuntime> visual_runtime_;
     std::jthread visual_worker_;
     std::condition_variable_any visual_worker_condition_;

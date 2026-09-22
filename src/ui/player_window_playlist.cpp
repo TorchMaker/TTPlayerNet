@@ -1887,18 +1887,18 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
     const auto geometry = [this]() {
         RECT client{};
         if (playlist_window_) GetClientRect(playlist_window_, &client);
-        return skin_ ? MakePlaylistGeometry(skin_->Playlist(),
+        return PlaylistSkin() ? MakePlaylistGeometry(PlaylistSkin()->Playlist(),
             settings_.playlist.split_on_lists, client.right, client.bottom,
-            VisiblePlaylistTrackCount(), current_scale_) : PlaylistGeometry{};
+            VisiblePlaylistTrackCount(), playlist_scale_) : PlaylistGeometry{};
     };
     const auto scrollbar_metrics = [this, &geometry]() {
-        if (!skin_) return PlaylistScrollbarMetrics{};
+        if (!PlaylistSkin()) return PlaylistScrollbarMetrics{};
         const auto bounds = geometry();
         const size_t count = VisiblePlaylistTrackCount();
         const size_t page = static_cast<size_t>(
             std::max(1, bounds.page_rows));
         return ResolvePlaylistScrollbarMetrics(
-            bounds, skin_->Playlist(), count, page, playlist_scroll_);
+            bounds, PlaylistSkin()->Playlist(), count, page, playlist_scroll_);
     };
     const auto scrollbar_hit = [&geometry, &scrollbar_metrics](POINT point) {
         const auto bounds = geometry();
@@ -1957,14 +1957,26 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
     case WM_ACTIVATE:
         RaiseSkinOwnerOnActivation(playlist_window_, wparam, lparam);
         break;
+    case WM_DPICHANGED: {
+        // Strategy C: this window owns its monitor DPI (see LyricWindowProc).
+        // Persist the live rectangle first so the rebuild keeps the window
+        // where the user left it instead of re-anchoring it to the main window.
+        const int dpi = static_cast<int>(HIWORD(wparam));
+        if (dpi <= 0 || dpi == playlist_scale_.dpi) return 0;
+        RECT bounds{};
+        if (playlist_window_ && GetWindowRect(playlist_window_, &bounds))
+            settings_.player.playlist_window = bounds;
+        UpdatePlaylistWindowSkin(true);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_GETMINMAXINFO: {
         auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
-        if (!limits || !skin_ || !skin_->Playlist().valid) return 0;
-        const SIZE native = skin_->Playlist().background.size;
+        if (!limits || !PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return 0;
+        const SIZE native = PlaylistSkin()->Playlist().background.size;
         limits->ptMinTrackSize = {native.cx, native.cy};
-        const RECT resize = skin_->Playlist().resize_rect;
+        const RECT resize = PlaylistSkin()->Playlist().resize_rect;
         if (resize.right <= resize.left || resize.bottom <= resize.top) {
             limits->ptMaxTrackSize = limits->ptMinTrackSize;
         } else {
@@ -2305,7 +2317,7 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
         const auto toolbar_hovered = PlaylistToolbarButtonAt(point);
         const auto scrollbar_hovered = scrollbar_hit(point);
         const auto metrics = geometry();
-        const bool close_hovered = skin_ && skin_->Playlist().close.image &&
+        const bool close_hovered = PlaylistSkin() && PlaylistSkin()->Playlist().close.image &&
             PtInRect(&metrics.close, point);
         if (hovered != playlist_hover_ || list_hovered != playlist_list_hover_ ||
             toolbar_hovered != playlist_toolbar_hover_ ||
@@ -2351,7 +2363,7 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
             BeginSkinBackgroundDrag(playlist_window_, point, resize_hit);
             return 0;
         }
-        if (skin_ && skin_->Playlist().close.image && PtInRect(&metrics.close, point)) {
+        if (PlaylistSkin() && PlaylistSkin()->Playlist().close.image && PtInRect(&metrics.close, point)) {
             playlist_close_pressed_ = true;
             if (!GetCapture()) SetCapture(playlist_window_);
             InvalidateRect(playlist_window_, &metrics.close, FALSE);
@@ -2377,8 +2389,8 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
             POINT screen{
                 metrics.toolbar.left + static_cast<int>(*button) * width / button_count,
                 metrics.toolbar.bottom};
-            if (skin_->Playlist().toolbar_items) {
-                const RECT item = PlaylistToolbarItemBounds(skin_->Playlist(), metrics.toolbar, *button);
+            if (PlaylistSkin()->Playlist().toolbar_items) {
+                const RECT item = PlaylistToolbarItemBounds(PlaylistSkin()->Playlist(), metrics.toolbar, *button);
                 screen = {item.left, item.bottom};
             }
             ClientToScreen(playlist_window_, &screen);
@@ -2562,7 +2574,7 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
         if (playlist_close_pressed_) {
             playlist_close_pressed_ = false;
             if (GetCapture() == playlist_window_) ReleaseCapture();
-            if (skin_ && PtInRect(&metrics.close, point)) {
+            if (PlaylistSkin() && PtInRect(&metrics.close, point)) {
                 SetSkinWindowVisible(playlist_window_, false);
                 settings_.player.playlist_visible = false;
                 if (window_) InvalidateRect(window_, nullptr, FALSE);
@@ -2891,8 +2903,8 @@ LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
 
 bool PlayerWindow::CreatePlaylistWindow() {
     if (playlist_window_) return true;
-    if (!skin_ || !skin_->Playlist().valid) return false;
-    const auto& layout = skin_->Playlist();
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return false;
+    const auto& layout = PlaylistSkin()->Playlist();
     RECT main_bounds{};
     GetWindowRect(window_, &main_bounds);
     int x = main_bounds.left + layout.position.left;
@@ -2937,13 +2949,14 @@ void PlayerWindow::TogglePlaylistWindow() {
 }
 
 void PlayerWindow::UpdatePlaylistWindowSkin(bool saved_bounds) {
-    if (!skin_ || !skin_->Playlist().valid) {
+    RefreshWindowSkins();
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) {
         if (playlist_window_) ShowWindow(playlist_window_, SW_HIDE);
         if (window_) InvalidateRect(window_, nullptr, FALSE);
         return;
     }
     if (!playlist_window_ && !CreatePlaylistWindow()) return;
-    const auto& layout = skin_->Playlist();
+    const auto& layout = PlaylistSkin()->Playlist();
     ScopedSkinRedraw redraw(playlist_window_);
     const auto size = layout.background.size;
     if (size.cx > 0 && size.cy > 0) {
@@ -2986,15 +2999,15 @@ void PlayerWindow::UpdatePlaylistWindowSkin(bool saved_bounds) {
 }
 
 void PlayerWindow::UpdatePlaylistWindowRegion() {
-    if (!playlist_window_ || !skin_ || !skin_->Playlist().valid) return;
+    if (!playlist_window_ || !PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     if (width <= 0 || height <= 0) return;
-    const auto& layout = skin_->Playlist();
+    const auto& layout = PlaylistSkin()->Playlist();
     HRGN region = CreateSkinWindowRegion(layout.background, layout.resize_rect,
-        width, height, layout.resize_tile, skin_->TransparentColor(), current_scale_);
+        width, height, layout.resize_tile, PlaylistSkin()->TransparentColor(), playlist_scale_);
     RECT bounds{};
     if (!region || GetRgnBox(region, &bounds) == NULLREGION ||
         !SetWindowRgn(playlist_window_, region, TRUE)) {
@@ -3115,12 +3128,12 @@ void PlayerWindow::DestroyPlaylistListControls() {
 }
 
 void PlayerWindow::LayoutPlaylistListControls() {
-    if (!playlist_window_ || !skin_ || !skin_->Playlist().valid) return;
+    if (!playlist_window_ || !PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     const size_t visible = static_cast<size_t>(
         std::max(1, metrics.page_rows));
     const size_t maximum = playlists_.Size() > visible
@@ -3222,10 +3235,10 @@ bool PlayerWindow::RoutePlaylistMouseWheel(const MSG& message) const {
     HWND target{};
     if (within(playlist_view_)) {
         target = playlist_view_;
-    } else if (within(playlist_window_) && skin_ && skin_->Playlist().valid) {
+    } else if (within(playlist_window_) && PlaylistSkin() && PlaylistSkin()->Playlist().valid) {
         RECT client{}; GetClientRect(playlist_window_, &client);
-        const auto metrics = MakePlaylistGeometry(skin_->Playlist(), settings_.playlist.split_on_lists,
-            client.right, client.bottom, VisiblePlaylistTrackCount(), current_scale_);
+        const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(), settings_.playlist.split_on_lists,
+            client.right, client.bottom, VisiblePlaylistTrackCount(), playlist_scale_);
         POINT point = screen; ScreenToClient(playlist_window_, &point);
         if (PtInRect(&metrics.list_titles, point))
             target = settings_.playlist.library_mode ? playlist_tree_control_ : playlist_list_control_;
@@ -3356,7 +3369,7 @@ void PlayerWindow::AddPlaylistToolTipControl(HWND control,
 void PlayerWindow::UpdateMainToolRects() {
     if (!window_ || !CreateToolTipWindow()) return;
     RemoveToolTipTools(window_);
-    if (!skin_) return;
+    if (!PlaylistSkin()) return;
 
     std::set<UINT_PTR> registered;
     for (const auto& element : ActiveSkinElements()) {
@@ -3415,12 +3428,12 @@ void PlayerWindow::UpdatePlaylistToolRects() {
                              SWP_NOZORDER | SWP_NOACTIVATE);
         }
     };
-    if (!skin_ || !skin_->Playlist().valid) { park_unused(); return; }
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) { park_unused(); return; }
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     const auto add_control = [this, &placed](UINT_PTR identifier, UINT control_id,
                                     const RECT& bounds) {
         if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
@@ -3447,14 +3460,14 @@ void PlayerWindow::UpdatePlaylistToolRects() {
             AddToolTipTool(playlist_window_, identifier, bounds);
         }
     };
-    if (skin_->Playlist().close.image)
+    if (PlaylistSkin()->Playlist().close.image)
         add_control(kPlaylistToolFirst + 7, kCmdShowPlaylist, metrics.close);
     UpdatePlaylistItemTipRects();
-    if (!skin_->Playlist().toolbar.image ||
+    if (!PlaylistSkin()->Playlist().toolbar.image ||
         metrics.toolbar.right <= metrics.toolbar.left) { park_unused(); return; }
     constexpr int count = 7;
     for (int index = 0; index < count; ++index) {
-        const RECT bounds = PlaylistToolbarItemBounds(skin_->Playlist(), metrics.toolbar, index);
+        const RECT bounds = PlaylistToolbarItemBounds(PlaylistSkin()->Playlist(), metrics.toolbar, index);
         add_control(kPlaylistToolFirst + index,
             static_cast<UINT>(kPlaylistToolFirst + index), bounds);
     }
@@ -3463,11 +3476,11 @@ void PlayerWindow::UpdatePlaylistToolRects() {
 
 std::pair<size_t, size_t> PlayerWindow::VisiblePlaylistInfoRange() const {
     if (settings_.playlist.library_mode) return {};
-    if (playlist_window_ && IsWindowVisible(playlist_window_) && skin_ && skin_->Playlist().valid) {
+    if (playlist_window_ && IsWindowVisible(playlist_window_) && PlaylistSkin() && PlaylistSkin()->Playlist().valid) {
         RECT client{};
         GetClientRect(playlist_window_, &client);
-        const auto metrics = MakePlaylistGeometry(skin_->Playlist(), settings_.playlist.split_on_lists,
-            client.right, client.bottom, VisiblePlaylistTrackCount(), current_scale_);
+        const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(), settings_.playlist.split_on_lists,
+            client.right, client.bottom, VisiblePlaylistTrackCount(), playlist_scale_);
         return {playlist_scroll_, static_cast<size_t>(std::max(0, metrics.visible_rows))};
     }
     if (playlist_view_ && IsWindowVisible(playlist_view_)) {
@@ -3482,10 +3495,10 @@ std::pair<size_t, size_t> PlayerWindow::VisiblePlaylistInfoRange() const {
 
 void PlayerWindow::InvalidatePlaylistInfoRows(const std::vector<size_t>& rows) {
     if (settings_.playlist.library_mode) return;
-    if (playlist_window_ && skin_ && skin_->Playlist().valid) {
+    if (playlist_window_ && PlaylistSkin() && PlaylistSkin()->Playlist().valid) {
         RECT client{}; GetClientRect(playlist_window_, &client);
-        const auto metrics = MakePlaylistGeometry(skin_->Playlist(), settings_.playlist.split_on_lists,
-            client.right, client.bottom, VisiblePlaylistTrackCount(), current_scale_);
+        const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(), settings_.playlist.split_on_lists,
+            client.right, client.bottom, VisiblePlaylistTrackCount(), playlist_scale_);
         for (const auto row : rows) {
             if (row < playlist_scroll_ || row - playlist_scroll_ >= static_cast<size_t>(std::max(0, metrics.visible_rows))) continue;
             const int top = metrics.tracks.top + static_cast<int>(row - playlist_scroll_) * metrics.row_height;
@@ -3537,13 +3550,13 @@ void PlayerWindow::UpdatePlaylistItemTipRects() {
             item = tooltip_tools_.erase(item);
         }
     }
-    if (!skin_ || !skin_->Playlist().valid) return;
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return;
 
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     if (!settings_.playlist.library_mode &&
         settings_.playlist.read_info_mode != 2 && metrics.visible_rows > 0) {
         // FUN_00487C0D queues an unread (-2) non-network CPlayItem only when
@@ -3713,12 +3726,12 @@ std::wstring PlayerWindow::ToolTipText(HWND owner, UINT_PTR tool) const {
 }
 
 std::optional<size_t> PlayerWindow::PlaylistTrackAt(POINT point) const {
-    if (!skin_ || !skin_->Playlist().valid) return std::nullopt;
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) return std::nullopt;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     if (!PtInRect(&metrics.tracks, point)) return std::nullopt;
     const size_t index = playlist_scroll_ +
         static_cast<size_t>((point.y - metrics.tracks.top) / metrics.row_height);
@@ -3727,13 +3740,13 @@ std::optional<size_t> PlayerWindow::PlaylistTrackAt(POINT point) const {
 }
 
 std::optional<size_t> PlayerWindow::PlaylistListAt(POINT point) const {
-    if (settings_.playlist.library_mode || !skin_ ||
-        !skin_->Playlist().valid) return std::nullopt;
+    if (settings_.playlist.library_mode || !PlaylistSkin() ||
+        !PlaylistSkin()->Playlist().valid) return std::nullopt;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     if (!PtInRect(&metrics.list_titles, point)) return std::nullopt;
     const size_t index = playlist_list_scroll_ + static_cast<size_t>(
         (point.y - metrics.list_titles.top) / metrics.row_height);
@@ -3741,13 +3754,13 @@ std::optional<size_t> PlayerWindow::PlaylistListAt(POINT point) const {
 }
 
 std::optional<size_t> PlayerWindow::PlaylistListInsertionAt(POINT point) const {
-    if (settings_.playlist.library_mode || !skin_ ||
-        !skin_->Playlist().valid) return std::nullopt;
+    if (settings_.playlist.library_mode || !PlaylistSkin() ||
+        !PlaylistSkin()->Playlist().valid) return std::nullopt;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     if (!PtInRect(&metrics.list_titles, point) || metrics.row_height <= 0)
         return std::nullopt;
 
@@ -3761,16 +3774,16 @@ std::optional<size_t> PlayerWindow::PlaylistListInsertionAt(POINT point) const {
 }
 
 std::optional<size_t> PlayerWindow::PlaylistToolbarButtonAt(POINT point) const {
-    if (!skin_ || !skin_->Playlist().toolbar.image) return std::nullopt;
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().toolbar.image) return std::nullopt;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     if (!PtInRect(&metrics.toolbar, point)) return std::nullopt;
-    if (skin_->Playlist().toolbar_items) {
+    if (PlaylistSkin()->Playlist().toolbar_items) {
         for (size_t index = 0; index < 7; ++index) {
-            const RECT item = PlaylistToolbarItemBounds(skin_->Playlist(), metrics.toolbar, index);
+            const RECT item = PlaylistToolbarItemBounds(PlaylistSkin()->Playlist(), metrics.toolbar, index);
             if (PtInRect(&item, point)) return index;
         }
         return std::nullopt;
@@ -3839,12 +3852,12 @@ void PlayerWindow::RestorePlaylistRowSelection() {
     const auto visible = caret ? caret : ActivePlaylist().PlayingRow();
     if (!visible || *visible >= ActivePlaylist().Tracks().size()) return;
     if (!caret) {
-        if (!playlist_window_ || !skin_) return;
+        if (!playlist_window_ || !PlaylistSkin()) return;
         RECT client{};
         GetClientRect(playlist_window_, &client);
-        const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+        const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
             settings_.playlist.split_on_lists, client.right, client.bottom,
-            ActivePlaylist().Tracks().size(), current_scale_);
+            ActivePlaylist().Tracks().size(), playlist_scale_);
         if (*visible < playlist_scroll_) playlist_scroll_ = *visible;
         const size_t rows = static_cast<size_t>(metrics.page_rows);
         if (*visible >= playlist_scroll_ + rows)
@@ -3864,12 +3877,12 @@ void PlayerWindow::RestorePlaylistRowSelection() {
 }
 
 void PlayerWindow::EnsurePlaylistSelectionVisible() {
-    if (!playlist_selection_ || !skin_) return;
+    if (!playlist_selection_ || !PlaylistSkin()) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     const size_t previous = playlist_scroll_;
     if (*playlist_selection_ < playlist_scroll_) playlist_scroll_ = *playlist_selection_;
     const size_t visible = static_cast<size_t>(metrics.page_rows);
@@ -3918,7 +3931,7 @@ void PlayerWindow::ActivatePlaylistCatalogueRow(size_t index) {
 }
 
 void PlayerWindow::BeginPlaylistListEdit(size_t index) {
-    if (!playlist_window_ || !skin_ || index >= playlists_.Size()) return;
+    if (!playlist_window_ || !PlaylistSkin() || index >= playlists_.Size()) return;
     FinishPlaylistListEdit(false);
     if (playlist_list_control_)
         SendMessageW(playlist_list_control_, LVM_ENSUREVISIBLE, index, FALSE);
@@ -3958,13 +3971,13 @@ void PlayerWindow::BeginPlaylistListEdit(size_t index) {
 }
 
 void PlayerWindow::LayoutPlaylistListEdit() {
-    if (!playlist_list_edit_ || !playlist_list_edit_index_ || !skin_ ||
+    if (!playlist_list_edit_ || !playlist_list_edit_index_ || !PlaylistSkin() ||
         !playlist_window_) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        ActivePlaylist().Tracks().size(), current_scale_);
+        ActivePlaylist().Tracks().size(), playlist_scale_);
     if (*playlist_list_edit_index_ < playlist_list_scroll_) {
         ShowWindow(playlist_list_edit_, SW_HIDE);
         return;
@@ -4049,12 +4062,12 @@ void PlayerWindow::CancelPlaylistScrollbarInteraction(bool release_capture) {
 }
 
 void PlayerWindow::ScrollPlaylist(int rows) {
-    if (!skin_) return;
+    if (!PlaylistSkin()) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     const size_t visible = static_cast<size_t>(
         std::max(1, metrics.page_rows));
     const size_t count = VisiblePlaylistTrackCount();
@@ -4067,12 +4080,12 @@ void PlayerWindow::ScrollPlaylist(int rows) {
 }
 
 void PlayerWindow::UpdatePlaylistMarquee(POINT point) {
-    if (!skin_ || !playlist_window_ || !playlist_marquee_.Pending()) return;
+    if (!PlaylistSkin() || !playlist_window_ || !playlist_marquee_.Pending()) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        VisiblePlaylistTrackCount(), current_scale_);
+        VisiblePlaylistTrackCount(), playlist_scale_);
     playlist_selected_rows_ = playlist_marquee_.Update(point, metrics.tracks,
         playlist_scroll_, metrics.row_height, VisiblePlaylistTrackCount(),
         {GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)});
@@ -4101,27 +4114,27 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
     const HBITMAP buffer = CreateCompatibleBitmap(dc, width, height);
     const HGDIOBJ old_buffer = SelectObject(canvas, buffer);
     FillRect(canvas, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    if (!skin_ || !skin_->Playlist().valid) {
+    if (!PlaylistSkin() || !PlaylistSkin()->Playlist().valid) {
         BitBlt(dc, 0, 0, width, height, canvas, 0, 0, SRCCOPY);
         SelectObject(canvas, old_buffer);
         DeleteObject(buffer);
         DeleteDC(canvas);
         return;
     }
-    const auto& layout = skin_->Playlist();
+    const auto& layout = PlaylistSkin()->Playlist();
     if (layout.background.image) {
         if (width == layout.background.size.cx && height == layout.background.size.cy) {
             layout.background.image.Draw(canvas, 0, 0, width, height,
                                          0, 0, width, height);
         } else {
             DrawResizableSkinBitmap(canvas, layout.background, layout.resize_rect,
-                                    width, height, layout.resize_tile, current_scale_);
+                                    width, height, layout.resize_tile, playlist_scale_);
         }
     }
 
     const auto metrics = MakePlaylistGeometry(layout, settings_.playlist.split_on_lists,
                                                width, height,
-                                               VisiblePlaylistTrackCount(), current_scale_);
+                                               VisiblePlaylistTrackCount(), playlist_scale_);
     if (metrics.list.right > metrics.list.left && metrics.list.bottom > metrics.list.top) {
         const RECT group = metrics.list_titles;
         // The left TreeCtrl and the track ListCtrl both receive Color_Bkgnd.
@@ -4214,7 +4227,7 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
                 layout.splitter_arrow.image.Draw(canvas,
                     metrics.splitter.right - arrow_width, arrow_y,
                     arrow_width, layout.splitter_arrow.size.cy, 0, 0,
-                    arrow_width, layout.splitter_arrow.size.cy, skin_->TransparentColor());
+                    arrow_width, layout.splitter_arrow.size.cy, PlaylistSkin()->TransparentColor());
             }
         } else {
             // Default SplitterCtrl paint: Color_Text fades toward
@@ -4358,7 +4371,7 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
         // custom-draw path treats the package transparent color as a mask.
         // SRCCOPY exposes the common #ff00ff key as a purple rectangle.
         DrawPlaylistToolbarBitmap(canvas, layout.toolbar, metrics.toolbar,
-                                  skin_->TransparentColor(), std::nullopt, 255, &layout);
+                                  PlaylistSkin()->TransparentColor(), std::nullopt, 255, &layout);
         const auto hot = playlist_toolbar_hover_;
         if (layout.toolbar.image.IsGdiPlus() && layout.toolbar_hot.image.IsGdiPlus() &&
             layout.toolbar_animation.Enabled()) {
@@ -4369,11 +4382,11 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
                     L"toolbar" + std::to_wstring(index), metrics.toolbar,
                     hot && *hot == index ? 1 : 0, layout.toolbar_animation);
                 DrawPlaylistToolbarBitmap(canvas, layout.toolbar_hot, metrics.toolbar,
-                    skin_->TransparentColor(), index, fade.HotOpacity(layout.toolbar_animation), &layout);
+                    PlaylistSkin()->TransparentColor(), index, fade.HotOpacity(layout.toolbar_animation), &layout);
             }
         } else if (hot && layout.toolbar_hot.image && layout.toolbar_hot.size.cx > 0) {
             DrawPlaylistToolbarBitmap(canvas, layout.toolbar_hot, metrics.toolbar,
-                                      skin_->TransparentColor(), *hot, 255, &layout);
+                                      PlaylistSkin()->TransparentColor(), *hot, 255, &layout);
         }
     }
 
@@ -4425,7 +4438,7 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
     }
 
     if (layout.title.image)
-        DrawElementFrame(canvas, layout.title, metrics.title, 0, skin_->TransparentColor(), current_scale_);
+        DrawElementFrame(canvas, layout.title, metrics.title, 0, PlaylistSkin()->TransparentColor(), playlist_scale_);
     if (layout.close.image) {
         const int state = playlist_close_pressed_ && playlist_close_hover_
             ? 2 : (playlist_close_hover_ ? 1 : 0);
@@ -4643,9 +4656,9 @@ void PlayerWindow::ShowPlaylistContextMenu(POINT screen_point, POINT client_poin
     } else {
         RECT client{};
         GetClientRect(playlist_window_, &client);
-        const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+        const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
             settings_.playlist.split_on_lists, client.right, client.bottom,
-            VisiblePlaylistTrackCount(), current_scale_);
+            VisiblePlaylistTrackCount(), playlist_scale_);
         blank_catalogue = !settings_.playlist.library_mode &&
             PtInRect(&metrics.list_titles, client_point);
         if (blank_catalogue) {
@@ -5174,9 +5187,9 @@ void PlayerWindow::FinishPlaylistTrackDrag(POINT point) {
     if (settings_.playlist.library_mode) return;
     RECT client{};
     GetClientRect(playlist_window_, &client);
-    const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+    const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
         settings_.playlist.split_on_lists, client.right, client.bottom,
-        ActivePlaylist().Tracks().size(), current_scale_);
+        ActivePlaylist().Tracks().size(), playlist_scale_);
 
     if (!settings_.playlist.library_mode &&
         settings_.playlist.split_on_lists > 0 &&
@@ -5857,12 +5870,12 @@ bool PlayerWindow::HandlePlaylistCommand(UINT command) {
         // rows.  004866FC only searches for the playing object again and
         // ensures that new row is visible; selection identity is not moved.
         RememberPlaylistRow(playlists_.ActiveIndex(), playlist_selection_);
-        if (const auto playing = ActivePlaylist().PlayingRow(); playing && skin_) {
+        if (const auto playing = ActivePlaylist().PlayingRow(); playing && PlaylistSkin()) {
             RECT client{};
             GetClientRect(playlist_window_, &client);
-            const auto metrics = MakePlaylistGeometry(skin_->Playlist(),
+            const auto metrics = MakePlaylistGeometry(PlaylistSkin()->Playlist(),
                 settings_.playlist.split_on_lists, client.right,
-                client.bottom, ActivePlaylist().Tracks().size(), current_scale_);
+                client.bottom, ActivePlaylist().Tracks().size(), playlist_scale_);
             if (*playing < playlist_scroll_) playlist_scroll_ = *playing;
             const size_t visible = static_cast<size_t>(metrics.page_rows);
             if (*playing >= playlist_scroll_ + visible)

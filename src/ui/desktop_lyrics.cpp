@@ -380,7 +380,14 @@ public:
 
     // Re-read the hosting window's DPI. Called whenever the skin changes (the
     // player does that on every WM_DPICHANGED) and right after the HWND exists.
-    void RefreshScale() { scale_ = ui::ResolveScaleForWindow(control_); }
+    // Returns true when the DPI actually changed, so callers can skip the
+    // re-layout (which is what makes the WM_WINDOWPOSCHANGED fallback cheap).
+    bool RefreshScale() {
+        const ui::DpiScale next = ui::ResolveScaleForWindow(control_);
+        if (next.dpi == scale_.dpi) return false;
+        scale_ = next;
+        return true;
+    }
     int MinWidth() const { return scale_.X(kMinimumWidth); }
     int MaxWidth() const { return scale_.X(kMaximumWidth); }
 
@@ -851,8 +858,35 @@ private:
             }
             break;
         case WM_WINDOWPOSCHANGED:
-            if (!positioning_) SyncOwnedWindows();
+            if (!positioning_) {
+                SyncOwnedWindows();
+                // Dragging across a monitor boundary does not always deliver
+                // WM_DPICHANGED before the next paint, so re-check here. Every
+                // fallback constant (bar rect, min/max width, line heights) is
+                // derived from scale_, which would otherwise stay stale until
+                // the next skin change or restart.
+                RECT moved{};
+                GetWindowRect(control_, &moved);
+                if (RefreshScale()) {
+                    PositionWindows(moved, true);
+                    ApplyBarSkin();
+                    if (visible_) RenderLayered();
+                }
+            }
             break;
+        case WM_DPICHANGED: {
+            // The control is a top-level WS_POPUP: Windows sends this when it
+            // lands on a monitor with a different DPI. The suggested rectangle
+            // is intentionally ignored — PositionWindows clamps to the scaled
+            // min/max width and keeps the bar reachable.
+            RECT bounds{};
+            GetWindowRect(control_, &bounds);
+            RefreshScale();
+            PositionWindows(bounds, true);
+            ApplyBarSkin();
+            if (visible_) RenderLayered();
+            return 0;
+        }
         case WM_DISPLAYCHANGE:
         case WM_SETTINGCHANGE: {
             RECT bounds{};

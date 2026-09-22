@@ -12,6 +12,7 @@
 #include "modern_file_dialog.h"
 #include "lyric_association_dialog.h"
 #include "../app/resource_ids.h"
+#include "ttplayer/app/product.h"
 #include "ttplayer/app/worker_process.h"
 #include "ttplayer/build_date.h"
 #include "ttplayer/settings/file_association.h"
@@ -2631,10 +2632,14 @@ HBITMAP RenderLegacySkinPreview(const skin::LegacySkin& source,
     // 00467B9B creates these child windows with their initial strings.
     // Status is empty; info is the program/version string, NOT the selected
     // track or skin name. Both strings come from this executable's ttpres.
+    // 版本段改用产品常量（资源 0x8299 里是原版的 "5.5"）。名字与年份紧排，
+    // 与主窗口标题一致：千千静听2026。
     auto caption = LoadResourceText(resources, 0x80);
-    const auto version = LoadResourceText(resources, 0x8299);
-    if (!caption.empty() && !version.empty()) caption += L" ";
-    caption += version;
+    if (caption.empty()) {
+        caption = app::kProductDisplayName;
+    } else {
+        caption += app::kProductVersion;
+    }
     const auto channel = LoadResourceText(resources, 0x81b7);
     for (const auto& element : source.Elements()) {
         if (IsSuppressedSkinControl(element.name)) continue;
@@ -4028,6 +4033,9 @@ void PlayerWindow::InitializeOptionsShell() {
     };
     make_button(kSaveAllOptions, 0x8141, close_bounds.left - 2 * (button_width + 6));
     make_button(kResetAllOptions, 0x8140, close_bounds.left - button_width - 6);
+    // 底部按钮行最左边那个（全部保存）的 x。横排布局的左边界按它算，别用
+    // close_bounds.left —— 那是「关闭」按钮的左边缘，比它靠右 188 像素。
+    const int buttons_left = close_bounds.left - 2 * (button_width + 6);
 
     options_navigation_ = CreateWindowExW(
         0, WC_LISTBOXW, nullptr,
@@ -4076,19 +4084,44 @@ void PlayerWindow::InitializeOptionsShell() {
         instance_, nullptr);
     if (related_label && font) SendMessageW(related_label, WM_SETFONT,
         reinterpret_cast<WPARAM>(font), TRUE);
+    // 仓库链接跟在「相关链接:」右侧。标签是 owner/repo 全名（见
+    // src/ui/project_links.h），比原版的「Github仓库 / 提交反馈」宽不少：单行排
+    // 不下时会盖住右边的「全部保存 / 全部重置 / 关闭」按钮。这几个静态控件是后
+    // 创建的，z 序在按钮之上，被盖住的那一截按钮既看不见也点不到，所以这里先按
+    // 单行试算，超出按钮左边界就改成竖排，并把行高压到能塞进底部条。
     int link_x = 8 + related_width + 4;
+    const int right_limit = buttons_left - 8;
+    int total_width = 0;
+    for (size_t index = 0; index < kProjectLinks.size(); ++index) {
+        if (index) total_width += 8;
+        total_width += text_width(ProjectLinkLabel(kProjectLinks[index]));
+    }
+    const bool single_row = link_x + total_width <= right_limit;
+
+    RECT client{};
+    GetClientRect(options_window_, &client);
+    int row_step = button_height - 6;
+    if (!single_row && !kProjectLinks.empty()) {
+        const int available = client.bottom - 2 - (close_bounds.top + 6);
+        const int rows = static_cast<int>(kProjectLinks.size());
+        if (available > 0 && available / rows < row_step) row_step = available / rows;
+        if (row_step < 1) row_step = 1;
+    }
+
     for (size_t index = 0; index < kProjectLinks.size(); ++index) {
         const std::wstring_view label{ProjectLinkLabel(kProjectLinks[index])};
         const int width = text_width(label);
+        const int row = single_row ? 0 : static_cast<int>(index);
         const HWND link = CreateWindowExW(
             0, WC_STATICW, label.data(),
             WS_CHILD | WS_VISIBLE | SS_NOTIFY,
-            link_x, close_bounds.top + 6, width, button_height - 6, options_window_,
+            link_x, close_bounds.top + 6 + row * row_step,
+            width, single_row ? button_height - 6 : row_step, options_window_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkFirst + index)),
             instance_, nullptr);
         if (link && font) SendMessageW(link, WM_SETFONT,
                                        reinterpret_cast<WPARAM>(font), TRUE);
-        link_x += width + 8;
+        if (single_row) link_x += width + 8;
     }
     if (previous_font) SelectObject(dc, previous_font);
     ReleaseDC(options_window_, dc);
@@ -4273,7 +4306,8 @@ void PlayerWindow::InitializeOptionsPage(HWND dialog, UINT template_id) {
             about.push_back(raw_about[index]);
         }
         SetDlgItemTextW(dialog, 1073, about.c_str());
-        auto version = ResourceText(0x8299);
+        // 「关于」页的版本行同样走产品常量，不用资源 0x8299（原版 "5.5"）。
+        std::wstring version = app::kProductVersion;
         version += L" (Unicode)";
         SetDlgItemTextW(dialog, 1011, version.c_str());
         SetDlgItemTextW(dialog, 1005, i18n::Literal(L"nanling与社区"));

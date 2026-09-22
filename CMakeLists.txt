@@ -129,6 +129,7 @@ add_library(ttplayer_core
   src/ui/taskbar_playback.cpp
   src/ui/taskbar_preview.cpp
   src/ui/player_window_equalizer.cpp
+  src/ui/player_window_dpi_selftest.cpp
   src/ui/player_window_file_intake.cpp
   src/ui/output_devices.cpp
   src/ui/modern_file_dialog.cpp
