@@ -1,7 +1,5 @@
 # 主要功能恢复与伪代码映射
 
-> 历史阶段记录：本文的“未实现／仅保存设置”等结论不代表当前版本。当前差异清单见 [整体差异与简化报告](PLAYER_PARITY_AND_SIMPLIFICATION_AUDIT_20261019.md)，2026-10-19 修复及验证范围见 [修复与验收](PLAYER_PARITY_FIXES_20261019.md)。保留本文用于追溯早期恢复依据。
-
 本文记录本轮针对 `TTPlayer.exe.pseudo.c` 的行为级恢复。地址表示能够从现有
 EXE、伪代码或随附 DLL 交叉确认的调用边界；不能由这些材料推出的私有对象布局，
 不会标成“逐字源码”或“二进制完全一致”。文件选择器继续采用用户指定的现代
@@ -29,11 +27,7 @@ Common Item Dialog，这是有意兼容改动。
   x86 SEH 边界；
 - `src/audio/audio_engine.cpp`：reader/decoder 解码与统一源；
 - `src/ui/playlist_transforms.cpp`：encoder 配置和批量转换；
-- `src/ui/player_window_playlist_properties.cpp`：文件属性、基本／高级标签编辑、封面与批量保存；
-- `src/app/file_info_worker.cpp`：隔离工作进程中的 metadata 与 thumbnail 写回。
-
-文件属性窗口的完整功能对照、底层标签修复和验证范围见
-[文件属性恢复](FILE_PROPERTIES_RECOVERY.md)。
+- `tools/file_info_probe.cpp`：metadata 与 thumbnail 写回。
 
 reader 使用 `IStream` 打开并通过六槽宿主 buffer 输出；decoder 选择遵循
 `004CD045`，读/seek/reset 对应 `004E3CF3/004E3E64`。encoder 遵循

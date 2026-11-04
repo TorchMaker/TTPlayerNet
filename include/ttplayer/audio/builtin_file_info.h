@@ -4,7 +4,6 @@
 #include <filesystem>
 #include <span>
 #include <string>
-#include <string_view>
 #include <vector>
 #include <windows.h>
 #include <mmreg.h>
@@ -63,33 +62,12 @@ HRESULT CreateStandardContent(IStream* stream, DWORD write_type,
 // Shell metadata fallbacks are also read-only, without tag-write capability.
 [[nodiscard]] HRESULT ReadBuiltinFileInfo(
     const std::filesystem::path& path, const Mp3TagPolicy& policy,
-    BuiltinFileInfo& result, bool allow_system_fallback = true) noexcept;
-
-// Requires consecutive MPEG frames, regardless of the filename suffix.
-[[nodiscard]] HRESULT ReadBuiltinMpegFileInfo(
-    const std::filesystem::path& path, const Mp3TagPolicy& policy,
     BuiltinFileInfo& result) noexcept;
-
-// Uses an independent cursor on a clonable stream (including archive members).
-// Shares the disk MPEG/WAVE parsers and always returns read-only metadata.
-// wave_header_only reads only the first WAVE fmt/data description. Its caller
-// must publish a provisional result and arrange final archive CRC validation.
-[[nodiscard]] HRESULT ReadBuiltinStreamInfo(
-    IStream* stream, const std::filesystem::path& logical_path,
-    const Mp3TagPolicy& policy, BuiltinFileInfo& result,
-    bool wave_header_only = false) noexcept;
 
 [[nodiscard]] BuiltinTagWriteResult WriteBuiltinFileInfo(
     const std::filesystem::path& path, const Mp3TagPolicy& policy,
     std::span<const BuiltinTagWriteField> fields,
     BuiltinCoverAction cover_action = BuiltinCoverAction::unchanged,
     std::span<const unsigned char> cover = {}) noexcept;
-
-// Update only these two fields in existing ID3v2/APEv2 tags; untagged MPEG
-// gets APEv2 as in 004D9B56. Preserve audio and all unrelated tag payloads.
-// Empty values remove the fields. Validates MPEG content, not the suffix.
-[[nodiscard]] HRESULT WriteBuiltinMpegReplayGain(
-    const std::filesystem::path& path, std::wstring_view gain,
-    std::wstring_view peak) noexcept;
 
 } // namespace ttplayer::audio

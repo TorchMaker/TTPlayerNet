@@ -12,6 +12,5 @@ struct LyricAssociationChoice {
 };
 LyricAssociationChoice ChooseLyricAssociation(HMODULE resources, HWND owner,
     lyrics::AssociationStore& store, const lyrics::SongKey& song,
-    lyrics::LocalSearchRequest request, std::function<void()> associations_changed,
-    std::function<bool(const std::filesystem::path&)> can_write_path = {});
+    lyrics::LocalSearchRequest request, std::function<void()> associations_changed);
 } // namespace ttplayer::ui::detail

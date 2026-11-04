@@ -20,7 +20,7 @@ namespace ttplayer::ui::detail {
 // helper without ever terminating an in-process thread or trusting partial
 // output from a killed process.
 inline constexpr std::uint32_t kFileInfoProbeMagic = 0x50494654U; // TFIP
-inline constexpr std::uint32_t kFileInfoProbeVersion = 7;
+inline constexpr std::uint32_t kFileInfoProbeVersion = 4;
 inline constexpr std::uint32_t kFileInfoProbeReadPacket = 1;
 inline constexpr std::uint32_t kFileInfoProbeWriteRequestPacket = 2;
 inline constexpr std::uint32_t kFileInfoProbeWriteResultPacket = 3;
@@ -35,11 +35,9 @@ struct FileInfoProbeMetadata {
 };
 
 struct FileInfoProbeReadResult {
-    std::wstring source_identity;
     HRESULT status{E_FAIL};
     DWORD capabilities{};
     DWORD cover_writable{};
-    DWORD cover_maximum_bytes{};
     WAVEFORMATEX format{};
     DWORD duration_ms{};
     DWORD encoded_bits_per_second{};
@@ -72,11 +70,9 @@ struct FileInfoProbeMp3Policy {
 
 struct FileInfoProbeReadRequest {
     FileInfoProbeMp3Policy mp3;
-    std::wstring archive_password_packet;
 };
 
 struct FileInfoProbeWriteRequest {
-    std::wstring source_identity;
     FileInfoProbeMp3Policy mp3;
     std::vector<FileInfoProbeWriteField> fields;
     FileInfoProbeCoverAction cover_action{FileInfoProbeCoverAction::unchanged};
@@ -211,8 +207,7 @@ inline bool WriteFileInfoProbeReadRequest(
     if (file == INVALID_HANDLE_VALUE) return false;
     const bool okay = FileInfoProbeWriteHeader(
         file, kFileInfoProbeReadRequestPacket) &&
-        FileInfoProbeWriteMp3Policy(file, request.mp3) &&
-        FileInfoProbeWriteWide(file, request.archive_password_packet);
+        FileInfoProbeWriteMp3Policy(file, request.mp3);
     CloseHandle(file);
     if (!okay) DeleteFileW(path.c_str());
     return okay;
@@ -227,8 +222,7 @@ inline bool ReadFileInfoProbeReadRequest(
     FileInfoProbeReadRequest decoded;
     const bool okay = FileInfoProbeReadHeader(
         file, kFileInfoProbeReadRequestPacket) &&
-        FileInfoProbeReadMp3Policy(file, decoded.mp3) &&
-        FileInfoProbeReadWide(file, decoded.archive_password_packet);
+        FileInfoProbeReadMp3Policy(file, decoded.mp3);
     CloseHandle(file);
     if (okay) request = decoded;
     return okay;
@@ -249,12 +243,10 @@ inline bool WriteFileInfoProbeReadResult(
         FileInfoProbeWriteScalar(file, result.status) &&
         FileInfoProbeWriteScalar(file, result.capabilities) &&
         FileInfoProbeWriteScalar(file, result.cover_writable) &&
-        FileInfoProbeWriteScalar(file, result.cover_maximum_bytes) &&
         FileInfoProbeWriteScalar(file, result.format) &&
         FileInfoProbeWriteScalar(file, result.duration_ms) &&
         FileInfoProbeWriteScalar(file, result.encoded_bits_per_second) &&
         FileInfoProbeWriteWide(file, result.codec) &&
-        FileInfoProbeWriteWide(file, result.source_identity) &&
         FileInfoProbeWriteScalar(file, metadata_count);
     for (std::uint32_t index = 0; okay && index < metadata_count; ++index) {
         okay = FileInfoProbeWriteWide(file, result.metadata[index].name) &&
@@ -279,12 +271,10 @@ inline bool ReadFileInfoProbeReadResult(
         FileInfoProbeReadScalar(file, decoded.status) &&
         FileInfoProbeReadScalar(file, decoded.capabilities) &&
         FileInfoProbeReadScalar(file, decoded.cover_writable) &&
-        FileInfoProbeReadScalar(file, decoded.cover_maximum_bytes) &&
         FileInfoProbeReadScalar(file, decoded.format) &&
         FileInfoProbeReadScalar(file, decoded.duration_ms) &&
         FileInfoProbeReadScalar(file, decoded.encoded_bits_per_second) &&
         FileInfoProbeReadWide(file, decoded.codec) &&
-        FileInfoProbeReadWide(file, decoded.source_identity) &&
         FileInfoProbeReadScalar(file, metadata_count) &&
         metadata_count <= kFileInfoProbeMaximumFields;
     if (okay) {
@@ -327,7 +317,6 @@ inline bool WriteFileInfoProbeWriteRequest(
     bool okay = FileInfoProbeWriteHeader(
         file, kFileInfoProbeWriteRequestPacket) &&
         FileInfoProbeWriteMp3Policy(file, request.mp3) &&
-        FileInfoProbeWriteWide(file, request.source_identity) &&
         FileInfoProbeWriteScalar(file, count);
     for (const auto& field : request.fields) {
         okay = okay && FileInfoProbeWriteNarrow(file, field.name) &&
@@ -354,7 +343,6 @@ inline bool ReadFileInfoProbeWriteRequest(
     bool okay = FileInfoProbeReadHeader(
         file, kFileInfoProbeWriteRequestPacket) &&
         FileInfoProbeReadMp3Policy(file, decoded.mp3) &&
-        FileInfoProbeReadWide(file, decoded.source_identity) &&
         FileInfoProbeReadScalar(file, count) &&
         count <= kFileInfoProbeMaximumFields;
     if (okay) {

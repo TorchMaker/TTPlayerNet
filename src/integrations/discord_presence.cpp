@@ -21,7 +21,6 @@ namespace ttplayer::integrations {
 namespace {
 
 constexpr DWORD kPipeIoTimeoutMilliseconds = 1500;
-constexpr DWORD kShutdownClearTimeoutMilliseconds = 250;
 constexpr std::uint32_t kHandshakeOpcode = 0;
 constexpr std::uint32_t kFrameOpcode = 1;
 constexpr std::uint32_t kCloseOpcode = 2;
@@ -208,30 +207,10 @@ std::string JsonEscape(std::wstring_view value) {
     return result;
 }
 
-// One budget covers a complete request/reply transaction, including partial
-// transfers, frame headers/payloads and intervening ping/pong frames.
-struct IoBudget {
-    explicit IoBudget(HANDLE stop, DWORD milliseconds = kPipeIoTimeoutMilliseconds)
-        : stop_event(stop), deadline(GetTickCount64() + milliseconds) {}
-
-    [[nodiscard]] DWORD Remaining() const noexcept {
-        const auto now = GetTickCount64();
-        return now < deadline ? static_cast<DWORD>(deadline - now) : 0;
-    }
-    [[nodiscard]] bool Active() const noexcept {
-        return Remaining() != 0 &&
-            (!stop_event || WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT);
-    }
-    HANDLE stop_event{};
-    ULONGLONG deadline{};
-};
-
-bool Transfer(HANDLE pipe, void* bytes, DWORD length, bool write,
-              const IoBudget& budget) {
+bool Transfer(HANDLE pipe, void* bytes, DWORD length, bool write) {
     auto* cursor = static_cast<std::uint8_t*>(bytes);
     DWORD remaining = length;
     while (remaining != 0) {
-        if (!budget.Active()) return false;
         UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         if (!event) return false;
         OVERLAPPED operation{};
@@ -242,14 +221,9 @@ bool Transfer(HANDLE pipe, void* bytes, DWORD length, bool write,
             : ReadFile(pipe, cursor, remaining, &transferred, &operation);
         if (!started) {
             if (GetLastError() != ERROR_IO_PENDING) return false;
-            const HANDLE events[]{event.Get(), budget.stop_event};
-            if (WaitForMultipleObjects(budget.stop_event ? 2 : 1, events, FALSE,
-                                       budget.Remaining()) != WAIT_OBJECT_0) {
-                // YY-Thunks 1.2.2 cannot cancel a specific OVERLAPPED on XP.
-                // Only this worker owns the pipe, with one outstanding I/O,
-                // so its native CancelIo safely provides the issuer-thread
-                // fallback. Keep OVERLAPPED alive until cancellation completes.
-                if (!CancelIoEx(pipe, &operation)) CancelIo(pipe);
+            if (WaitForSingleObject(event.Get(), kPipeIoTimeoutMilliseconds) !=
+                WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &operation);
                 WaitForSingleObject(event.Get(), INFINITE);
                 return false;
             }
@@ -260,14 +234,13 @@ bool Transfer(HANDLE pipe, void* bytes, DWORD length, bool write,
         cursor += transferred;
         remaining -= transferred;
     }
-    return budget.Active();
+    return true;
 }
 
-bool WriteFrame(HANDLE pipe, std::uint32_t opcode, std::string_view json,
-                const IoBudget& budget) {
+bool WriteFrame(HANDLE pipe, std::uint32_t opcode, std::string_view json) {
     auto frame = discord_presence_detail::BuildRpcFrame(opcode, json);
     return !frame.empty() && Transfer(pipe, frame.data(),
-                                      static_cast<DWORD>(frame.size()), true, budget);
+                                      static_cast<DWORD>(frame.size()), true);
 }
 
 struct RpcFrame {
@@ -275,9 +248,9 @@ struct RpcFrame {
     std::string json;
 };
 
-std::optional<RpcFrame> ReadFrame(HANDLE pipe, const IoBudget& budget) {
+std::optional<RpcFrame> ReadFrame(HANDLE pipe) {
     std::array<std::uint8_t, 8> header{};
-    if (!Transfer(pipe, header.data(), static_cast<DWORD>(header.size()), false, budget))
+    if (!Transfer(pipe, header.data(), static_cast<DWORD>(header.size()), false))
         return std::nullopt;
     RpcFrame result;
     std::uint32_t length{};
@@ -286,17 +259,17 @@ std::optional<RpcFrame> ReadFrame(HANDLE pipe, const IoBudget& budget) {
     if (length > kMaximumPayloadBytes) return std::nullopt;
     result.json.resize(length);
     if (length != 0 &&
-        !Transfer(pipe, result.json.data(), length, false, budget)) return std::nullopt;
+        !Transfer(pipe, result.json.data(), length, false)) return std::nullopt;
     return result;
 }
 
-bool AwaitFrame(HANDLE pipe, std::string_view marker, const IoBudget& budget,
+bool AwaitFrame(HANDLE pipe, std::string_view marker,
                 std::uint32_t expected_opcode = kFrameOpcode) {
     for (int attempt = 0; attempt < 6; ++attempt) {
-        const auto frame = ReadFrame(pipe, budget);
+        const auto frame = ReadFrame(pipe);
         if (!frame || frame->opcode == kCloseOpcode) return false;
         if (frame->opcode == kPingOpcode) {
-            if (!WriteFrame(pipe, kPongOpcode, frame->json, budget)) return false;
+            if (!WriteFrame(pipe, kPongOpcode, frame->json)) return false;
             continue;
         }
         if (frame->opcode == expected_opcode &&
@@ -307,9 +280,8 @@ bool AwaitFrame(HANDLE pipe, std::string_view marker, const IoBudget& budget,
 }
 
 UniqueHandle ConnectPipe(std::string_view application_id,
-                         const std::wstring& test_pipe_name, const IoBudget& budget) {
+                         const std::wstring& test_pipe_name) {
     for (int index = 0; index < (test_pipe_name.empty() ? 10 : 1); ++index) {
-        if (!budget.Active()) return {};
         const std::wstring name = test_pipe_name.empty()
             ? L"\\\\?\\pipe\\discord-ipc-" + std::to_wstring(index)
             : test_pipe_name;
@@ -322,8 +294,8 @@ UniqueHandle ConnectPipe(std::string_view application_id,
             continue;
         if (!WriteFrame(pipe.Get(), kHandshakeOpcode,
                         discord_presence_detail::BuildHandshakeJson(
-                            application_id), budget)) continue;
-        if (!AwaitFrame(pipe.Get(), "READY", budget)) continue;
+                            application_id))) continue;
+        if (!AwaitFrame(pipe.Get(), "READY")) continue;
         return pipe;
     }
     return {};
@@ -335,26 +307,23 @@ std::string NextNonce() {
            std::to_string(++sequence);
 }
 
-bool Publish(HANDLE pipe, const DiscordTrackPresence* presence, HANDLE stop_event,
-             DWORD milliseconds = kPipeIoTimeoutMilliseconds) {
-    const IoBudget budget(stop_event, milliseconds);
+bool Publish(HANDLE pipe, const DiscordTrackPresence* presence) {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const std::string nonce = NextNonce();
     const auto json = discord_presence_detail::BuildSetActivityJson(
         presence, GetCurrentProcessId(), nonce, now);
-    if (!WriteFrame(pipe, kFrameOpcode, json, budget)) return false;
+    if (!WriteFrame(pipe, kFrameOpcode, json)) return false;
     // Discord is free to insert JSON whitespace in replies, so match the
     // unique nonce value rather than depending on a particular serializer.
-    return AwaitFrame(pipe, nonce, budget);
+    return AwaitFrame(pipe, nonce);
 }
 
-bool ProbeConnection(HANDLE pipe, HANDLE stop_event) {
-    const IoBudget budget(stop_event);
+bool ProbeConnection(HANDLE pipe) {
     const std::string payload = "{\"time\":" +
         std::to_string(GetTickCount64()) + "}";
-    return WriteFrame(pipe, kPingOpcode, payload, budget) &&
-           AwaitFrame(pipe, {}, budget, kPongOpcode);
+    return WriteFrame(pipe, kPingOpcode, payload) &&
+           AwaitFrame(pipe, {}, kPongOpcode);
 }
 
 bool SameStableActivity(const DiscordTrackPresence& left,
@@ -468,7 +437,6 @@ public:
             std::lock_guard lock(mutex_);
             stopping_ = true;
         }
-        if (stop_event_) SetEvent(stop_event_.Get());
         changed_.notify_one();
         if (worker_.joinable()) worker_.join();
     }
@@ -568,7 +536,6 @@ private:
 
     void Run() noexcept {
         try {
-            if (!stop_event_) return; // Presence is optional if event allocation fails.
             UniqueHandle pipe;
             std::wstring connected_id;
             bool published = false;
@@ -583,10 +550,7 @@ private:
             for (;;) {
                 const Snapshot state = GetSnapshot();
                 if (state.stopping) {
-                    // Preserve a best-effort graceful clear, but never let a
-                    // silent/slow peer turn shutdown into another full RPC wait.
-                    if (pipe && published) static_cast<void>(Publish(
-                        pipe.Get(), nullptr, nullptr, kShutdownClearTimeoutMilliseconds));
+                    if (pipe && published) static_cast<void>(Publish(pipe.Get(), nullptr));
                     return;
                 }
                 const auto now = std::chrono::steady_clock::now();
@@ -595,7 +559,7 @@ private:
                         state.application_id);
                 if (!valid) {
                     if (pipe && published)
-                        static_cast<void>(Publish(pipe.Get(), nullptr, stop_event_.Get()));
+                        static_cast<void>(Publish(pipe.Get(), nullptr));
                     pipe.Reset();
                     connected_id.clear();
                     published = false;
@@ -614,7 +578,7 @@ private:
                 }
 
                 if (pipe && connected_id != state.application_id) {
-                    if (published) static_cast<void>(Publish(pipe.Get(), nullptr, stop_event_.Get()));
+                    if (published) static_cast<void>(Publish(pipe.Get(), nullptr));
                     pipe.Reset();
                     published = false;
                 }
@@ -623,7 +587,7 @@ private:
                         WaitForChange(state.revision, retry_after);
                         continue;
                     }
-                    pipe = ConnectPipe(application_id, test_pipe_name_, IoBudget(stop_event_.Get()));
+                    pipe = ConnectPipe(application_id, test_pipe_name_);
                     if (pipe) {
                         connected_id = state.application_id;
                         needs_publish = true;
@@ -653,7 +617,7 @@ private:
                         discord_presence_detail::ProjectPresencePosition(*projected,
                             std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - state.observed_at));
-                    if (Publish(pipe.Get(), projected ? &*projected : nullptr, stop_event_.Get())) {
+                    if (Publish(pipe.Get(), projected ? &*projected : nullptr)) {
                         published = state.desired.has_value();
                         processed_revision = state.revision;
                         processed_urgent_revision = state.urgent_revision;
@@ -669,7 +633,7 @@ private:
                     continue;
                 }
                 if (now >= next_probe) {
-                    if (!ProbeConnection(pipe.Get(), stop_event_.Get())) {
+                    if (!ProbeConnection(pipe.Get())) {
                         pipe.Reset();
                         published = false;
                         retry_id = state.application_id;
@@ -698,7 +662,6 @@ private:
     std::uint64_t revision_{};
     std::uint64_t urgent_revision_{};
     const std::wstring test_pipe_name_;
-    UniqueHandle stop_event_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     std::thread worker_;
 };
 

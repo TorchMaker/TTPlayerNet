@@ -1,6 +1,5 @@
 #include "ttplayer/ui/wtl_dialogs.h"
 #include "player_window_internal.h"
-#include "osu_library_write_policy.h"
 #include "ttplayer/core/text.h"
 
 #include <algorithm>
@@ -143,7 +142,7 @@ void PlayerWindow::StartOnlineLyricSearch(bool automatic) {
         const auto& service = lyric_services_.entries[index];
         if (!service.url.empty())
             lyric_search_ = std::make_unique<lyrics::OnlineSearch>(service, index, settings_.network,
-                lyric_search_artist_, lyric_search_title_, sound_library_);
+                lyric_search_artist_, lyric_search_title_);
         else // Other AddIns keep their own private, non-ttp_lrcsh protocol.
             lyric_search_ = std::make_unique<lyrics::OnlineSearch>(*sound_library_, service.legacy_provider,
                 settings_.network, lyric_search_artist_, lyric_search_title_);
@@ -167,14 +166,13 @@ void PlayerWindow::UpdateOnlineLyricSelection() {
     filename = lyrics::LyricFileName(std::move(filename));
     SetDlgItemTextW(lyric_search_dialog_, 2001, filename.c_str());
     EnableWindow(GetDlgItem(lyric_search_dialog_, IDOK), snapshot.phase == lyrics::SearchPhase::results ||
-        snapshot.phase == lyrics::SearchPhase::downloaded || snapshot.phase == lyrics::SearchPhase::download_failed);
+        snapshot.phase == lyrics::SearchPhase::downloaded);
 }
 
 void PlayerWindow::DownloadOnlineLyric(int index) {
     if (!lyric_search_) return;
     const auto snapshot = lyric_search_->Snapshot();
-    if ((snapshot.phase != lyrics::SearchPhase::results && snapshot.phase != lyrics::SearchPhase::downloaded &&
-         snapshot.phase != lyrics::SearchPhase::download_failed) || index < 0 ||
+    if ((snapshot.phase != lyrics::SearchPhase::results && snapshot.phase != lyrics::SearchPhase::downloaded) || index < 0 ||
         static_cast<size_t>(index) >= snapshot.results.size()) return;
     lyric_download_deadline_ = 0;
     const auto& item = snapshot.results[index];
@@ -182,9 +180,8 @@ void PlayerWindow::DownloadOnlineLyric(int index) {
         (settings_.lyric.same_file_title && !lyric_search_track_.path.empty()
             ? lyric_search_track_.path.stem().wstring() : item.artist + L" - " + item.title);
     if (filename.empty()) return;
-    lyric_download_path_ = LyricDownloadPathForTrack(lyric_search_track_, settings_,
-        PlayerRuntimeDirectory(), std::move(filename));
-    if (lyric_download_path_.empty()) return;
+    lyric_download_path_ = lyrics::DownloadDirectory(settings_.lyric, lyric_search_track_.path,
+        PlayerRuntimeDirectory()) / lyrics::LyricFileName(std::move(filename));
     lyric_download_overwrite_ = settings_.lyric.overwrite;
     std::error_code error;
     if (!lyric_download_overwrite_ && std::filesystem::exists(lyric_download_path_, error)) {
@@ -277,7 +274,7 @@ void PlayerWindow::PollOnlineLyricSearch() {
     UINT status = 0x817a;
     if (snapshot.phase == Phase::results) status = snapshot.results.empty() ? 0x817b : 0x8184;
     else if (snapshot.phase == Phase::downloading) status = 0x8179;
-    else if (snapshot.phase == Phase::failed || snapshot.phase == Phase::download_failed) status = 0x817b;
+    else if (snapshot.phase == Phase::failed) status = 0x817b;
     else if (snapshot.phase == Phase::downloaded) {
         status = 0x8186;
         if (!lyric_search_saved_) {
@@ -296,16 +293,14 @@ void PlayerWindow::PollOnlineLyricSearch() {
         }
     }
     if (lyric_search_dialog_) {
-        auto text = (snapshot.phase == Phase::failed || snapshot.phase == Phase::download_failed) &&
-            !snapshot.error.empty() ? snapshot.error : ResourceText(status);
+        auto text = snapshot.phase == Phase::failed && !snapshot.error.empty() ? snapshot.error : ResourceText(status);
         if (const auto at = text.find(L"%s"); at != text.npos) text.replace(at, 2, lyric_download_path_.wstring());
         SetDlgItemTextW(lyric_search_dialog_, 1052, text.c_str());
         const bool busy = snapshot.phase == Phase::searching || snapshot.phase == Phase::downloading;
         EnableWindow(GetDlgItem(lyric_search_dialog_, 1046), !busy);
         EnableWindow(GetDlgItem(lyric_search_dialog_, 2090), !busy);
         EnableWindow(GetDlgItem(lyric_search_dialog_, IDOK),
-            (snapshot.phase == Phase::results || snapshot.phase == Phase::downloaded ||
-             snapshot.phase == Phase::download_failed) && !snapshot.results.empty());
+            (snapshot.phase == Phase::results || snapshot.phase == Phase::downloaded) && !snapshot.results.empty());
         if (!snapshot.extra_title.empty()) SetDlgItemTextW(lyric_search_dialog_, 2269, snapshot.extra_title.c_str());
         ShowWindow(GetDlgItem(lyric_search_dialog_, 2269), WebLink(snapshot.extra_url) ? SW_SHOW : SW_HIDE);
         update_countdown();

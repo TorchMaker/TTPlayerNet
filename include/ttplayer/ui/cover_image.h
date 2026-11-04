@@ -2,8 +2,6 @@
 
 #include <windows.h>
 #include <span>
-#include <filesystem>
-#include <vector>
 
 namespace ttplayer::ui {
 
@@ -14,10 +12,6 @@ struct CoverImage {
     SIZE size{};
 };
 enum class CoverImageDecoder { automatic, wic, gdi_plus };
-
-// Read a bounded image payload by contents, including extensionless game files.
-// Empty, inaccessible and oversized files return an empty payload.
-std::vector<unsigned char> ReadCoverImageFile(const std::filesystem::path&) noexcept;
 
 CoverImage DecodeCoverImage(std::span<const unsigned char> bytes, UINT maximum_edge = 0,
                            CoverImageDecoder decoder = CoverImageDecoder::automatic);

@@ -9,7 +9,6 @@ struct PlaylistInfoSessionRequest {
     std::wstring path;
     int subtrack{};
     FileInfoProbeMp3Policy mp3;
-    std::wstring archive_password_packet;
 };
 inline bool WritePlaylistInfoSessionRequest(const std::filesystem::path& path,
                                            const PlaylistInfoSessionRequest& request) {
@@ -20,8 +19,7 @@ inline bool WritePlaylistInfoSessionRequest(const std::filesystem::path& path,
         FileInfoProbeWriteScalar(file, request.id) &&
         FileInfoProbeWriteWide(file, request.path) &&
         FileInfoProbeWriteScalar(file, request.subtrack) &&
-        FileInfoProbeWriteMp3Policy(file, request.mp3) &&
-        FileInfoProbeWriteWide(file, request.archive_password_packet);
+        FileInfoProbeWriteMp3Policy(file, request.mp3);
     CloseHandle(file);
     return okay;
 }
@@ -34,8 +32,7 @@ inline bool ReadPlaylistInfoSessionRequest(const std::filesystem::path& path,
         FileInfoProbeReadScalar(file, request.id) && request.id != 0 &&
         FileInfoProbeReadWide(file, request.path) &&
         FileInfoProbeReadScalar(file, request.subtrack) && request.subtrack >= 0 &&
-        FileInfoProbeReadMp3Policy(file, request.mp3) &&
-        FileInfoProbeReadWide(file, request.archive_password_packet);
+        FileInfoProbeReadMp3Policy(file, request.mp3);
     CloseHandle(file);
     return okay;
 }

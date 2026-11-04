@@ -1,8 +1,6 @@
-#include "ttplayer/platform/windows_features.h"
 #include "file_info_probe_client.h"
 #include "playlist_info_session_protocol.h"
 #include "ttplayer/app/file_info_worker.h"
-#include "ttplayer/audio/archive_password.h"
 #include "ttplayer/app/worker_process.h"
 
 #include <algorithm>
@@ -79,7 +77,6 @@ std::optional<FileInfoProbeReadResult> RunReadMode(
     } remove_output{output}, remove_request{request};
     FileInfoProbeReadRequest encoded_request;
     encoded_request.mp3 = mp3_policy;
-    if(arguments.size()>2)encoded_request.archive_password_packet=audio::ExportArchivePasswordPacket(arguments[2],[&]{return stop.stop_requested();});
     if (!WriteFileInfoProbeReadRequest(request, encoded_request)) {
         if (process_state)
             *process_state = FileInfoProbeProcessState::launch_failed;
@@ -205,12 +202,7 @@ std::optional<FileInfoProbeReadResult> RunFileInfoReadProbe(
     const std::filesystem::path& ttpcomm_path,
     DWORD timeout_milliseconds,
     FileInfoProbeProcessState* process_state,
-    const FileInfoProbeMp3Policy& mp3_policy, int subtrack) {
-    if (subtrack > 0 && _wcsicmp(logical_path.extension().c_str(), L".cue") == 0)
-        return RunReadMode(stop, helper,
-            {L"cue-read", addin_directory.wstring(), logical_path.wstring(),
-             ttpcomm_path.wstring(), std::to_wstring(subtrack)},
-            timeout_milliseconds, process_state, mp3_policy);
+    const FileInfoProbeMp3Policy& mp3_policy) {
     return RunReadMode(stop, helper,
         {L"read", addin_directory.wstring(), logical_path.wstring(),
          ttpcomm_path.wstring()}, timeout_milliseconds, process_state,
@@ -254,8 +246,11 @@ struct PlaylistInfoProbeSession::State {
     };
     std::list<Cached> cache;
     size_t cache_bytes{};
-    const size_t cache_limit = platform::CurrentWindowsFeatures().MetadataCacheEntries();
-    const size_t byte_limit = platform::CurrentWindowsFeatures().MetadataCacheBytes();
+#ifdef TTPLAYER_LEGACY_WINDOWS
+    static constexpr size_t cache_limit = 128, byte_limit = 4 * 1024 * 1024;
+#else
+    static constexpr size_t cache_limit = 512, byte_limit = 16 * 1024 * 1024;
+#endif
     ~State() { Reset(); }
     void Reset() noexcept {
         if (process && WaitForSingleObject(process.Get(), 0) == WAIT_TIMEOUT) {
@@ -366,11 +361,9 @@ std::optional<FileInfoProbeReadResult> PlaylistInfoProbeSession::Read(
         GetTickCount64() - s.last_use >= 45000) {
         if (!s.Start(helper, addin, comm)) return fail(FileInfoProbeProcessState::launch_failed);
     }
-    const auto password_packet=audio::ExportArchivePasswordPacket(path,[&]{return stop.stop_requested();});
-    if(stop.stop_requested())return fail(FileInfoProbeProcessState::cancelled);
     const auto deadline = GetTickCount64() + timeout;
     const auto request_id = ++s.next_id;
-    if (!WritePlaylistInfoSessionRequest(s.request, {request_id, path.native(), subtrack, mp3,password_packet}) ||
+    if (!WritePlaylistInfoSessionRequest(s.request, {request_id, path.native(), subtrack, mp3}) ||
         !SetEvent(s.incoming.Get())) return fail(FileInfoProbeProcessState::wait_failed);
     ++s.stats.reads;
     HANDLE waits[]{s.outgoing.Get(), s.process.Get()};
@@ -391,13 +384,13 @@ std::optional<FileInfoProbeReadResult> PlaylistInfoProbeSession::Read(
     const auto after = State::Fingerprint(path, subtrack);
     if (stamp && (!after || !(*stamp == *after)))
         return fail(FileInfoProbeProcessState::cancelled); // File changed during decoding; retry later.
-    if (stamp && result.status == S_OK) { // S_FALSE is unverified archive prefix information.
+    if (stamp && SUCCEEDED(result.status)) {
         size_t memory = sizeof(State::Cached) + key.size() * sizeof(wchar_t) +
             result.codec.size() * sizeof(wchar_t) + result.metadata.size() * sizeof(FileInfoProbeMetadata);
         for (const auto& field : result.metadata) memory += (field.name.size() + field.value.size()) * sizeof(wchar_t);
-        if (memory <= s.byte_limit) {
-            while (!s.cache.empty() && (s.cache.size() >= s.cache_limit ||
-                    s.cache_bytes + memory > s.byte_limit)) {
+        if (memory <= State::byte_limit) {
+            while (!s.cache.empty() && (s.cache.size() >= State::cache_limit ||
+                    s.cache_bytes + memory > State::byte_limit)) {
                 s.cache_bytes -= s.cache.back().bytes; s.cache.pop_back();
             }
             s.cache.push_front({std::move(key), *stamp, result, memory});

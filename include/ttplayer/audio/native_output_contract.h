@@ -2,27 +2,19 @@
 
 #include <cstdint>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <guiddef.h>
 
 namespace ttplayer::audio {
 
 enum class OutputBackend { wave_out = 0, direct_sound = 1, kernel_streaming = 2,
-                           asio = 3, wasapi_shared = 4, wasapi_exclusive = 5,
-                           unknown = -1 };
+                           asio = 3, unknown = -1 };
 
 struct OutputDeviceKey {
     OutputBackend backend{OutputBackend::unknown};
     GUID identifier{};
     std::uint16_t ordinal{};
     bool default_direct_sound{};
-    // Rebuild extension: persist the opaque MMDevice ID, never a list ordinal.
-    // Empty selects the current default multimedia render endpoint.
-    std::wstring endpoint_id;
-    // Stable native identity: ASIO uses identifier as its CLSID; KS stores
-    // its device-interface path in endpoint_id. Old ordinal GUIDs still load.
-    bool stable_native{};
 };
 
 // FUN_004918B1 / FUN_004918FE: Data1.high selects the backend only when
@@ -30,15 +22,6 @@ struct OutputDeviceKey {
 // An empty setting retains the existing wave mapper default.
 [[nodiscard]] std::optional<OutputDeviceKey>
 ParseOutputDeviceKey(std::wstring_view text);
-
-// FUN_004C2FD5: explicit layouts for the original multichannel formats.
-[[nodiscard]] std::uint32_t LegacyOutputChannelMask(unsigned channels) noexcept;
-
-// Pure KS discovery contracts, shared by device discovery and regression tests.
-[[nodiscard]] bool IsKsPcmDataRange(const GUID& major, const GUID& subformat,
-                                   const GUID& specifier) noexcept;
-[[nodiscard]] bool KsProbeDeadlineExpired(std::uint64_t deadline,
-                                          std::uint64_t now) noexcept;
 
 struct AsioChannelLayout {
     int container_bits{};

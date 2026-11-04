@@ -59,36 +59,6 @@ survive every profile load unchanged.
 
 ## Painting semantics
 
-### Plugin lyric font defaults
-
-A provider may declare a default window-lyric LOGFONT height through the
-optional `lyric_font_height` ABI field. Winamp declares `-11` (11 glyph pixels).
-The host applies this before loading the skin's saved lyric font. The Lyrics
-Show font chooser, playback renderer and editor then use the same settings;
-later font choices survive skin reselect and restart. Playlist and fullscreen
-font settings remain independent. The provider editor accepts sizes below the
-native editor's 9-point minimum, so 11 pixels stays 8.25 points at 96 DPI.
-
-### Long vertical lines
-
-Vertical lyrics now wrap to the actual content width, including the native
-skin window and a plugin's bounded lyric surface. This fixes the previous
-single-line clipping of long sentences. Horizontal scrolling retains its
-continuous stream. The saved LRC text and timestamps are unchanged.
-
-Each timestamp owns a block of display rows. Drawing, hit testing, scrolling,
-drag previews and release-to-seek use that same block height. Karaoke consumes
-the measured widths of the rows in order, so highlighting continues onto the
-next row instead of restarting on every row. Short lines retain their existing
-height, alignment and timing. Word boundaries are preferred, long words/CJK
-can break within a line, and UTF-16 surrogate pairs and combining marks remain
-together. Layouts are cached by content width, selected font and source text;
-resizing or replacing a font/document recomputes the affected layouts.
-
-Local `tests/waskin/video_host_tests.inc` covers native/plugin rendering,
-Chinese and English long lines, unbroken words, Unicode boundaries, visible
-last-row pixels, karaoke progression and drag time across wrapped rows.
-
 `FUN_0043FC10` tests the control's `KaraokeMode` field at offset `+0x80`.
 When it is zero, the current line is drawn completely in `HilightColor`. When
 it is one, the line is first drawn in `TextColor` and then redrawn through a

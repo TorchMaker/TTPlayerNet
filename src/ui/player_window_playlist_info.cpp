@@ -1,10 +1,7 @@
 #include "player_window_internal.h"
 #include "file_info_probe_client.h"
-#include "track_metadata.h"
 
 #include "ttplayer/core/text.h"
-#include "ttplayer/audio/archive_member.h"
-#include "ttplayer/audio/archive_verified_info.h"
 
 #include <algorithm>
 #include <chrono>
@@ -25,13 +22,23 @@
 namespace ttplayer::ui {
 namespace {
 
-using PlaylistInfoState = detail::TrackInfoState;
+enum class PlaylistInfoState { success, failed, unavailable };
 
-struct PlaylistInfoResult : playlist::Track {
+struct PlaylistInfoResult {
     std::uint64_t info_revision{};
     size_t playlist_slot{};
     size_t row_hint{};
+    std::filesystem::path path;
+    int subtrack{};
     PlaylistInfoState state{PlaylistInfoState::failed};
+    int duration_ms{-2};
+    std::string title;
+    std::string artist;
+    std::string album;
+    std::string media_type;
+    std::uint32_t bitrate_bps{};
+    std::uint32_t sample_rate_hz{};
+    std::vector<std::pair<std::string, std::string>> metadata;
 };
 
 bool LooksLikeNetworkPath(std::wstring_view value) {
@@ -59,6 +66,42 @@ std::wstring RequestKey(size_t playlist_slot,
     return key;
 }
 
+bool EqualsAsciiInsensitive(std::wstring_view left,
+                            std::wstring_view right) {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        wchar_t lhs = left[index];
+        wchar_t rhs = right[index];
+        if (lhs >= L'A' && lhs <= L'Z') lhs += L'a' - L'A';
+        if (rhs >= L'A' && rhs <= L'Z') rhs += L'a' - L'A';
+        if (lhs != rhs) return false;
+    }
+    return true;
+}
+
+std::string Utf8(std::wstring_view value) {
+    if (value.empty()) return {};
+    try { return core::WideToUtf8(value); }
+    catch (const std::exception&) { return {}; }
+}
+
+std::wstring MetadataValue(
+    const detail::FileInfoProbeReadResult& probe, std::wstring_view name) {
+    const auto found = std::find_if(probe.metadata.begin(),
+        probe.metadata.end(),
+        [name](const auto& entry) {
+            return EqualsAsciiInsensitive(entry.name, name);
+        });
+    return found == probe.metadata.end() ? std::wstring{} : found->value;
+}
+
+bool ReaderUnavailable(HRESULT status) {
+    // The pre-open HasReaderForPath check is encoded as NOT_SUPPORTED by the
+    // helper.  E_NOINTERFACE can instead be a matched creator/Open failure and
+    // therefore follows 00481759's ordinary failed-item (-1) path.
+    return status == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+}
+
 std::filesystem::path RuntimeDirectory() {
     std::wstring executable(32768, L'\0');
     const DWORD length = GetModuleFileNameW(
@@ -81,46 +124,52 @@ PlaylistInfoResult ReadPlaylistInfoIsolated(
     result.path = path;
     result.subtrack = subtrack;
 
-    // The foreground WAV stream and isolated information worker otherwise
-    // inflate the same archive member into two separate process-local tasks.
-    // Reuse only complete, identity-checked foreground results; third-party
-    // readers and all cache misses retain the existing isolation boundary.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    for (;;) {
-        if (stop.stop_requested()) {
-            result.state = PlaylistInfoState::unavailable;
-            return result;
-        }
-        if (auto info = audio::TryReadVerifiedArchiveInfo(path, subtrack)) {
-            detail::FileInfoProbeReadResult probe;
-            probe.status = S_OK;
-            probe.capabilities = info->capabilities;
-            probe.format = info->format;
-            probe.duration_ms = info->duration_ms;
-            probe.encoded_bits_per_second = info->encoded_bits_per_second;
-            probe.codec = std::move(info->codec);
-            for (auto& field : info->metadata)
-                probe.metadata.push_back({std::move(field.name), std::move(field.value)});
-            result.state = detail::ApplyFileInfoProbeToTrack(
-                result, std::move(probe), detail::FileInfoProbeProcessState::completed);
-            return result;
-        }
-        if (!audio::IsArchiveInfoVerificationPending(path, subtrack)) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            // Completion can reach 100% just before final metadata publishes.
-            // Keep the row unread and retry through the normal queue timer;
-            // never start a duplicate helper merely because that job is slow.
-            result.state = PlaylistInfoState::unavailable;
-            return result;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
     detail::FileInfoProbeProcessState process_state{};
     const auto probe = session.Read(
         stop, helper, addin_directory, path, ttpcomm_path, subtrack, 15000,
         &process_state, policy);
-    result.state = detail::ApplyFileInfoProbeToTrack(result, probe, process_state);
+    if (!probe) {
+        // A missing helper means this build cannot inspect the source.  A
+        // launched helper which times out, crashes or emits a partial packet
+        // did match the transaction but failed, so 00481759's -2 -> -1
+        // failure transition must run and the following queue item can start.
+        result.state = process_state ==
+                detail::FileInfoProbeProcessState::launch_failed || process_state ==
+                detail::FileInfoProbeProcessState::cancelled
+            ? PlaylistInfoState::unavailable
+            : PlaylistInfoState::failed;
+        return result;
+    }
+    if (ReaderUnavailable(probe->status)) {
+        result.state = PlaylistInfoState::unavailable;
+        return result;
+    }
+    if (FAILED(probe->status)) return result;
+
+    result.state = PlaylistInfoState::success;
+    result.duration_ms = static_cast<int>(std::clamp<std::int64_t>(
+        probe->duration_ms, 0, INT_MAX));
+
+    result.title = Utf8(MetadataValue(*probe, L"title"));
+    auto artist = MetadataValue(*probe, L"artist");
+    if (artist.empty()) artist = MetadataValue(*probe, L"author");
+    result.artist = Utf8(artist);
+    result.album = Utf8(MetadataValue(*probe, L"album"));
+    result.media_type = Utf8(probe->codec);
+    const std::uint64_t encoded = probe->encoded_bits_per_second != 0
+        ? probe->encoded_bits_per_second
+        : static_cast<std::uint64_t>(probe->format.nAvgBytesPerSec) * 8U;
+    // CPlayItem reserves bit 31 for the VBR display flag.
+    result.bitrate_bps = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(encoded, 0x7fffffffU));
+    result.sample_rate_hz = probe->format.nSamplesPerSec;
+    result.metadata.reserve(probe->metadata.size());
+    for (const auto& entry : probe->metadata) {
+        auto name = Utf8(entry.name);
+        auto value = Utf8(entry.value);
+        if (!name.empty())
+            result.metadata.emplace_back(std::move(name), std::move(value));
+    }
     return result;
 }
 
@@ -180,11 +229,6 @@ void PlayerWindow::RequestPlaylistTrackInfo(size_t playlist_index, size_t row,
     const auto key = RequestKey(slot, track.path, track.subtrack);
     const auto checked = playlist_info_checked_.find(key);
     if (checked != playlist_info_checked_.end() && GetTickCount64() - checked->second < 5000) return;
-    if (playlist_info_verifying_ && RequestKey(playlist_info_verifying_->playlist_slot,
-            playlist_info_verifying_->path, playlist_info_verifying_->subtrack) == key) {
-        playlist_info_verifying_->visible_only &= visible_only;
-        return;
-    }
     if (playlist_info_active_ && RequestKey(playlist_info_active_->playlist_slot,
             playlist_info_active_->path, playlist_info_active_->subtrack) == key) {
         playlist_info_active_->visible_only &= visible_only;
@@ -229,59 +273,15 @@ void PlayerWindow::PollPlaylistInfo() {
     if (now - playlist_info_poll_tick_ >= 1000) {
         playlist_info_poll_tick_ = now;
         if (!settings_.playlist.library_mode) {
-            for (const auto [first, count] : VisiblePlaylistInfoRanges())
-                QueuePlaylistInfoRange(playlists_.ActiveIndex(), first, count, true, true);
+            const auto [first, count] = VisiblePlaylistInfoRange();
+            QueuePlaylistInfoRange(playlists_.ActiveIndex(), first, count, true, true);
         }
     }
     StartNextPlaylistInfoRead();
 }
 
 void PlayerWindow::StartNextPlaylistInfoRead() {
-    audio::ArchiveMemberPath archive;
-    const auto state = audio_->State();
-    const bool playback_priority = opened_track_ &&
-        audio::ParseArchiveMemberPath(opened_track_->path.native(), archive) &&
-        (state == audio::PlaybackState::opening ||
-         ((state == audio::PlaybackState::playing || state == audio::PlaybackState::paused) &&
-          audio_->DownloadedPercent() < 100));
-    if (playback_priority) {
-        // The isolated helper cannot share the player's in-process Task.
-        // Retire its own session while the foreground prefix is inflating.
-        // Preserve the queued work and never wait on an untrusted decoder UI-side.
-        if (playlist_info_active_ && !playlist_info_verifying_)
-            playlist_info_verifying_ = playlist_info_active_;
-        if (playlist_info_receiver_) {
-            playlist_info_receiver_->stop.request_stop();
-            {
-                std::scoped_lock lock(playlist_info_receiver_->mutex);
-                playlist_info_receiver_->stopped = true;
-                playlist_info_receiver_->target = nullptr;
-            }
-            playlist_info_receiver_->wake.notify_one();
-            playlist_info_receiver_.reset();
-            MSG message{};
-            while (PeekMessageW(&message, window_, detail::kMsgPlaylistInfoReady,
-                                detail::kMsgPlaylistInfoReady, PM_REMOVE))
-                delete reinterpret_cast<PlaylistInfoResult*>(message.lParam);
-        }
-        playlist_info_active_.reset();
-        playlist_info_working_ = false;
-        return;
-    }
     if (playlist_info_working_) return;
-    if (playlist_info_verifying_) {
-        if (GetTickCount64() < playlist_info_verify_tick_) return;
-        auto request = std::move(*playlist_info_verifying_);
-        playlist_info_verifying_.reset();
-        const auto key = RequestKey(request.playlist_slot, request.path, request.subtrack);
-        const auto found = playlist_info_queued_keys_.find(key);
-        if (found != playlist_info_queued_keys_.end()) {
-            playlist_info_pending_.erase(found->second);
-            playlist_info_queued_keys_.erase(found);
-        }
-        playlist_info_pending_.push_front(std::move(request));
-        playlist_info_queued_keys_[key] = playlist_info_pending_.begin();
-    }
     if (settings_.playlist.read_info_mode == 2 || !sound_library_) {
         playlist_info_pending_.clear(); playlist_info_queued_keys_.clear(); return;
     }
@@ -296,13 +296,11 @@ void PlayerWindow::StartNextPlaylistInfoRead() {
         const auto& list = playlists_.At(*index);
         const auto& tracks = list.Tracks();
         const auto& rows = PlaylistInfoSourceRows(*index, SourceKey(request.path, request.subtrack));
-        const auto visible_ranges = VisiblePlaylistInfoRanges();
+        const auto [first, count] = VisiblePlaylistInfoRange();
         const auto row = std::find_if(rows.begin(), rows.end(), [&](size_t candidate) {
             return tracks[candidate].duration_ms == -2 && (!request.visible_only ||
                 (!settings_.playlist.library_mode && *index == playlists_.ActiveIndex() &&
-                 std::any_of(visible_ranges.begin(), visible_ranges.end(), [&](const auto& range) {
-                     return candidate >= range.first && candidate - range.first < range.second;
-                 })));
+                 candidate >= first && candidate - first < count));
         });
         if (row == rows.end()) continue;
         request.row_hint = *row;
@@ -366,12 +364,6 @@ LRESULT PlayerWindow::ApplyPlaylistInfoResult(LPARAM value) {
     std::unique_ptr<PlaylistInfoResult> result(reinterpret_cast<PlaylistInfoResult*>(value));
     const auto active = std::move(playlist_info_active_);
     playlist_info_active_.reset(); playlist_info_working_ = false;
-    if (result && active && result->state == PlaylistInfoState::provisional) {
-        // Keep -2 (not verified), show the available tags/format, and retry the
-        // same cached member rather than evicting it with the next item.
-        playlist_info_verifying_ = *active;
-        playlist_info_verify_tick_ = GetTickCount64() + 250;
-    }
     if (result && settings_.playlist.read_info_mode != 2) {
         const auto index = playlists_.IndexOfSlot(result->playlist_slot);
         if (index) {
@@ -397,18 +389,10 @@ LRESULT PlayerWindow::ApplyPlaylistInfoResult(LPARAM value) {
                     bool changed{};
                     if (result->state == PlaylistInfoState::failed) changed = list.SetDuration(row, -1);
                     else {
-                        playlist::Track updated = *result;
-                        updated.path = list.Tracks()[row].path;
-                        updated.rating = list.Tracks()[row].rating;
-                        // The isolated worker knows only the audio path. Its
-                        // result cannot replace the row's game/service identity.
-                        // Merge per row: two beatmap sets may share one hash but
-                        // have different titles, timing files and backgrounds.
-                        const auto& original = list.Tracks()[row].metadata;
-                        detail::PreserveBrowserTrackIdentity(original, updated.metadata);
-                        detail::PreserveOsuTrackMetadata(original, updated.metadata);
-                        detail::RestoreOsuTrackMetadata(updated);
-                        changed = list.SetTrack(row, std::move(updated));
+                        changed |= list.SetDuration(row, result->duration_ms);
+                        changed |= list.SetMetadata(row, result->title, result->artist, result->album);
+                        changed |= list.SetExtendedMetadata(row, result->metadata, result->media_type,
+                            result->bitrate_bps, result->sample_rate_hz);
                     }
                     if (changed) changed_rows.push_back(row);
                 }
@@ -417,11 +401,6 @@ LRESULT PlayerWindow::ApplyPlaylistInfoResult(LPARAM value) {
                     if (*index == playlists_.ActiveIndex()) InvalidatePlaylistInfoRows(changed_rows);
                     if (playlist_item_tooltip_ && IsWindow(playlist_item_tooltip_))
                         SendMessageW(playlist_item_tooltip_, TTM_UPDATE, 0, 0);
-                    if (!media_library_playback_active_ &&
-                        playing_playlist_index_ == index && current_ &&
-                        std::find(changed_rows.begin(), changed_rows.end(),
-                                  *current_) != changed_rows.end())
-                        RefreshTrackInformation();
                 }
             }
         }
@@ -431,10 +410,8 @@ LRESULT PlayerWindow::ApplyPlaylistInfoResult(LPARAM value) {
 }
 
 void PlayerWindow::ShutdownPlaylistInfoLoading() {
-    extension_corrections_.clear();
     playlist_info_pending_.clear(); playlist_info_queued_keys_.clear();
     playlist_info_checked_.clear(); playlist_info_index_.reset();
-    playlist_info_verifying_.reset(); playlist_info_verify_tick_ = 0;
     if (playlist_info_receiver_) {
         playlist_info_receiver_->stop.request_stop();
         {

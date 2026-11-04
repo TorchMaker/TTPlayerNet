@@ -5,7 +5,6 @@
 #include "ttplayer/ui/dpi_scale.h"
 
 #include <filesystem>
-#include <functional>
 #include <array>
 #include <optional>
 #include <span>
@@ -17,7 +16,6 @@
 namespace ttplayer::settings { struct Settings; }
 
 namespace ttplayer::skin {
-class SkinPackage;
 // The first 0x24 bytes of TTPlayer's private skin-package object are the
 // package identity and the metadata parsed from the root <skin> element by
 // CSkinParser_ParseMetadata (004A8315).  Keep these fields independent from
@@ -38,21 +36,6 @@ struct SkinMetadata {
 [[nodiscard]] std::optional<SkinMetadata> ParseLegacySkinMetadata(
     std::span<const unsigned char> xml_bytes);
 
-// Front-to-back child order from 0044E50C / 00467B9B. Unknown XML
-// elements have no native slot. 6.1.2-only controls keep explicit slots too.
-[[nodiscard]] inline int PlayerSkinOrder(std::wstring_view name) {
-    constexpr std::wstring_view names[] = {
-        L"exit", L"minimize", L"minimode", L"equalizer", L"lyric", L"playlist",
-        L"browser", L"play", L"pause", L"stop", L"prev", L"next", L"open", L"mute",
-        L"icon", L"info", L"visual", L"led", L"stereo", L"status", L"progress", L"volume",
-        L"set", L"login", L"login_name", L"mode_single", L"mode_loop", L"mode_slider",
-        L"mode_circle", L"mode_random"
-    };
-    for (int i = 0; i < static_cast<int>(std::size(names)); ++i)
-        if (name == names[i]) return i;
-    return -1;
-}
-
 struct SkinElement {
     std::wstring name;
     RECT bounds{};
@@ -60,9 +43,6 @@ struct SkinElement {
     SIZE image_size{};
     int frames{1};
     bool four_state{};
-    // PNG extension: hit_test="rect" includes transparent button padding.
-    // The default keeps the normal frame's alpha silhouette for hit testing.
-    bool rectangular_hit_test{};
     bool vertical{};
     SkinImage bar_image{};
     SIZE bar_size{};
@@ -78,7 +58,7 @@ struct SkinElement {
     COLORREF color{RGB(255, 255, 255)};
     COLORREF background{0xff000000};
     unsigned int alignment{};
-    std::wstring font; // empty: no custom HFONT (004AA061)
+    std::wstring font{L"Tahoma"};
     int font_size{12};
 };
 
@@ -92,7 +72,6 @@ struct SkinBitmap {
 // independent backgrounds, native sizes and control coordinates.
 struct PlayerSkinLayout {
     SkinImage background{};
-    SkinIcons icons;
     SIZE window_size{};
     std::vector<SkinElement> elements;
 };
@@ -123,16 +102,12 @@ struct PlaylistSkin {
     SkinBitmap scrollbar_buttons;
     SkinBitmap scrollbar_thumb;
     SkinBitmap scrollbar_bar;
-    [[nodiscard]] bool HasSkinnedScrollbar() const noexcept {
-        return scrollbar_buttons.image && scrollbar_thumb.image && scrollbar_bar.image;
-    }
     // XML thumb_resize_center is the height of the stretch/tile source
     // segment, not a boolean (00488463 reads it as an integer at +0xEB4).
     int scrollbar_thumb_resize_center{};
     bool scrollbar_thumb_resize_tile{};
     std::wstring font{L"SimSun"};
     int font_height{-13};
-    LOGFONTW font_descriptor{};
     COLORREF text_color{DefaultSkinColors().playlist.text_color};
     COLORREF highlight_color{DefaultSkinColors().playlist.highlight_color};
     COLORREF background_color{DefaultSkinColors().playlist.background_color};
@@ -146,16 +121,6 @@ struct PlaylistSkin {
 // CSkinParser_ParseEqualizerWindow (004A8B73) stores the equalizer as a
 // separate owned popup layout.  eqfactor is a template: the native parser
 // clones it ten times and advances by template width + eq_interval.
-struct BrowserSkin {
-    bool valid{};
-    RECT position{}, content{}, resize_rect{};
-    bool resize_tile{};
-    COLORREF transparent_color{CLR_INVALID};
-    SkinBitmap background;
-    SkinElement close, music, downloads, back, forward, refresh, startup, link;
-    int checkbox_interval{4};
-};
-
 struct EqualizerSkin {
     bool valid{};
     RECT position{};
@@ -209,9 +174,8 @@ struct LyricSkin {
 struct DesktopLyricBarSkin {
     bool valid{};
     SkinBitmap background;
-    COLORREF transparent_color{CLR_INVALID};
+    COLORREF transparent_color{RGB(255, 0, 255)};
     RECT icon{};
-    SkinIcon icon_image;
     SkinElement play;
     SkinElement pause;
     SkinElement previous;
@@ -271,13 +235,8 @@ struct VisualSkin {
 
 class LegacySkin {
 public:
-    using AssetLoader = std::function<bool(const std::filesystem::path&)>;
     static LegacySkin Load(const std::filesystem::path& directory,
-                           const settings::Settings* current = nullptr,
-                           AssetLoader assets = {});
-    static LegacySkin LoadPackage(const SkinPackage& package,
-        const std::filesystem::path& directory, HMODULE ttpcomm,
-        const settings::Settings* current = nullptr);
+                           const settings::Settings* current = nullptr);
     LegacySkin() = default;
     ~LegacySkin();
     LegacySkin(const LegacySkin&) = delete;
@@ -287,10 +246,7 @@ public:
 
     [[nodiscard]] bool Valid() const noexcept { return background_ != nullptr; }
     [[nodiscard]] const SkinImage& Background() const noexcept { return background_; }
-    [[nodiscard]] HICON Icon(bool mini = false, bool large = false) const noexcept {
-        const auto& icons = mini ? mini_.icons : icons_;
-        return (large ? icons.large_icon : icons.small_icon).Get();
-    }
+    [[nodiscard]] HICON Icon() const noexcept { return icon_; }
     [[nodiscard]] SIZE WindowSize() const noexcept { return window_size_; }
     [[nodiscard]] COLORREF TransparentColor() const noexcept { return transparent_color_; }
     [[nodiscard]] const std::vector<SkinElement>& Elements() const noexcept { return elements_; }
@@ -306,23 +262,12 @@ public:
     [[nodiscard]] const std::vector<SkinElement>& MiniElements() const noexcept {
         return mini_.elements;
     }
-    [[nodiscard]] const SkinMetadata& Metadata() const noexcept { return metadata_; }
-    [[nodiscard]] const BrowserSkin& Browser() const noexcept { return browser_; }
-    void ApplyBrowserFallback(const LegacySkin& fallback) {
-        if (!browser_.valid) browser_ = fallback.browser_;
-    }
     [[nodiscard]] const PlaylistSkin& Playlist() const noexcept { return playlist_; }
     [[nodiscard]] const BrowserSkin& Browser() const noexcept { return browser_; }
     [[nodiscard]] const EqualizerSkin& Equalizer() const noexcept { return equalizer_; }
     [[nodiscard]] const LyricSkin& Lyric() const noexcept { return lyric_; }
     [[nodiscard]] const DesktopLyricBarSkin& DesktopLyricBar() const noexcept {
         return desktop_lyric_bar_;
-    }
-    // 00449451 tests the loaded background, not merely the presence of XML.
-    // Images share ownership so the temporary fallback skin can be released.
-    void ApplyDesktopLyricBarFallback(const LegacySkin& fallback) {
-        if (!desktop_lyric_bar_.background.image)
-            desktop_lyric_bar_ = fallback.desktop_lyric_bar_;
     }
     [[nodiscard]] const VisualSkin& Visual() const noexcept { return visual_; }
     [[nodiscard]] const SkinElement* Find(std::wstring_view name) const;
@@ -337,16 +282,14 @@ public:
     [[nodiscard]] HRGN CreateWindowRegion(bool mini, const ui::DpiScale& scale) const;
 
     // Cache and layouts share image ownership, including across rebinds.
-    SkinImage LoadBitmap(const std::filesystem::path& path, bool* replacement_started = nullptr);
-    bool PrepareAsset(const std::filesystem::path& path) const;
+    SkinImage LoadBitmap(const std::filesystem::path& path);
 
 private:
     std::unordered_map<std::wstring, SkinImage> bitmaps_;
     SkinImage background_{};
-    SkinIcons icons_;
-    AssetLoader assets_; // used only during Load; never retains the package
+    HICON icon_{};
     SIZE window_size_{};
-    COLORREF transparent_color_{CLR_INVALID};
+    COLORREF transparent_color_{RGB(255, 0, 255)};
     std::vector<SkinElement> elements_;
     PlayerSkinLayout mini_;
     LyricSkin lyric_;
@@ -355,7 +298,5 @@ private:
     BrowserSkin browser_;
     EqualizerSkin equalizer_;
     VisualSkin visual_;
-    BrowserSkin browser_;
-    SkinMetadata metadata_;
 };
 } // namespace ttplayer::skin

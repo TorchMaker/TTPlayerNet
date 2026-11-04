@@ -56,11 +56,8 @@ ParsedCommandLine ParseCommandLine() {
         if (!argument.empty() && (argument.front() == L'/' || argument.front() == L'-')) {
             argument.erase(argument.begin());
             parsed.switches.push_back(Lower(std::move(argument)));
-        } else {
-            ++parsed.file_count;
-            if (_wcsicmp(std::filesystem::path(argument).extension().c_str(), L".reg") == 0)
-                parsed.registry_import = true;
-            if (parsed.file.empty()) parsed.file = std::move(argument);
+        } else if (parsed.file.empty()) {
+            parsed.file = std::move(argument);
         }
     }
     return parsed;
@@ -86,7 +83,7 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
         } else {
             // FUN_0049CD41 removes registered reader/playlist patterns plus
             // the AudioCD and Directory shell verbs, then notifies Explorer.
-            return association.UnregisterAllAssociations() ? 0 : 1;
+            static_cast<void>(association.UnregisterAllAssociations());
         }
         return 0;
     }

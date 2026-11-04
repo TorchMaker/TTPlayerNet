@@ -6,14 +6,11 @@
 #include "ttplayer/platform/optional_windows_api.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/settings/settings.h"
-#include "ttplayer/ui/taskbar_icon.h"
 #include "../ui/file_info_probe_client.h"
-#include "../audio/plugin_registry.h"
 
 #include <commctrl.h>
 #include <objbase.h>
 #include <shellapi.h>
-#include <stdexcept>
 #include <string>
 #include <windows.h>
 
@@ -42,85 +39,36 @@ private:
     HMODULE module_{};
 };
 
-int ImportPluginRegistration(const ttplayer::app::ParsedCommandLine& command_line) {
-    namespace i18n = ttplayer::i18n;
-    const auto title = i18n::Literal(L"导入音效插件配置");
-    if (command_line.file_count != 1 || !command_line.switches.empty() || command_line.smoke_test) {
-        MessageBoxW(nullptr, i18n::Literal(L"请每次将一个 REG 文件拖到播放器 EXE 图标上。"),
-                    title, MB_OK | MB_ICONWARNING);
-        return 1;
-    }
-    // Import is a separate launch, before single-instance forwarding or any
-    // DSP initialization. Never change an active plug-in's registration.
-    const HANDLE running = OpenEventW(SYNCHRONIZE, FALSE, L"TTPlayer_Event");
-    if (running) {
-        CloseHandle(running);
-        MessageBoxW(nullptr, i18n::Literal(L"请先完全退出播放器，再将 REG 文件拖到 EXE 图标上导入。"),
-                    title, MB_OK | MB_ICONINFORMATION);
-        return 1;
-    }
-    try {
-        const auto directory = ttplayer::app::RuntimePath({});
-        if (directory.empty()) throw std::runtime_error("Missing runtime directory");
-        const auto file = directory / L"PluginState" / L"registry.json";
-        {
-            ttplayer::audio::detail::FileRegistry registry(file);
-            registry.Import(command_line.file);
-        }
-        const auto description = i18n::Literal(L"配置已导入共享 PluginState\\registry.json。\n已接入兼容层的插件会在下次加载时读取这些配置；系统注册表未被修改。");
-        const std::wstring message = std::wstring(description) + L"\n" + i18n::Literal(
-            L"已有配置的备份为 registry.json.bak。\n\n保存位置：\n") + file.native();
-        MessageBoxW(nullptr, message.c_str(), title, MB_OK | MB_ICONINFORMATION);
-        return 0;
-    } catch (const std::exception&) {
-        MessageBoxW(nullptr, i18n::Literal(
-            L"导入失败，原配置未被覆盖。\n\n"
-            L"当前仅支持 Ozone 或 DFX 的 UTF-16LE REG 文件，不支持删除脚本或其它注册表分支。\n"
-            L"请确认文件可读取、配置目录可写，且配置未被其它进程占用。"),
-            title, MB_OK | MB_ICONERROR);
-        return 1;
-    }
-}
-
 int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     namespace i18n = ttplayer::i18n;
     // Load the optional i18n provider before actively loading ttpcomm. Missing
-    // translations never prevent startup. The universal EXE retains a mandatory
+    // translations never prevent startup. The XP edition retains a mandatory
     // ttpcomm startup import for static TLS, so Windows loads that dependency
     // before this entry point; do not replace it with LoadLibrary-only loading.
     const OptionalI18nRuntime i18n_runtime;
 
-    const auto command_line = ttplayer::app::ParseCommandLine();
-    if (command_line.registry_import) return ImportPluginRegistration(command_line);
-
-    // Require the rebuilt runtime ABI/capabilities, not an exact release date.
+    // Retain EXE-local dependency paths and omit the original exact-version
+    // gate. ABI-compatible revisions are accepted; consumers check exports.
     ttplayer::app::TtpCommRuntime ttpcomm;
     if (!ttpcomm.Initialize()) {
-        MessageBoxW(nullptr, i18n::Literal(L"ttpcomm.dll 缺少此版本播放器需要的运行时接口。\n\n请退出播放器，将完整发行包手动解压并替换到同一目录，包括主程序 EXE 和 ttpcomm.dll。请勿混用原版或旧版核心 DLL。"),
+        MessageBoxW(nullptr, i18n::Literal(L"Error in ttpcomm.dll, please resetup this program!"),
                     i18n::Literal(L"TTPlayer"), MB_OK | MB_ICONERROR);
         return -1;
     }
 
     // CSingleInstanceIpc_Initialize is a static-runtime predecessor of the
     // recovered wWinMain. Its observable branch is reproduced here.
+    const auto command_line = ttplayer::app::ParseCommandLine();
     std::wstring instance_name = kSingleInstanceName;
     if (command_line.smoke_test)
         instance_name += L".Smoke." + std::to_wstring(GetCurrentProcessId());
-    else if (command_line.HasSwitch(L"reg") || command_line.HasSwitch(L"unreg"))
-        // Maintenance targets the explicitly launched installation. It must
-        // not be forwarded to an already running copy in a different folder.
-        // Registry mutations themselves are serialized by the association backend.
-        instance_name += L".Association." + std::to_wstring(GetCurrentProcessId());
     ttplayer::app::SingleInstanceIpc single_instance(
         instance_name, kSingleInstanceMappingSize);
     if (!single_instance.Valid()) return 1;
     if (!single_instance.IsPrimary()) {
-        const bool forwarded = single_instance.ForwardCommandLine(
-            command_line.file.native(), command_line.FileMode());
+        single_instance.ForwardCommandLine(command_line.file.native(),
+                                           command_line.FileMode());
         single_instance.Shutdown();
-        if (!forwarded)
-            MessageBoxW(nullptr, i18n::Literal(L"正在运行的播放器未及时确认请求，可能仍在处理。请先检查播放列表，再决定是否重试。"),
-                        i18n::Literal(L"千千静听"), MB_OK | MB_ICONEXCLAMATION);
         return 1;
     }
     single_instance.PublishProcess();
@@ -143,7 +91,7 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     if (!resources.Initialize()) {
         if (SUCCEEDED(ole_result)) OleUninitialize();
         if (tls_index != TLS_OUT_OF_INDEXES) TlsFree(tls_index);
-        MessageBoxW(nullptr, i18n::Literal(L"ttpres.dll 缺失、无法加载或缺少此版本播放器需要的界面资源。\n\n请退出播放器，将完整发行包解压并替换到同一目录，包括主程序 EXE 和 ttpres.dll。"),
+        MessageBoxW(nullptr, i18n::Literal(L"Load resource (ttpres.dll) failed, please resetup this program!"),
                     i18n::Literal(L"TTPlayer"), MB_OK | MB_ICONERROR);
         return -1;
     }
@@ -234,9 +182,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         }
     }
     if (arguments) LocalFree(arguments);
-    // Before any player or DSP UI; workers above deliberately keep their own
-    // identity. Plugin windows and the main window belong to the same group.
-    ttplayer::ui::InitializePlayerTaskbarIdentity();
     ttplayer::ui::detail::EnableEmbeddedFileInfoProbe();
     return TTPlayer_wWinMain(instance, previous, command_line, show_command);
 }

@@ -1,5 +1,4 @@
 #pragma once
-#include <ttpcomm/audio_format_probe.h>
 
 #include <cstddef>
 #include <filesystem>
@@ -19,11 +18,6 @@ namespace ttplayer::plugins {
 // 004C51D3, also exported by the host EXE for old AddIns using temporary WAVs.
 HRESULT CreateLegacyFileStream(const wchar_t* path, DWORD mode,
                               IStream** output) noexcept;
-
-// Optional new interface, never appended to an original Reader/Metadata vtable.
-// IUnknown slots 0..2, HRESULT __stdcall Commit() at slot 3; terminal, single attempt.
-inline constexpr GUID kMetadataCommitInterface{
-    0x3ab643c1, 0xd8a4, 0x4d49, {0x9c,0xbb,0xef,0x19,0x6b,0x04,0xb6,0xe7}};
 
 // One entry in the sound-reader registry built by CSoundLibrary_Initialize.
 // The description is supplied by the successfully instantiated reader
@@ -53,7 +47,6 @@ struct ThumbnailData {
 struct PluginInfo {
     std::filesystem::path path;
     bool has_legacy_entry{};
-    bool skin_provider{};
     bool instance_created{};
     bool registered{};
     size_t reader_count{};
@@ -103,14 +96,12 @@ public:
     [[nodiscard]] DWORD EncodedBitsPerSecond() const noexcept;
     [[nodiscard]] DWORD Capabilities() const noexcept;
     [[nodiscard]] const std::wstring& CodecName() const noexcept;
-    [[nodiscard]] const std::optional<ttp::format::Result>& DetectedFormat() const noexcept;
     [[nodiscard]] const std::filesystem::path& ModulePath() const noexcept;
     [[nodiscard]] const std::vector<MetadataEntry>& Metadata() const noexcept;
     // ISoundThumbnail {B5E770AF-DFB0-43E5-9B0C-3EE98E7B6248}.  Presence is
     // kept separate so callers do not bypass the reader ABI with an unrelated
     // file parser when the plug-in deliberately reports no first picture.
     [[nodiscard]] bool HasThumbnailInterface() const noexcept;
-    [[nodiscard]] DWORD MaximumThumbnailBytes() const noexcept;
     [[nodiscard]] const std::vector<unsigned char>& Thumbnail() const noexcept;
     // FUN_004AD663 first requires reader capability bit 4, obtains the
     // current item count (slot 3) and the 60000-byte-per-item limit (slot 4),
@@ -120,10 +111,6 @@ public:
     HRESULT ClearThumbnails() noexcept;
     [[nodiscard]] std::optional<std::wstring> MetadataValue(
         std::string_view name) const;
-    // Verification callers must distinguish an absent field (S_FALSE) from
-    // an I/O or malformed-metadata failure. MetadataValue is display-only.
-    [[nodiscard]] HRESULT ReadMetadataValue(std::string_view name,
-                                            std::wstring& value) const noexcept;
     HRESULT SetMetadataValue(std::string_view name,
                              std::wstring_view value) noexcept;
     // CScanGainDlg/FUN_004A50B5 and FUN_00484009 call metadata slot 6
@@ -133,14 +120,6 @@ public:
     // ReplayGain comment updates through this slot.
     HRESULT SetMetadataValueDirect(std::string_view name,
                                    std::wstring_view value) noexcept;
-    // Some host-provided tag writers alias Lyric to Lyrics. Clear an existing
-    // singular field before setting Lyrics, then verify the reader's result.
-    // This edits the live reader only; its caller owns commit/release timing.
-    HRESULT SetLyrics(std::wstring_view text) noexcept;
-    // S_FALSE: old plugin, release the session then verify by reopening.
-    // Otherwise returns the explicit save result. A supporting session is
-    // terminal afterwards, including on failure; retry with a fresh reader.
-    HRESULT CommitMetadata() noexcept;
 
 private:
     struct Impl;
@@ -165,9 +144,6 @@ public:
     HRESULT NeedsInput() const noexcept;
     HRESULT OutputAvailable() const noexcept;
     HRESULT PushInput(std::span<const std::byte> encoded) noexcept;
-    // Only the host's MPEG and ACM decoders opt into explicit EOF draining.
-    // S_FALSE leaves all foreign decoder EOF contracts unchanged.
-    HRESULT FinishInput() noexcept;
     HRESULT ReadOutput(size_t requested_bytes, std::vector<std::byte>& pcm,
                        bool& end_of_stream) noexcept;
     HRESULT Reset() noexcept;
@@ -243,14 +219,6 @@ struct LyricSearchCallback : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE OnServer(LPCWSTR name) = 0;
 };
 
-// Optional ttp_lrcsh extension; legacy vtables and the 24-byte network ABI stay intact.
-inline constexpr GUID kLyricControlId{0xb25e8a91,0x0a73,0x46bb,
-    {0x9c,0x25,0xa8,0xe7,0x3c,0x51,0x9d,0x64}};
-struct LyricSearchControl : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE Configure(LPCWSTR name, LPCWSTR url, DWORD flags) = 0;
-    virtual HRESULT STDMETHODCALLTYPE Cancel() = 0;
-};
-
 class LegacyLyricSearchSession {
 public:
     ~LegacyLyricSearchSession();
@@ -304,8 +272,6 @@ public:
     [[nodiscard]] std::shared_ptr<PluginManager>
         RetainForBackground() const noexcept;
     [[nodiscard]] bool HasReaderForPath(const std::filesystem::path& path) const;
-    // Worker-only bounded local probe; file dialogs retain the cheap pattern query.
-    [[nodiscard]] bool HasReaderForContent(const std::filesystem::path& path) const;
     [[nodiscard]] std::unique_ptr<LegacyReaderSession> OpenReader(
         const std::filesystem::path& path, HRESULT* result = nullptr,
         std::wstring* diagnostic = nullptr) const;
@@ -357,8 +323,7 @@ public:
     [[nodiscard]] std::unique_ptr<LegacyLyricSearchSession> CreateLyricSearch(
         size_t index, LyricSearchCallback* context, const LyricNetworkConfig* network,
         HRESULT* result = nullptr,
-        std::wstring* diagnostic = nullptr,
-        LPCWSTR service_name = nullptr, LPCWSTR service_url = nullptr) const;
+        std::wstring* diagnostic = nullptr) const;
 
 private:
     [[nodiscard]] std::unique_ptr<LegacyReaderSession> OpenReaderWithFlags(

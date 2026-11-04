@@ -7,9 +7,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
-#include <vector>
 #include <windows.h>
-#include <mmreg.h>
 
 namespace ttplayer::plugins { class PluginManager; }
 
@@ -25,8 +23,6 @@ enum class ReplayGainScanStatus {
 };
 
 struct ReplayGainScanResult {
-    std::wstring source_identity; // Actual opened CD; checked again before cache writes.
-    std::wstring source_version; // Physical file(s) actually analyzed; never infer it at commit time.
     ReplayGainScanStatus status{ReplayGainScanStatus::decode_error};
     double gain_db{};
     double peak{};
@@ -34,18 +30,6 @@ struct ReplayGainScanResult {
     HRESULT result{E_FAIL};
     std::wstring diagnostic;
 };
-
-// Committed values survive decoder/modeless-dialog destruction. The UI
-// consumes them independently of the current playback state.
-struct ReplayGainMetadataUpdate {
-    std::filesystem::path path;
-    int subtrack{};
-    std::wstring gain;
-    std::wstring peak;
-    std::wstring source_identity; // CD TOC checked by the writer.
-    std::wstring file_version; // Post-commit physical identity for late-result rejection.
-};
-[[nodiscard]] std::vector<ReplayGainMetadataUpdate> TakeReplayGainMetadataUpdates();
 
 enum class ReplayGainCommitPolicy {
     // CScanGainDlg completion (004A50B5 -> 004C80AC) deliberately removes
@@ -60,28 +44,6 @@ using ReplayGainProgress =
     std::function<void(std::uint64_t decoded_frames,
                        std::uint64_t expected_frames)>;
 
-// Called before opening/reading the source and before committing metadata.
-// A UI may wait here while paused; false requests cooperative cancellation.
-using ReplayGainCheckpoint = std::function<bool()>;
-
-// Includes a CUE's referenced physical sources. A changed file is a conflict,
-// even if its suffix or size is unchanged; stale analysis is never persisted.
-[[nodiscard]] std::wstring CaptureReplayGainSourceVersion(
-    const std::filesystem::path& path, int subtrack = 0) noexcept;
-
-// Snapshot verified reader binaries once per batch. Unknown/replaced plug-ins
-// retain serial scanning; matching a filename or extension is not sufficient.
-class ReplayGainScanConcurrency {
-public:
-    ReplayGainScanConcurrency(const plugins::PluginManager& library, HMODULE ttpcomm);
-    [[nodiscard]] bool Allows(const std::filesystem::path& path, int subtrack) const;
-private:
-    struct Format { std::wstring pattern; bool verified{}; };
-    std::vector<Format> formats_;
-    bool analyzer_verified_{};
-    [[nodiscard]] bool AllowsFile(const std::filesystem::path& path) const;
-};
-
 // Ordinals 100/101 are the exact sample-rate predicate and ReplayGain object
 // used by CScanGainDlg::CWorkThread::Run (004A5251).  This query only verifies
 // that the two entry points exist; individual rates are checked when a reader
@@ -95,17 +57,14 @@ private:
 [[nodiscard]] ReplayGainScanResult AnalyzeReplayGainTrack(
     const plugins::PluginManager& library, HMODULE ttpcomm,
     const std::filesystem::path& path, bool skip_existing,
-    std::stop_token stop = {}, ReplayGainProgress progress = {}, int subtrack = 0,
-    ReplayGainCheckpoint checkpoint = {},
-    const ReplayGainScanConcurrency* concurrency = nullptr);
+    std::stop_token stop = {}, ReplayGainProgress progress = {});
 
 [[nodiscard]] ReplayGainScanResult CommitReplayGainTrack(
     const plugins::PluginManager& library,
     const std::filesystem::path& path,
     const ReplayGainScanResult& analysis,
     ReplayGainCommitPolicy policy,
-    std::stop_token stop = {}, int subtrack = 0,
-    ReplayGainCheckpoint checkpoint = {});
+    std::stop_token stop = {});
 
 // FUN_004B107E creates ordinal 101 beside the playback processor and
 // FUN_004B1950 feeds it the already-decoded double PCM before ReplayGain/EQ.
@@ -120,13 +79,8 @@ public:
 
     [[nodiscard]] static std::unique_ptr<PlaybackReplayGainAnalyzer> Create(
         HMODULE ttpcomm, DWORD sample_rate, WORD channels) noexcept;
-    // Interleaved, finite source samples, with integer PCM full scale at 1.0.
     [[nodiscard]] bool Analyze(
         const double* samples, size_t sample_count) noexcept;
-    // Shares the manual scanner's full-scale conversion. Feed source PCM
-    // before gain/EQ and before private processor-domain scaling.
-    [[nodiscard]] bool AnalyzePcm(
-        const std::vector<std::byte>& bytes, const WAVEFORMATEX& format) noexcept;
     [[nodiscard]] std::optional<ReplayGainScanResult> Finish() noexcept;
     void Cancel() noexcept;
 
@@ -143,7 +97,7 @@ private:
 // the UI thread and live decoder input is never modified concurrently.
 void QueueReplayGainCommit(
     std::shared_ptr<plugins::PluginManager> retained_library,
-    std::filesystem::path path, ReplayGainScanResult analysis, int subtrack = 0) noexcept;
+    std::filesystem::path path, ReplayGainScanResult analysis) noexcept;
 
 // Decode one physical sound file through the registered private reader ABI,
 // feed normalized double samples to ttpcomm ordinal 101, then store the two
@@ -152,7 +106,6 @@ void QueueReplayGainCommit(
 [[nodiscard]] ReplayGainScanResult ScanReplayGainTrack(
     const plugins::PluginManager& library, HMODULE ttpcomm,
     const std::filesystem::path& path, bool skip_existing,
-    std::stop_token stop = {}, ReplayGainProgress progress = {}, int subtrack = 0,
-    ReplayGainCheckpoint checkpoint = {});
+    std::stop_token stop = {}, ReplayGainProgress progress = {});
 
 } // namespace ttplayer::audio

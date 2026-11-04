@@ -1,18 +1,10 @@
-#include "ttplayer/audio/disc_media.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/ui/wtl_dialogs.h"
 #include "ttplayer/ui/player_window.h"
 #include "player_window_internal.h"
 #include "modern_file_dialog.h"
-#include "archive_password_dialog.h"
-#include "file_intake.h"
-#include "../app/resource_ids.h"
-#include <mutex>
-#include <thread>
 
 #include "ttplayer/audio/archive_member.h"
-#include "ttplayer/audio/osz_archive.h"
-#include <ttpcomm/archive_format.h>
 #include "ttplayer/audio/cue_sheet.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
@@ -34,7 +26,6 @@
 #include <iterator>
 #include <new>
 #include <optional>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -233,14 +224,32 @@ std::vector<std::filesystem::path> EnumeratePattern(
 std::vector<std::filesystem::path> DiscMediaPaths(
     const std::filesystem::path& root) {
     std::vector<std::filesystem::path> result;
-    try {
-        for (const auto& track : audio::ReadDiscLayout(root).tracks) {
-            if (track.data) continue;
-            wchar_t filename[32]{};
-            swprintf_s(filename, L"Track%02u.cda", track.number);
-            result.push_back(root / filename);
+    const auto name = root.root_name().wstring();
+    if (name.size() == 2 && name[1] == L':') {
+        std::wstring device = L"\\\\.\\";
+        device += static_cast<wchar_t>(towupper(name[0]));
+        device += L":";
+        const ScopedKernelHandle handle(CreateFileW(
+            device.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (handle.value != INVALID_HANDLE_VALUE) {
+            CDROM_TOC toc{};
+            DWORD returned{};
+            if (DeviceIoControl(handle.value, IOCTL_CDROM_READ_TOC, nullptr, 0,
+                                &toc, sizeof(toc), &returned, nullptr) &&
+                toc.FirstTrack != 0 && toc.LastTrack >= toc.FirstTrack) {
+                for (unsigned track = toc.FirstTrack;
+                     track <= toc.LastTrack; ++track) {
+                    const size_t index = track - toc.FirstTrack;
+                    if ((toc.TrackData[index].Control & 4U) != 0) continue;
+                    wchar_t filename[32]{};
+                    swprintf_s(filename, L"Track%02u.cda", track);
+                    result.push_back(root / filename);
+                }
+            }
         }
-    } catch (const std::exception&) {}
+    }
     // FUN_0047D023 falls back to the shell's synthetic CDA files and then
     // VCD MPEGAV/*.dat when the TOC reader produced no playable item.
     if (result.empty()) result = EnumeratePattern(root, L"*.cda");
@@ -364,40 +373,15 @@ std::wstring LowerExtension(const std::filesystem::path& path) {
     return extension;
 }
 
-// 00473EC5/00474051 compare the interned item against the temporary input
-// batch, not against the destination playlist. Keep the literal spelling:
-// 0041B572 hashes UTF-16 code units, and the native importer admits distinct
-// differently-cased paths even though the archive reader matches names
-// case-insensitively. Ordinary explicitly added files may still repeat.
-class ImportedTrackIdentities {
-public:
-    explicit ImportedTrackIdentities(const std::vector<playlist::Track>& tracks) {
-        for (const auto& track : tracks)
-            items_.emplace(track.path.native(), track.subtrack);
-    }
-    bool Insert(const std::filesystem::path& path, int subtrack = 0) {
-        return items_.emplace(path.native(), subtrack).second;
-    }
-private:
-    std::set<std::pair<std::wstring, int>> items_;
-};
-
-void AppendCueTracks(const audio::CueSheet& sheet,
-                     const std::filesystem::path& path,
-                     std::vector<playlist::Track>& tracks,
-                     ImportedTrackIdentities& identities) {
-    for (const auto& cue_track : sheet.Tracks()) {
-        if (!identities.Insert(path, cue_track.number)) continue;
-        // 00473F27 seeds -2 for both disk and archive CUE. An INDEX-derived
-        // duration is not a completed Reader query: setting it here skips
-        // the later metadata/format read for all but the final subtrack.
-        tracks.push_back({path, core::WideToUtf8(cue_track.title),
-            core::WideToUtf8(cue_track.performer), -2, cue_track.number,
-            core::WideToUtf8(sheet.Title())});
-        tracks.back().track_number = cue_track.number;
-        for (const auto& [key, value] : cue_track.metadata)
-            tracks.back().metadata.emplace_back(core::WideToUtf8(key),
-                                                 core::WideToUtf8(value));
+std::string ImportedTrackTitle(const std::filesystem::path& path) {
+    // FUN_0041EA0C constructs every row accepted by 00474051 from the
+    // logical archive-member path.  At import time that constructor stores
+    // the file stem as the title; CUE TITLE/PERFORMER and decoder metadata
+    // are not copied into the TTBL row by the archive enumerator.
+    try {
+        return core::WideToUtf8(path.stem().wstring());
+    } catch (const std::exception&) {
+        return {};
     }
 }
 
@@ -680,9 +664,6 @@ public:
             if (point_accepted_) {
                 selected = surface_ == FileDropSurface::playlist
                     ? incoming : DROPEFFECT_LINK;
-                if (surface_ != FileDropSurface::lyric && owner_.external_skin_ &&
-                    owner_.external_skin_->Provider()->Api().playlist_drop)
-                    selected = owner_.FileDropEffect(surface_, point, incoming);
             }
         } catch (...) {
             accepted_ = false;
@@ -829,20 +810,8 @@ DWORD PlayerWindow::FileDropEffect(FileDropSurface surface, POINTL point,
     // Main 00468B09 leaves DragOver's source mask untouched.  Lyric's simple
     // target reports LINK on both Enter and Over.  CPlayListWnd alone runs
     // the region/hit-test path below and ORs LINK into the incoming mask.
-    if (surface == FileDropSurface::lyric) return DROPEFFECT_LINK;
-    const HWND provider_window=surface==FileDropSurface::player?window_:playlist_window_;
-    if (external_skin_ && provider_window) {
-        TtpSkinPlaylistDrop drop{sizeof(drop),provider_window,{point.x,point.y},TTP_SKIN_DROP_PREVIEW,-1};
-        ScreenToClient(provider_window,&drop.point);
-        if (external_skin_->PlaylistDrop(drop)) {
-            playlist_list_hover_.reset();
-            playlist_external_dragging_=drop.insertion>=0;
-            playlist_track_drop_row_=drop.insertion>=0
-                ? std::optional<size_t>{static_cast<size_t>(drop.insertion)}:std::nullopt;
-            return drop.insertion>=0?source_effect|DROPEFFECT_LINK:DROPEFFECT_NONE;
-        }
-    }
     if (surface == FileDropSurface::player) return source_effect;
+    if (surface == FileDropSurface::lyric) return DROPEFFECT_LINK;
     if (!playlist_window_ || !playlist_list_control_ ||
         !playlist_track_control_ || !skin_ || !skin_->Playlist().valid)
         return DROPEFFECT_NONE;
@@ -888,10 +857,6 @@ DWORD PlayerWindow::FileDropEffect(FileDropSurface surface, POINTL point,
 }
 
 void PlayerWindow::ClearPlaylistDropCue() noexcept {
-    for(HWND provider_window:{window_,playlist_window_}) if (external_skin_ && provider_window) {
-        TtpSkinPlaylistDrop drop{sizeof(drop),provider_window,{},TTP_SKIN_DROP_LEAVE,-1};
-        external_skin_->PlaylistDrop(drop);
-    }
     const bool changed = playlist_track_drop_row_.has_value() ||
                          playlist_list_hover_.has_value() ||
                          playlist_external_dragging_;
@@ -902,127 +867,26 @@ void PlayerWindow::ClearPlaylistDropCue() noexcept {
         InvalidateRect(playlist_window_, nullptr, FALSE);
 }
 
-namespace {
-// The worker owns its input/configuration and temporary result. It never touches
-// PlayerWindow, playlist controls or live settings. Commit stays on the UI thread.
-struct ImportScan {
-    HMODULE module{};
-    bool recursive{}, ignore_bad{};
-    std::vector<std::wstring> patterns;
-    std::vector<playlist::Track> tracks;
-    ImportedTrackIdentities identities;
-    const size_t initial;
-    std::atomic_bool canceled{}, done{};
-    std::stop_token external_stop;
-    bool IsCanceled() const noexcept { return canceled.load() || external_stop.stop_requested(); }
-    std::mutex mutex;
-    std::wstring current, phase;
-    size_t found{};
-    uint64_t completed{}, total{};
-    DWORD published{};
-    std::vector<std::wstring> errors;
-    std::vector<std::filesystem::path> completed_containers;
-    size_t suppressed_errors{};
-    bool failed{};
-    std::jthread worker;
-    HWND* dialog_slot{};
-
-    explicit ImportScan(std::vector<playlist::Track> rows)
-        : tracks(std::move(rows)), identities(tracks), initial(tracks.size()) {}
-    void Report(const std::filesystem::path& path, const wchar_t* text, bool force=false) {
-        const auto tick=GetTickCount();
-        if(!force && tick-published<75)return;
-        published=tick;
-        std::lock_guard lock(mutex);
-        current=path.native();phase=text;found=tracks.size()-initial;
-        completed=total=0;
-    }
-    void Progress(uint64_t n,uint64_t size) {
-        std::lock_guard lock(mutex);completed=n;total=size;found=tracks.size()-initial;
-    }
-    void Error(std::wstring text) {
-        // A bad folder must not produce thousands of modal message boxes.
-        if(errors.size()<8){if(text.size()>1024){text.resize(1024);text+=L"…";}errors.push_back(std::move(text));}
-        else ++suppressed_errors;
-    }
-    bool Collect(const std::filesystem::path& input, bool directory_member,
-                 std::vector<std::wstring>* directory_ancestry);
-    void Execute(const std::vector<std::filesystem::path>& paths, bool directory_member,
-                 std::vector<std::wstring> ancestry) noexcept {
-        const auto com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
-        try {
-            for(const auto& path:paths){if(IsCanceled())break;Collect(path,directory_member,&ancestry);}
-        }catch(...){canceled=true;failed=true;}
-        if(SUCCEEDED(com))CoUninitialize();
-        done.store(true,std::memory_order_release);
-    }
-    static INT_PTR CALLBACK Dialog(HWND window,UINT message,WPARAM wp,LPARAM lp) {
-        auto* s=reinterpret_cast<ImportScan*>(GetWindowLongPtrW(window,DWLP_USER));
-        if(message==WM_INITDIALOG){
-            s=reinterpret_cast<ImportScan*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);
-            *s->dialog_slot=window;SetArchivePasswordModalParent(window);
-            RECT base{},r{};GetWindowRect(GetParent(window),&base);GetWindowRect(window,&r);
-            MONITORINFO m{sizeof(m)};GetMonitorInfoW(MonitorFromWindow(GetParent(window),MONITOR_DEFAULTTONEAREST),&m);
-            const int w=r.right-r.left,h=r.bottom-r.top;
-            SetWindowPos(window,nullptr,std::max(m.rcWork.left,std::min(m.rcWork.right-w,base.left+(base.right-base.left-w)/2)),
-                std::max(m.rcWork.top,std::min(m.rcWork.bottom-h,base.top+(base.bottom-base.top-h)/2)),0,0,SWP_NOSIZE|SWP_NOZORDER);
-            SendDlgItemMessageW(window,IDC_FILE_IMPORT_PROGRESS,PBM_SETRANGE32,0,100);
-            if(!SetTimer(window,1,75,nullptr)){s->canceled=true;EndDialog(window,IDCANCEL);}
-            return TRUE;
-        }
-        if(!s)return FALSE;
-        if(message==WM_TIMER && wp==1){
-            std::wstring path,phase;uint64_t n{},total{};size_t count{};
-            {std::lock_guard lock(s->mutex);path=s->current;phase=s->phase;n=s->completed;total=s->total;count=s->found;}
-            SetDlgItemTextW(window,IDC_FILE_IMPORT_PATH,path.c_str());
-            SetDlgItemTextW(window,IDC_FILE_IMPORT_PHASE,s->canceled?i18n::Literal(L"正在取消，请稍候…"):phase.c_str());
-            const auto text=i18n::Literal(L"已找到 ")+std::to_wstring(count)+i18n::Literal(L" 首曲目");
-            SetDlgItemTextW(window,IDC_FILE_IMPORT_COUNTS,text.c_str());
-            // Indeterminate activity works with XP common controls too. Known
-            // percentages describe this scan stage, not an invented overall ETA.
-            const int percent=total?static_cast<int>(100.0*std::min(n,total)/total):static_cast<int>((GetTickCount()/75)%100);
-            SendDlgItemMessageW(window,IDC_FILE_IMPORT_PROGRESS,PBM_SETPOS,percent,0);
-            if(s->done.load(std::memory_order_acquire))EndDialog(window,s->canceled?IDCANCEL:IDOK);
-            return TRUE;
-        }
-        if(message==WM_CLOSE || message==WM_COMMAND && LOWORD(wp)==IDCANCEL){
-            s->canceled=true;EnableWindow(GetDlgItem(window,IDCANCEL),FALSE);return TRUE;
-        }
-        if(message==WM_DESTROY){
-            KillTimer(window,1);if(!s->done.load())s->canceled=true;
-            *s->dialog_slot=nullptr;SetArchivePasswordModalParent(nullptr);
-        }
-        return FALSE;
-    }
-};
-
-bool ImportScan::Collect(const std::filesystem::path& input, bool directory_member,
-                         std::vector<std::wstring>* directory_ancestry) {
-    if (input.empty() || IsCanceled()) return false;
-    Report(input, i18n::Literal(L"正在检查文件…"));
+bool PlayerWindow::CollectImportedTracks(const std::filesystem::path& input,
+                                         std::vector<playlist::Track>& tracks,
+                                         bool directory_member,
+                                         std::vector<std::wstring>* directory_ancestry) {
+    if (input.empty()) return false;
     auto path = input;
     if (IsUrl(path.native())) {
-        identities.Insert(path); tracks.push_back({path, {}, {}, -2});
+        tracks.push_back({path, {}, {}, -2});
         return true;
     }
-    bool resolved_shortcut{};
     if (LowerExtension(path) == L".lnk") {
         const auto resolved = ResolveShortcut(path);
         // 004739DB keeps the .lnk itself as an ordinary item when IShellLink
         // resolution fails.  If resolution succeeds, even a now-missing
         // target continues through the type-0 ordinary-item route.
-        if (resolved) {
-            path = *resolved;
-            resolved_shortcut = true;
-        }
+        if (resolved) path = *resolved;
     }
 
     std::error_code error;
     if (std::filesystem::is_directory(path, error) && !error) {
-        // 0047444A only recurses into actual directory entries. Its type-6
-        // branch for a resolved .lnk does not dispatch or recurse, even with
-        // CheckSubFolder enabled. Explicit folder shortcuts still scan.
-        if (directory_member && resolved_shortcut) return false;
         std::vector<std::wstring> root_ancestry;
         if (!directory_ancestry) directory_ancestry = &root_ancestry;
         const auto identity = DirectoryIdentity(path);
@@ -1041,13 +905,12 @@ bool ImportScan::Collect(const std::filesystem::path& input, bool directory_memb
         const ScopedFindHandle close_search(search);
         bool added{};
         do {
-            if (IsCanceled()) return false;
             if (std::wcscmp(data.cFileName, L".") == 0 ||
                 std::wcscmp(data.cFileName, L"..") == 0) continue;
             if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-                !recursive)
+                !settings_.history.check_sub_folder)
                 continue;
-            added = Collect(path / data.cFileName, true,
+            added = CollectImportedTracks(path / data.cFileName, tracks, true,
                                           directory_ancestry) || added;
         } while (FindNextFileW(search, &data));
         return added;
@@ -1055,126 +918,149 @@ bool ImportScan::Collect(const std::filesystem::path& input, bool directory_memb
     error.clear();
     if (!std::filesystem::is_regular_file(path, error) || error) {
         if (directory_member) return false;
-        identities.Insert(path); tracks.push_back({path, {}, {}, -2});
+        tracks.push_back({path, {}, {}, -2});
         return true;
     }
 
     const auto extension = LowerExtension(path);
-    const bool archive_input=audio::IsArchivePath(path);
-    if(directory_member && audio::IsOszArchive(path) && !audio::HasOszSupport())return false;
-    if (archive_input) path=ttpcomm::archive_format::Canonical(path.c_str());
-    if (!archive_input && extension == L".cue") {
+    if (extension == L".cue") {
         try {
             const auto sheet = audio::CueSheet::Load(path);
             const size_t before = tracks.size();
-            AppendCueTracks(sheet, path, tracks, identities);
-            completed_containers.push_back(path);
+            for (const auto& cue_track : sheet.Tracks()) {
+                const auto duration = cue_track.DurationMilliseconds();
+                tracks.push_back({
+                    path,
+                    cue_track.title.empty() ? std::string{} :
+                        core::WideToUtf8(cue_track.title),
+                    cue_track.performer.empty() ? std::string{} :
+                        core::WideToUtf8(cue_track.performer),
+                    duration < 0 || duration > INT_MAX ? -2 :
+                        static_cast<int>(duration),
+                    cue_track.number,
+                    sheet.Title().empty() ? std::string{} :
+                        core::WideToUtf8(sheet.Title())});
+            }
             return tracks.size() != before;
         } catch (const std::exception&) {
             return false;
         }
     }
-    if (!archive_input && IsPlaylistFile(path)) {
+    if (IsPlaylistFile(path)) {
         if (directory_member) return false;
         try {
             playlist::Playlist loaded;
             loaded.LoadFromFile(path,
-                {ignore_bad});
-            for (const auto& track : loaded.Tracks()) identities.Insert(track.path, track.subtrack);
+                {settings_.playlist.ignore_bad_files});
             tracks.insert(tracks.end(), loaded.Tracks().begin(), loaded.Tracks().end());
             return !loaded.Tracks().empty();
         } catch (const std::exception&) {
             return false;
         }
     }
-    if (archive_input) {
+    if (extension == L".zip") {
+        // FUN_00474051 preserves ordinary members as archive.zip|member and
+        // extracts them only when the sound source is opened.  Do not reuse
+        // the skin cache extraction path here: persisted playlists must not
+        // depend on files under %TEMP%.
+        try {
+            const auto package = skin::SkinPackage::Open(path);
+            const size_t before = tracks.size();
+            for (const auto& entry : package.Entries()) {
+                std::wstring member;
+                try { member = audio::DecodeZipMemberName(entry.name); }
+                catch (const std::exception&) { continue; }
+                if (member.empty() || member.back() == L'\\') continue;
+                const auto logical = audio::MakeZipMemberPath(path, member);
+                const auto member_extension = LowerExtension(logical);
+                if (member_extension == L".cue") {
+                    // 00474051 calls the archive read vtable at +0x14 and
+                    // passes both those bytes and `archive|member` to
+                    // 00473EC5.  Playlist rows retain the logical CUE name;
+                    // CueSegmentSource repeats the same memory parse when a
+                    // sub-track is opened.
+                    try {
+                        const auto sheet = audio::CueSheet::LoadFromMemory(
+                            package.ReadEntry(entry.name, ttpcomm_module_), logical);
+                        for (const auto& cue_track : sheet.Tracks()) {
+                            tracks.push_back({
+                                logical,
+                                ImportedTrackTitle(logical), {}, -2,
+                                cue_track.number, {}});
+                        }
+                    } catch (const std::exception&) {
+                        // Like 00474051, a malformed individual CUE member
+                        // does not abort enumeration of the remaining archive.
+                    }
+                    continue;
+                }
+                // CDA and MIDI use device/file-name backends in the rebuild;
+                // they cannot consume the archive IStream boundary.
+                if (member_extension == L".cda" || member_extension == L".mid" ||
+                    member_extension == L".midi" || member_extension == L".rmi")
+                    continue;
+                bool supported = IsBuiltInAudioPath(logical);
+                if (!supported) {
+                    supported = std::ranges::any_of(reader_formats_,
+                        [&](const auto& format) {
+                            return PatternMatchesPath(format.pattern, logical);
+                        });
+                }
+                if (supported) {
+                    tracks.push_back(
+                        {logical, ImportedTrackTitle(logical), {}, -2});
+                }
+            }
+            return tracks.size() != before;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+    if (extension == L".rar") {
         // 004738B5 selects a distinct RAR archive object, but 00474051 keeps
-        // the same archive|member identity. The rebuilt core enumerates headers
-        // in archive order; payloads are only read for CUE or playback.
+        // the same archive|member identity.  The rebuild uses Windows' RAR
+        // namespace as the decompressor while ensuring cache paths never leak
+        // into TTBL persistence.
         try {
             const size_t before = tracks.size();
-            std::wstring cue_read_error;
-            bool complete = true;
-            Report(path, i18n::Literal(L"正在读取压缩包目录并校验…"), true);
-            const auto stop = [&] { return IsCanceled(); };
-            if (audio::IsOszArchive(path)) {
-                Report(path,i18n::Literal(L"正在解析 OSZ 压缩包…"),true);
-                const auto media = audio::ResolveOszMedia(path,module,stop,
-                    [&](uint64_t n,uint64_t total){Progress(n,total);});
-                if (media.empty()) {
-                    Error(path.filename().wstring()+i18n::Literal(L"\n\nOSZ 中没有有效的 .osu 音频引用，或引用的音乐文件不存在。"));
-                    return false;
-                }
-                // ResolveOszMedia validates the reference; retain the actual
-                // entry spelling just like the ordinary archive importer.
-                for (const auto& item : media) {
-                    if (stop()) return false;
-                    const auto logical = audio::MakeZipMemberPath(path,item.audio);
-                    if (identities.Insert(logical)) tracks.push_back({logical,{},{},-2});
-                }
-                completed_containers.push_back(path);
-                return tracks.size() != before;
-            }
-            const auto names = audio::ListArchiveMembers(path, module, stop,
-                [&](uint64_t n, uint64_t total) { Progress(n, total); }, &path);
-            size_t index = 0;
-            for (const auto& member : names) {
-                if (stop()) return false;
-                Progress(index++, names.size());
-                const auto logical = audio::MakeZipMemberPath(path, member);
+            for (const auto& member : audio::ListRarArchiveMembers(path)) {
+                const auto logical = audio::MakeArchiveMemberPath(path, member);
                 const auto member_extension = LowerExtension(logical);
                 if (member_extension == L".cue") {
                     try {
                         audio::ArchiveMemberPath archive_member;
                         if (!audio::ParseArchiveMemberPath(
                                 logical.native(), archive_member)) continue;
-                        Report(logical, i18n::Literal(L"正在读取包内 CUE 并校验…"), true);
                         const auto sheet = audio::CueSheet::LoadFromMemory(
                             audio::ReadArchiveMember(archive_member,
-                                                     module, stop),
+                                                     ttpcomm_module_),
                             logical);
-                        AppendCueTracks(sheet, logical, tracks, identities);
-                    } catch (const audio::ArchiveError& error) {
-                        complete = false;
-                        if(error.Result()==HRESULT_FROM_WIN32(ERROR_CANCELLED)){canceled=true;return false;}
-                        // Keep successfully imported members, but do not silently
-                        // hide a password/CRC/read failure in the CUE itself.
-                        if (cue_read_error.empty())
-                            cue_read_error = member + L"\n\n" + error.Message();
+                        for (const auto& cue_track : sheet.Tracks()) {
+                            tracks.push_back({
+                                logical,
+                                ImportedTrackTitle(logical), {}, -2,
+                                cue_track.number, {}});
+                        }
                     } catch (const std::exception&) {
-                        complete = false;
                     }
                     continue;
                 }
-                // 004741A6 rejects registered playlist formats before testing
-                // audio types. Even a plugin advertising *.* must not import
-                // a nested playlist as a song. MIDI/CDA are registered types;
-                // import does not imply that their Reader supports streams.
-                if (IsPlaylistFile(logical)) continue;
+                if (member_extension == L".cda" || member_extension == L".mid" ||
+                    member_extension == L".midi" || member_extension == L".rmi")
+                    continue;
                 bool supported = IsBuiltInAudioPath(logical);
                 if (!supported) {
-                    supported = std::ranges::any_of(patterns,
+                    supported = std::ranges::any_of(reader_formats_,
                         [&](const auto& format) {
-                            return PatternMatchesPath(format, logical);
+                            return PatternMatchesPath(format.pattern, logical);
                         });
                 }
-                if (supported && identities.Insert(logical)) {
-                    // File-name fallback belongs to the title formatter. It
-                    // is not a Title tag (0041EA0C/004AD1A4).
-                    tracks.push_back({logical, {}, {}, -2});
+                if (supported) {
+                    tracks.push_back(
+                        {logical, ImportedTrackTitle(logical), {}, -2});
                 }
             }
-            if (!cue_read_error.empty()) {
-                const auto message = path.filename().wstring() + L"\n" + cue_read_error;
-                Error(message);
-            }
-            if (complete) completed_containers.push_back(path);
             return tracks.size() != before;
-        } catch (const audio::ArchiveError& error) {
-            if(error.Result()==HRESULT_FROM_WIN32(ERROR_CANCELLED)){canceled=true;return false;}
-            const std::wstring message=path.filename().wstring()+L"\n\n"+error.Message();
-            Error(message);
-            return false;
         } catch (const std::exception&) {
             return false;
         }
@@ -1182,94 +1068,16 @@ bool ImportScan::Collect(const std::filesystem::path& input, bool directory_memb
 
     bool supported = IsBuiltInAudioPath(path);
     if (!supported) {
-        supported = std::ranges::any_of(patterns, [&](const auto& format) {
-            return PatternMatchesPath(format, path);
+        supported = std::ranges::any_of(reader_formats_, [&](const auto& format) {
+            return PatternMatchesPath(format.pattern, path);
         });
     }
     // FUN_004739DB type 1 accepts an explicitly supplied existing file even
     // if no reader recognizes it.  Recursive directory scans only admit the
     // type-2 audio/CUE/archive classes.
     if (directory_member && !supported) return false;
-    identities.Insert(path); tracks.push_back({path, {}, {}, -2});
+    tracks.push_back({path, {}, {}, -2});
     return true;
-}
-
-} // namespace
-
-detail::TrackSourceCollection detail::CollectTrackSources(
-    const std::vector<std::filesystem::path>& paths,
-    const TrackSourceOptions& options, bool directory_member) {
-    ImportScan scan({});
-    scan.module = options.module;
-    scan.recursive = options.recursive;
-    scan.ignore_bad = options.ignore_bad;
-    scan.patterns = options.reader_patterns;
-    scan.external_stop = options.stop;
-    scan.Execute(paths, directory_member, {});
-    return {std::move(scan.tracks), std::move(scan.errors),
-            scan.IsCanceled(), scan.failed, std::move(scan.completed_containers)};
-}
-
-bool PlayerWindow::CollectImportedTracks(const std::filesystem::path& input,
-    std::vector<playlist::Track>& tracks, bool directory_member,
-    std::vector<std::wstring>* directory_ancestry) {
-    return CollectImportedFiles({input},tracks,directory_member,directory_ancestry);
-}
-
-bool PlayerWindow::CollectImportedFiles(const std::vector<std::filesystem::path>& paths,
-    std::vector<playlist::Track>& tracks, bool directory_member,
-    std::vector<std::wstring>* directory_ancestry) {
-    if(file_import_active_)return false;
-    struct Guard {
-        PlayerWindow& p;explicit Guard(PlayerWindow& owner):p(owner){p.file_import_active_=true;}
-        ~Guard(){
-            p.file_import_active_=false;
-            if(p.file_import_deferred_close_){const auto mode=*p.file_import_deferred_close_;p.file_import_deferred_close_.reset();PostMessageW(p.window_,WM_CLOSE,mode,0);}
-            else if(!p.deferred_import_commands_.empty())PostMessageW(p.window_,kMsgDeferredFileImport,0,0);
-        }
-    } guard(*this);
-    file_import_cancelled_=false;
-    ImportScan scan(std::move(tracks));scan.module=ttpcomm_module_;
-    scan.recursive=settings_.history.check_sub_folder;scan.ignore_bad=settings_.playlist.ignore_bad_files;
-    for(const auto& f:reader_formats_)scan.patterns.push_back(f.pattern);
-    const auto ancestry=directory_ancestry?*directory_ancestry:std::vector<std::wstring>{};
-    const size_t before=scan.initial;
-    // A single ordinary/URL item has no expensive metadata operation here.
-    // Archive, CUE, playlist and folder handling always uses the worker.
-    bool background=paths.size()>1;
-    if(paths.size()==1 && !IsUrl(paths.front().native())) {
-        std::error_code error;const auto ext=LowerExtension(paths.front());
-        background=ext==L".lnk" || ext==L".cue" || IsPlaylistFile(paths.front()) ||
-            std::filesystem::is_directory(paths.front(),error) || audio::IsArchivePath(paths.front());
-    }
-    if(background && window_ && IsWindow(window_)) {
-        // The transaction keeps its target list stable, including detached skin
-        // windows; playback timers and password requests keep being dispatched.
-        std::vector<HWND> disabled;
-        EnumThreadWindows(GetCurrentThreadId(),[](HWND w,LPARAM p)->BOOL {
-            if(IsWindowVisible(w) && IsWindowEnabled(w)){
-                static_cast<std::vector<HWND>*>(reinterpret_cast<void*>(p))->push_back(w);EnableWindow(w,FALSE);
-            }return TRUE;
-        },reinterpret_cast<LPARAM>(&disabled));
-        try {
-            scan.dialog_slot=&file_import_progress_;
-            scan.worker=std::jthread([&scan,paths,directory_member,ancestry]{scan.Execute(paths,directory_member,ancestry);});
-            if(ShowWtlModalDialog(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_FILE_IMPORT_PROGRESS),window_,
-                ImportScan::Dialog,reinterpret_cast<LPARAM>(&scan))!=IDOK)scan.canceled=true;
-        }catch(...){scan.canceled=true;scan.failed=true;}
-        if(scan.worker.joinable())scan.worker.join();
-        for(HWND w:disabled)if(IsWindow(w))EnableWindow(w,TRUE);
-    }else scan.Execute(paths,directory_member,ancestry);
-    file_import_cancelled_=scan.canceled;
-    if(file_import_cancelled_)scan.tracks.resize(before);
-    tracks=std::move(scan.tracks);
-    if(scan.failed && IsWindow(window_))MessageBoxW(window_,i18n::Literal(L"导入未能完成，播放列表保持不变。"),i18n::Literal(L"导入歌曲"),MB_OK|MB_ICONERROR);
-    else if(!scan.errors.empty() && IsWindow(window_)) {
-        std::wstring message;for(const auto& error:scan.errors){if(!message.empty())message+=L"\n\n";message+=error;}
-        if(scan.suppressed_errors)message+=i18n::Literal(L"\n\n另有 ")+std::to_wstring(scan.suppressed_errors)+i18n::Literal(L" 项错误未展开。");
-        MessageBoxW(window_,message.c_str(),i18n::Literal(L"导入歌曲"),MB_OK|MB_ICONERROR);
-    }
-    return tracks.size()!=before;
 }
 
 bool PlayerWindow::CommitImportedTracks(std::vector<playlist::Track> tracks,
@@ -1277,7 +1085,7 @@ bool PlayerWindow::CommitImportedTracks(std::vector<playlist::Track> tracks,
                                         size_t insertion,
                                         bool replace_current,
                                         ImportPlayback playback) {
-    if (playlist_index >= playlists_.Size() || playlists_.IsExternal(playlist_index)) return false;
+    if (playlist_index >= playlists_.Size()) return false;
     // FUN_0048059D calls 00480386 only when the temporary batch is non-empty.
     // A successful replace operation has already requested 0047F67C and must
     // still clear; an empty append is a strict no-op, including selection and
@@ -1391,10 +1199,10 @@ bool PlayerWindow::ImportFiles(
     const std::vector<std::filesystem::path>& paths, size_t playlist_index,
     std::optional<size_t> insertion, bool replace_current,
     ImportPlayback playback) {
-    if (file_import_active_ || playlist_index >= playlists_.Size()) return false;
+    if (playlist_index >= playlists_.Size()) return false;
     std::vector<playlist::Track> tracks;
-    static_cast<void>(CollectImportedFiles(paths, tracks));
-    if(file_import_cancelled_)return false;
+    for (const auto& path : paths)
+        static_cast<void>(CollectImportedTracks(path, tracks));
     const size_t target = insertion.value_or(
         playlists_.At(playlist_index).Tracks().size());
     return CommitImportedTracks(std::move(tracks), playlist_index, target,
@@ -1441,19 +1249,14 @@ void PlayerWindow::ChooseFiles(bool replace_and_play, HWND owner) {
 }
 
 void PlayerWindow::ChooseFolder() {
-    LeaveFullScreen(); // 004851A1 -> 0044AB8F, before showing the picker.
     ModernFolderOptions dialog;
     dialog.owner = playlist_window_ ? playlist_window_ : window_;
-    dialog.title = ResourceText(0x8152);
-    dialog.checkbox_label = ResourceText(0x8153);
-    dialog.checkbox_checked = settings_.history.check_sub_folder;
     dialog.initial_path = PreferredDialogHistory(
         settings_.history.folder, file_dialog_initial_directory_);
     const auto selected = ModernPickFolder(dialog);
     if (!selected) return;
     file_dialog_initial_directory_ = selected->path;
     settings_.history.folder = selected->path;
-    settings_.history.check_sub_folder = selected->checkbox_checked;
     static_cast<void>(ImportFiles({selected->path},
         playlists_.ActiveIndex(), std::nullopt, false,
         ImportPlayback::if_idle));
@@ -1503,7 +1306,6 @@ void PlayerWindow::ShowPlayCdDialog() {
 
 bool PlayerWindow::OpenPath(const std::filesystem::path& path,
                             bool start_playback) {
-    if (IsPluginSkinPackage(path)) return InstallPluginSkin(path);
     // OpenPath is also the command-line/single-instance route.  It is not the
     // main window's 0xE101 Open command: starting a supplied media path must
     // not silently inherit that command's replace-list flag.  Preserve the
@@ -1698,11 +1500,6 @@ void PlayerWindow::RunMusicFreeSelfTest(const std::string& query) {
 
 void PlayerWindow::OpenCommandLinePath(const std::filesystem::path& path,
                                        ULONG_PTR raw_mode) {
-    if(file_import_active_){deferred_import_commands_.emplace_back(path,raw_mode);return;}
-    if (IsPluginSkinPackage(path)) {
-        static_cast<void>(InstallPluginSkin(path));
-        return;
-    }
     auto mode = static_cast<CommandLineFileMode>(raw_mode);
     if (mode != CommandLineFileMode::open_and_play &&
         mode != CommandLineFileMode::append &&
@@ -1818,17 +1615,6 @@ void PlayerWindow::HandleDroppedFiles(FileDropSurface surface, IDataObject* data
                                       DWORD, POINTL point, DWORD* effect) {
     const DWORD incoming_effect = effect ? *effect : DROPEFFECT_NONE;
     if (effect) *effect = DROPEFFECT_NONE;
-    HWND provider_window=playlist_window_;
-    if(surface==FileDropSurface::player && external_skin_) {
-        TtpSkinPlaylistDrop hit{sizeof(hit),window_,{point.x,point.y},TTP_SKIN_DROP_QUERY,-1};
-        ScreenToClient(window_,&hit.point);
-        if(external_skin_->PlaylistDrop(hit)) {
-            if(hit.insertion<0) return;
-            // An embedded provider playlist uses playlist insertion semantics,
-            // including empty-data handling; never clear/open the whole list.
-            surface=FileDropSurface::playlist;provider_window=window_;
-        }
-    }
     auto paths = ExtractDropPaths(data);
     if (paths.empty()) {
         // 0045A8BE clears the active list even when a data object which passed
@@ -1847,12 +1633,7 @@ void PlayerWindow::HandleDroppedFiles(FileDropSurface surface, IDataObject* data
         return;
     }
     if (surface == FileDropSurface::player) {
-        const auto extension = LowerExtension(paths.front());
-        if (IsPluginSkinPackage(paths.front())) {
-            if (InstallPluginSkin(paths.front()) && effect) *effect = incoming_effect;
-            return;
-        }
-        if (extension == L".skn") {
+        if (LowerExtension(paths.front()) == L".skn") {
             const auto runtime = RuntimeDirectory();
             bool copied{};
             std::filesystem::path installed;
@@ -1907,10 +1688,6 @@ void PlayerWindow::HandleDroppedFiles(FileDropSurface surface, IDataObject* data
 
     if (!playlist_window_ || !skin_ || !skin_->Playlist().valid) return;
     const POINT screen{point.x, point.y};
-    TtpSkinPlaylistDrop drop{sizeof(drop),provider_window,screen,TTP_SKIN_DROP_QUERY,-1};
-    ScreenToClient(provider_window,&drop.point);
-    const bool provider_drop=external_skin_ && external_skin_->PlaylistDrop(drop);
-    if (provider_drop && drop.insertion<0) return;
     RECT list_bounds{};
     GetWindowRect(playlist_list_control_, &list_bounds);
 
@@ -1918,27 +1695,24 @@ void PlayerWindow::HandleDroppedFiles(FileDropSurface surface, IDataObject* data
     // PlayLists rectangle is not inflated here; a point in the two-pixel
     // transition band therefore follows the Files branch selected by
     // 0048218C.
-    const bool over_catalogue = !provider_drop && !settings_.playlist.library_mode &&
+    const bool over_catalogue = !settings_.playlist.library_mode &&
                                 settings_.playlist.split_on_lists > 0 &&
                                 PtInRect(&list_bounds, screen);
     if (!over_catalogue) {
         POINT track_point = screen;
         ScreenToClient(playlist_track_control_, &track_point);
-        const LRESULT hit_row = provider_drop?drop.insertion:
-            OriginalListDropHit(playlist_track_control_,track_point);
+        const LRESULT hit_row = OriginalListDropHit(playlist_track_control_,
+                                                    track_point);
         const size_t insertion = hit_row >= 0
             ? static_cast<size_t>(hit_row) : ActivePlaylist().Tracks().size();
         auto classified = ClassifyExternalDropPaths(paths);
         const bool consumed_playlist = !classified.playlists.empty();
         auto ordered = OriginalExternalImportOrder(std::move(classified));
-        // 00482612..0048261B calls 00480386 with allow_idle_play = 1.
-        // A retained playing-row marker or an open source suppresses autoplay.
         const bool imported = ImportFiles(ordered, playlists_.ActiveIndex(),
                                           insertion, false,
-                                          ImportPlayback::if_idle);
+                                          ImportPlayback::none);
         if (imported || consumed_playlist) {
-            const HWND focus=provider_drop?provider_window:playlist_track_control_;
-            if (focus) SetFocus(focus);
+            if (playlist_track_control_) SetFocus(playlist_track_control_);
             if (effect) *effect = DROPEFFECT_LINK;
         }
         return;
@@ -1960,29 +1734,29 @@ void PlayerWindow::HandleDroppedFiles(FileDropSurface surface, IDataObject* data
     // 004824C4 passes the raw catalogue hit to FUN_00478E4E.  A true blank
     // hit is -1: the first playlist is appended, then 004824DE increments the
     // signed cursor to zero, so the second playlist is inserted at the front.
-    // Keep the synthetic itemCount hit distinct from the -1 sentinel too.
-    // Blank is normalized only after ordinary paths yield actual tracks:
-    // an empty directory must not change the playlist-file insertion order.
+    // If ordinary files exist, 004823DD first normalizes blank to itemCount;
+    // their newly-created list is consequently kept after the imported
+    // playlist files.  Preserve the -1 sentinel instead of collapsing both
+    // paths to itemCount.
     std::optional<size_t> list_insertion;
-    if (list_row >= 0) list_insertion = static_cast<size_t>(list_row);
+    if (hit) list_insertion = *hit;
+    else if (!ordinary.empty()) list_insertion = playlists_.Size();
     bool imported{};
     if (hit && !ordinary.empty()) {
         std::vector<playlist::Track> tracks;
-        static_cast<void>(CollectImportedFiles(ordinary, tracks));
+        for (const auto& path : ordinary)
+            static_cast<void>(CollectImportedTracks(path, tracks));
         if (!tracks.empty()) {
             SwitchPlaylist(*hit);
-            // 00482470..00482479 enables the same idle-play path as Files.
             imported = CommitImportedTracks(std::move(tracks), *hit,
                 playlists_.At(*hit).Tracks().size(), false,
-                ImportPlayback::if_idle);
+                ImportPlayback::none);
         }
     } else if (!ordinary.empty()) {
         std::vector<playlist::Track> tracks;
-        static_cast<void>(CollectImportedFiles(ordinary, tracks));
+        for (const auto& path : ordinary)
+            static_cast<void>(CollectImportedTracks(path, tracks));
         if (!tracks.empty()) {
-            // The native blank branch appends the ordinary-input list, then
-            // inserts queued playlist files at its original catalogue index.
-            list_insertion = playlists_.Size();
             std::wstring title;
             // 00481F2A overwrites the temporary list title for each directory
             // it encounters; consequently the last directory wins in a

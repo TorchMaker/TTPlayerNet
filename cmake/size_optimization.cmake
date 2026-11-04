@@ -7,7 +7,7 @@ if(NOT MSVC)
   message(FATAL_ERROR "TTPLAYER_OPTIMIZE_SIZE requires MSVC")
 endif()
 
-foreach(target IN ITEMS ttplayer_core ttpcomm_api ${ttplayer_app_targets})
+foreach(target IN ITEMS ttplayer_core ttpcomm_api ttplayer_rebuild)
   set_target_properties(${target} PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
     INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
@@ -32,7 +32,5 @@ foreach(source IN LISTS core_sources)
   endif()
 endforeach()
 
-foreach(target IN LISTS ttplayer_app_targets)
-  target_link_options(${target} PRIVATE
-    "$<$<CONFIG:Release,MinSizeRel>:/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")
-endforeach()
+target_link_options(ttplayer_rebuild PRIVATE
+  "$<$<CONFIG:Release,MinSizeRel>:/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")

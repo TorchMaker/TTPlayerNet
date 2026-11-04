@@ -1,5 +1,4 @@
 #pragma once
-#include "ttplayer/audio/hires_output.h"
 
 #include <windows.h>
 #include <mmsystem.h>
@@ -37,13 +36,12 @@ public:
     virtual std::optional<std::uint64_t> PositionBytes() = 0;
 };
 
-// Unsigned 8-bit or signed interleaved 16/24/32-bit PCM. The 16-bit fallback discards the
+// Signed, interleaved 16/24/32-bit PCM. The 16-bit fallback discards the
 // least-significant bytes exactly as FUN_004E088A. Gain is applied to the
 // owned packet copy because KS pins need not expose a hardware volume node.
 [[nodiscard]] bool ConvertKsPcm(std::span<const std::byte> source,
     const WAVEFORMATEX& source_format, unsigned output_bits,
-    float left_gain, float right_gain, std::vector<std::byte>& output,
-    unsigned output_channels = 0);
+    float left_gain, float right_gain, std::vector<std::byte>& output);
 
 class KernelStreamingSink {
 public:
@@ -54,14 +52,10 @@ public:
 
     bool OpenDevice(const std::wstring& filter_path,
         const WAVEFORMATEX& source_format, size_t packet_count,
-        size_t source_packet_bytes,
-        PcmPlaybackMode mode = PcmPlaybackMode::compatible,
-        HMODULE module = nullptr, int dither = 0);
+        size_t source_packet_bytes);
     bool OpenTransport(std::unique_ptr<KsStreamTransport> transport,
         const WAVEFORMATEX& source_format, const WAVEFORMATEX& device_format,
-        size_t packet_count, size_t source_packet_bytes,
-        PcmPlaybackMode mode = PcmPlaybackMode::compatible,
-        HMODULE module = nullptr, int dither = 0);
+        size_t packet_count, size_t source_packet_bytes);
     bool Submit(size_t packet, std::span<const std::byte> source,
         float left_gain = 1.0F, float right_gain = 1.0F);
     // A completed packet becomes writable; pending packets are never reused.

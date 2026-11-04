@@ -5,13 +5,6 @@
 #include <windows.h>
 
 namespace ttplayer::lyrics {
-std::filesystem::path AssociationStorePath(std::filesystem::path executable) {
-    // 00401829 derives .rll from the EXE basename. Both rebuilt distribution
-    // names retain their existing file instead of the original TTPlayer.rll.
-    if (_wcsicmp(executable.filename().c_str(), L"TTPlayer.exe") == 0)
-        return executable.parent_path() / L"TTPlayerRebuild.rll";
-    return executable.replace_extension(L".rll");
-}
 bool SongKeyLess::operator()(const SongKey& a, const SongKey& b) const noexcept {
     const int comparison = _wcsicmp(a.path.c_str(), b.path.c_str());
     return comparison < 0 || (comparison == 0 && a.subtrack < b.subtrack);
@@ -22,28 +15,8 @@ bool SongKey::operator==(const SongKey& other) const noexcept {
 namespace {
 bool Field(const std::filesystem::path& path) {
     const auto& value = path.native();
-    return !value.empty() && value.find_first_of(L"\r\n") == value.npos &&
+    return !value.empty() && value.find_first_of(L"|\r\n") == value.npos &&
         value.find(L'\0') == value.npos;
-}
-constexpr std::wstring_view kEscaped = L"@TTPlayerLyricAssociation/2|";
-std::wstring Escape(std::wstring_view value) {
-    std::wstring out;
-    for (const auto c : value) {
-        if (c == L'%') out += L"%25";
-        else if (c == L'|') out += L"%7C";
-        else out += c;
-    }
-    return out;
-}
-bool Unescape(std::wstring& value) {
-    std::wstring out;
-    for (size_t i=0; i<value.size(); ++i) {
-        if (value[i] != L'%') out += value[i];
-        else if (value.compare(i,3,L"%25") == 0) { out += L'%'; i+=2; }
-        else if (value.compare(i,3,L"%7C") == 0) { out += L'|'; i+=2; }
-        else return false;
-    }
-    value = std::move(out); return true;
 }
 }
 bool AssociationStore::Load(const std::filesystem::path& file) {
@@ -66,8 +39,6 @@ bool AssociationStore::Load(const std::filesystem::path& file) {
         std::wistringstream lines(text);
         for (std::wstring line; std::getline(lines, line);) {
             if (!line.empty() && line.back() == L'\r') line.pop_back();
-            const bool escaped = line.starts_with(kEscaped);
-            if (escaped) line.erase(0,kEscaped.size());
             const auto first = line.find(L'|');
             if (first == line.npos || !first) continue;
             const auto second = line.find(L'|', first + 1);
@@ -79,14 +50,7 @@ bool AssociationStore::Load(const std::filesystem::path& file) {
                 catch (...) { continue; }
                 if (used != number.size() || key.subtrack < 0) continue;
             }
-            auto value_text = line.substr((second == line.npos ? first : second) + 1);
-            if (value_text.find(L'|') != value_text.npos) continue;
-            if (escaped) {
-                auto key_text = key.path.native();
-                if (second == line.npos || !Unescape(key_text) || !Unescape(value_text)) continue;
-                key.path = key_text;
-            }
-            const std::filesystem::path value = value_text;
+            const std::filesystem::path value = line.substr((second == line.npos ? first : second) + 1);
             if (Field(key.path) && Field(value)) entries_.insert_or_assign(std::move(key), value);
         }
         file_ = file;
@@ -106,56 +70,30 @@ bool AssociationStore::Erase(const SongKey& song) {
     if (!entries_.erase(song)) return false;
     dirty_ = true; return true;
 }
-bool AssociationStore::RetargetSource(const std::filesystem::path& before,
-                                      const std::filesystem::path& after) {
-    if (!Field(before) || !Field(after) || !_wcsicmp(before.c_str(), after.c_str())) return false;
-    Entries moved = entries_;
-    bool changed{};
-    for (const auto& [song, lyric] : entries_) {
-        if (_wcsicmp(song.path.c_str(), before.c_str())) continue;
-        moved.erase(song);
-        moved.insert_or_assign(SongKey{after, song.subtrack}, lyric);
-        changed = true;
-    }
-    if (changed) { entries_.swap(moved); dirty_ = true; }
-    return changed;
-}
 bool AssociationStore::Save() {
-    return static_cast<bool>(SaveChecked());
-}
-SaveResult AssociationStore::SaveChecked() {
-    if (!dirty_) return {};
-    if (file_.empty()) return SaveResult::Win32Failure(file_, ERROR_INVALID_NAME);
+    if (!dirty_) return true;
+    if (file_.empty()) return false;
     if (entries_.empty()) {
         std::error_code error;
         std::filesystem::remove(file_, error);
-        if (error) return SaveResult::Win32Failure(file_, static_cast<DWORD>(error.value()));
-        dirty_ = false; return {};
+        if (error) return false;
+        dirty_ = false; return true;
     }
     // Same-directory temporary file preserves the old table on a failed write.
     wchar_t temporary[MAX_PATH]{};
-    if (!GetTempFileNameW(file_.parent_path().c_str(), L"rll", 0, temporary))
-        return SaveResult::Win32Failure(file_);
+    if (!GetTempFileNameW(file_.parent_path().c_str(), L"rll", 0, temporary)) return false;
     bool okay = false;
-    DWORD failure = ERROR_WRITE_FAULT;
     try {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         output << "\xef\xbb\xbf";
-        for (const auto& [key, value] : entries_) {
-            const bool escaped = key.path.native().find(L'|') != std::wstring::npos ||
-                value.native().find(L'|') != std::wstring::npos || key.path.native().starts_with(kEscaped);
-            if (escaped) output << core::WideToUtf8(kEscaped);
-            output << core::WideToUtf8(escaped ? Escape(key.path.native()) : key.path.native()) << '|' << key.subtrack << '|'
-                   << core::WideToUtf8(escaped ? Escape(value.native()) : value.native()) << "\r\n";
-        }
+        for (const auto& [key, value] : entries_)
+            output << core::WideToUtf8(key.path.native()) << '|' << key.subtrack << '|'
+                   << core::WideToUtf8(value.native()) << "\r\n";
         output.flush(); okay = output.good(); output.close(); okay &= !output.fail();
-        if (okay) {
-            okay = MoveFileExW(temporary, file_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
-            if (!okay) failure = GetLastError();
-        }
+        if (okay) okay = MoveFileExW(temporary, file_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
     } catch (...) { okay = false; }
     if (!okay) DeleteFileW(temporary);
     else dirty_ = false;
-    return okay ? SaveResult{} : SaveResult::Win32Failure(file_, failure);
+    return okay;
 }
 } // namespace ttplayer::lyrics

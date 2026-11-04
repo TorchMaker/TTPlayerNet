@@ -42,43 +42,25 @@
 
 ## CUE 子曲目
 
-- 原版 `FUN_004E323B` 将外部子曲目参数减一后按数组取轨道；公开编号是
-  从 1 开始的**解析顺序序号**。原版解析后也重写 Tracknumber，不保留文本
-  TRACK 跳号作为公开编号。重建版现已采用该顺序编号，同时保留源 TRACK 数字。
-  对旧重建版播放列表，仅在缓存标题或越界轨号能明确识别时迁移；歧义数据不猜测。
-- 当前重建版解析器支持 ANSI、UTF-8 BOM/无 BOM、UTF-16 LE/BE，以及
-  `FILE/TRACK/TITLE/PERFORMER/INDEX 00/01`，保存单轨 REM 和未知原始行。
-  UTF-16 支持及正确的无 BOM UTF-8 解码是保留的改进，不能据此认定原版相同。
-- 当前相对 FILE 按 CUE 所在目录解析；分段 source 打开实际音频，再限制
-  duration/read/seek。正常情况下使用本轨 INDEX 01 与同文件下一轨 INDEX 01
-  划分范围；没有有效的下一轨边界时使用实际音频长度。保留精确采样帧边界，
-  Seek 不再量化到 75 Hz，拒绝结尾定位，并利用旧插件返回的实际位置补读。
-  已恢复 CUE 同名文件的原扩展名、APE、TAK 后备查找，播放与信息读取共用候选列表。
-- 导入时展开逻辑曲目，每项保留 CUE 路径和 subtrack，不生成独立音频文件。
-  TTBL flags bit `0x1` 后的 `uint16` 已恢复读写，但仍需区分上述编号语义。
-- 文件属性读写现已传入子曲目，标签来源改为独立 CUE 标签集合。保存仅合并
-  修改字段并更新 CUE，保留编码、FILE、TRACK、INDEX 和未知行；轨号及 Lyrics
-  不可写，包内 CUE 只读。只读、过期快照和替换失败均返回错误，不覆盖原文件。
-- 手动及播放时 ReplayGain 扫描已接通分段 PCM 和 CUE 标签写入。
-
-详细函数依据见 [原版 CUE 实现分析及重建版差异](CUE_IMPLEMENTATION_ANALYSIS.md)；
-修复内容及测试结果见 [CUE 修复与验证记录](CUE_RECOVERY_VALIDATION.md)（2026-09-27）。
+- `FUN_004E323B` 把外部 TRACK 参数减一后存储，因此公开编号是 1-based。
+- 解析器支持 ANSI、UTF-8 BOM/无 BOM、UTF-16 LE/BE，以及
+  `FILE/TRACK/TITLE/PERFORMER/INDEX 00/01`。
+- 相对 `FILE` 严格按 CUE 文件目录解析。播放 source 先打开实际音频
+  reader，再把 duration/read/seek 限制到本轨 `INDEX 01` 与同文件下一轨
+  `INDEX 01` 之间。
+- 打开 CUE 时播放列表展开为多首 Track；每项仍保存 CUE 路径，并保存
+  1-based subtrack。TTBL flags bit `0x1` 后的 `uint16` 已恢复读写，不再丢弃。
 
 ## CDA 数字抓轨
 
-- 当前重建版路径保持 `X:\TrackNN.cda` 语义。
-- 重建版使用 `IOCTL_CDROM_READ_TOC` 取得轨道与 lead-out，拒绝 data track。
-- 当前输出固定为普通 CD-DA 的 PCM 44100 Hz、2 声道、16 bit，block align 4，
+- 路径保持原版 `X:\TrackNN.cda` 语义。
+- `IOCTL_CDROM_READ_TOC` 取得轨道与 lead-out，拒绝 data track。
+- 输出格式固定为原版的 PCM 44100 Hz、2 声道、16 bit，block align 4，
   `nAvgBytesPerSec = 176400`。
-- 重建版抓取使用 `IOCTL_CDROM_RAW_READ`、`TrackMode=CDDA`、2352 字节/扇区、
+- 抓取使用 `IOCTL_CDROM_RAW_READ`、`TrackMode=CDDA`、2352 字节/扇区、
   75 扇区/秒；`DiskOffset` 按 Windows 接口要求使用 `LBA*2048`。
-- 每次请求最多 24 扇区，失败时在请求不少于 8 扇区时减 4 再试；
-  满批量时表现为 24、20、16、12、8、4。较小请求和轨道末尾从实际请求数量开始。
-
-2026-09-27 复核：以上是重建版的简化实现，不能等同于原版完整 CDA 恢复。
-原版 NT 分支使用 SCSI 直通的 READ TOC/READ CD，有 48 扇区开播缓存、
-DTS-CD 探测、CDA 描述文件属性后备和本地 CDDB 元数据读写；这些尚未完整接入重建版。
-完整证据、原版边界问题及恢复顺序见 [CDA 实现分析](CDA_IMPLEMENTATION_ANALYSIS.md)。
+- 每次最多读取原版的 24 扇区；失败时按 24、20、16、12、8、4 的顺序
+  回退，以兼容拒绝大块 raw transfer 的旧光驱。
 
 当前机器没有可读取的物理 Audio CD，因此 TOC/LBA/请求结构和无硬件
 错误路径已经编译、测试，真实光盘的驱动返回数据仍需在有光驱的 x86

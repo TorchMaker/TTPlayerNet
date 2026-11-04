@@ -31,11 +31,8 @@ void PlayerWindow::AdvanceSkinControlAnimations() {
             continue;
         }
         if (it->pulse ? it->pulse->Tick(it->definition, now)
-                      : it->hover.Tick(it->definition, now)) {
-            if (it->owner == window_)
-                InvalidateSkinElement(it->key.starts_with(L"slider:") ? it->key.substr(7) : it->key);
-            else InvalidateRect(it->owner, &it->bounds, FALSE);
-        }
+                      : it->hover.Tick(it->definition, now))
+            InvalidateRect(it->owner, &it->bounds, FALSE);
         running |= it->pulse ? (it->pulse->playing || it->pulse->remaining > 0)
                              : it->hover.remaining > 0;
         ++it;
@@ -47,16 +44,6 @@ void PlayerWindow::AdvanceSkinControlAnimations() {
 }
 
 void PlayerWindow::ResetSkinControlAnimations() {
-    const HWND capture = GetCapture();
-    if (capture && (capture == window_ || native_skin_buttons_.contains(capture))) ReleaseCapture();
-    captured_skin_button_.clear();
-    main_skin_buttons_.clear();
-    native_skin_buttons_.clear();
-    dirty_skin_elements_.clear();
-    skin_backing_dirty_ = false;
-    play_button_refresh_bounds_ = {};
-    skin_display_values_.clear();
-    skin_slider_thumbs_.clear();
     if (window_) KillTimer(window_, kSkinControlAnimationTimer);
     skin_control_animation_timer_ = false;
     skin_control_animations_.clear();
@@ -98,16 +85,6 @@ void PlayerWindow::DrawAnimatedSkinFrame(HDC dc, const skin::SkinElement& elemen
 void PlayerWindow::DrawSkinSliderThumb(HDC dc, const skin::SkinElement& thumb,
     int state, bool playing, RECT control_bounds) const {
     if (!skin_) return;
-    // 00451F59 -> bitmap draw: a zero source width means the complete BMP.
-    // A 1..3-pixel four-frame bitmap still has a zero-width hit strip; its
-    // visible fallback must not change the slider's numeric geometry.
-    if (thumb.image && !thumb.image.IsGdiPlus() &&
-        thumb.image_size.cx > 0 && thumb.image_size.cx < 4) {
-        thumb.image.Draw(dc, thumb.bounds.left, thumb.bounds.top,
-            thumb.image_size.cx, thumb.image_size.cy, 0, 0,
-            thumb.image_size.cx, thumb.image_size.cy, skin_->TransparentColor());
-        return;
-    }
     const auto& def = thumb.animation;
     if (!def.Enabled() || !thumb.image.IsGdiPlus()) {
         DrawElementFrame(dc, thumb, thumb.bounds, state, skin_->TransparentColor(), current_scale_);

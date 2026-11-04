@@ -37,7 +37,7 @@ public:
                 PopupMenuTracker popup_tracker = {});
     void Destroy() noexcept;
 
-    void SetSkin(const skin::LegacySkin* skin, HICON default_icon = nullptr);
+    void SetSkin(const skin::LegacySkin* skin);
     void SetLyrics(const lyrics::Lyrics* lyrics);
     void SetFallbackText(std::wstring text);
     void UpdatePlayback(std::chrono::milliseconds position, bool playing);
@@ -47,7 +47,6 @@ public:
     // ordinary skin/visibility refreshes preserve owner Z order.
     void RefreshTopmost(bool raise_owner_group = false);
     void CaptureBounds() noexcept;
-    void Rearrange();
 
     void Show(bool visible);
     void Toggle();

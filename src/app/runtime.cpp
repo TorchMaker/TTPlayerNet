@@ -1,5 +1,3 @@
-#include <ttpcomm/runtime_client.h>
-#include <ttpres/resource_extensions.h>
 #include "ttplayer/app/runtime.h"
 
 #include <commctrl.h>
@@ -27,7 +25,7 @@ void SetTooltipTopmost(HWND window, bool topmost) noexcept {
     if (current == topmost) return;
     if (topmost) {
         SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else {
         // FUN_004B5713 -> FUN_00405417 removes the extended-style bit
         // directly when the tooltip is hidden; it does not reorder the
@@ -171,22 +169,12 @@ TtpCommRuntime::~TtpCommRuntime() { Shutdown(); }
 bool TtpCommRuntime::Initialize() {
     if (api_.module) return true;
     const auto path = FindRuntimePath(L"ttpcomm.dll");
-    if(path.empty() || !TtpComm_LoadApi(&api_, path.c_str())) return false;
-    TtpCommArchiveStreamApi archive{};
-    if(!ttpcomm::host::Runtime() || !ttpcomm::host::QueryArchiveStreams(api_.module,archive)) {Shutdown();return false;}
-    return true;
+    return !path.empty() && TtpComm_LoadApi(&api_, path.c_str());
 }
-void TtpCommRuntime::Shutdown() {
-    if(api_.module) {
-        TtpCommArchiveStreamApi archive{};
-        if(ttpcomm::host::QueryArchiveStreams(api_.module,archive))archive.clear_cache();
-        TtpComm_UnloadApi(&api_);
-    }
-}
+void TtpCommRuntime::Shutdown() { if (api_.module) TtpComm_UnloadApi(&api_); }
 
 ResourceRuntime::~ResourceRuntime() { Shutdown(); }
 bool ResourceRuntime::Initialize() {
-    Shutdown();
     const auto path = FindRuntimePath(L"ttpres.dll");
     if (path.empty()) return false;
     // CPlayerApp_InitializeResources (004C077E) uses LoadLibraryW and keeps
@@ -204,8 +192,7 @@ bool ResourceRuntime::Initialize() {
     const std::wstring_view value = title_length > 0 && title
         ? std::wstring_view(title, static_cast<size_t>(title_length))
         : std::wstring_view{};
-    if ((value != L"千千静听" && value != L"千千靜聽" && value != L"TTPlayer") ||
-        !ttpres::HasRequiredExtensions(module_)) {
+    if (value != L"千千静听" && value != L"千千靜聽" && value != L"TTPlayer") {
         FreeLibrary(module_);
         module_ = nullptr;
         return false;

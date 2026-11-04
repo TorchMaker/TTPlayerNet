@@ -3,9 +3,7 @@
 #include "ttplayer/ui/player_window.h"
 #include "player_window_internal.h"
 #include "options_buttons.h"
-#include "options_visual_tabs.h"
 #include "modern_file_dialog.h"
-#include "../app/resource_ids.h"
 
 #include <algorithm>
 #include <array>
@@ -28,7 +26,6 @@ constexpr UINT kVisualProfileMenu = 0x009e;
 constexpr UINT kVisualType = 0x0452;
 constexpr UINT kVisualFrames = 0x0427;
 constexpr UINT kVisualFramesText = 0x07f3;
-constexpr UINT kVisualFramesMaximum = 0xe954; // runtime ID for immutable template's anonymous endpoint
 constexpr UINT kScopeSpeed = 0x0422;
 constexpr UINT kSpectrumWide = 0x0849;
 constexpr UINT kScopeBlur = 0x044d;
@@ -47,11 +44,9 @@ constexpr UINT kResetAllOptions = 0x04d3;
 constexpr int kPropertySheetApply = 0x3021;
 constexpr UINT_PTR kVisualOptionsSheetSubclass = 0x5454564f;
 
-constexpr std::array<UINT, 12> kColorControls{
+constexpr std::array<UINT, 6> kColorControls{
     kPeakColor, kTopColor, kMiddleColor, kBottomColor, kScopeColor,
-    kVisualTextColor, IDC_VISUAL_PULSE_COLOR, IDC_VISUAL_RIPPLE_COLOR,
-    IDC_VISUAL_PULSE_BACKGROUND, IDC_VISUAL_RIPPLE_BACKGROUND,
-    IDC_VISUAL_OSU_ACCENT, IDC_VISUAL_OSU_BACKGROUND};
+    kVisualTextColor};
 
 COLORREF* VisualColor(settings::VisualSettings& visual, UINT control) {
     switch (control) {
@@ -61,12 +56,6 @@ COLORREF* VisualColor(settings::VisualSettings& visual, UINT control) {
     case kBottomColor: return &visual.spectrum_bottom_color;
     case kScopeColor: return &visual.blur_scope_color;
     case kVisualTextColor: return &visual.text_color;
-    case IDC_VISUAL_PULSE_COLOR: return &visual.pulse_color;
-    case IDC_VISUAL_RIPPLE_COLOR: return &visual.ripple_color;
-    case IDC_VISUAL_PULSE_BACKGROUND: return &visual.pulse_background;
-    case IDC_VISUAL_RIPPLE_BACKGROUND: return &visual.ripple_background;
-    case IDC_VISUAL_OSU_ACCENT: return &visual.osu_accent;
-    case IDC_VISUAL_OSU_BACKGROUND: return &visual.osu_background;
     default: return nullptr;
     }
 }
@@ -209,7 +198,7 @@ bool LoadVisualProfile(const std::filesystem::path& path,
 
     int integer{};
     if (XmlInteger(node, L"Type", integer))
-        visual.type = std::clamp(integer, 0, settings::kMaximumVisualType);
+        visual.type = std::clamp(integer, 0, 4);
     XmlColor(node, L"SpectrumTopColor", visual.spectrum_top_color);
     XmlColor(node, L"SpectrumBtmColor", visual.spectrum_bottom_color);
     XmlColor(node, L"SpectrumMidColor", visual.spectrum_middle_color);
@@ -221,45 +210,6 @@ bool LoadVisualProfile(const std::filesystem::path& path,
     if (XmlInteger(node, L"Blur", integer)) visual.blur = integer != 0;
     XmlColor(node, L"BlurScopeColor", visual.blur_scope_color);
     XmlColor(node, L"TextColor", visual.text_color);
-    XmlColor(node, L"PulseColor", visual.pulse_color);
-    XmlColor(node, L"RippleColor", visual.ripple_color);
-    XmlColor(node, L"PulseBackground", visual.pulse_background);
-    XmlColor(node, L"RippleBackground", visual.ripple_background);
-    if (XmlInteger(node, L"PulseFollowLyric", integer)) visual.pulse_follow_lyric = integer != 0;
-    if (XmlInteger(node, L"RippleFollowLyric", integer)) visual.ripple_follow_lyric = integer != 0;
-    if (XmlInteger(node, L"OsuFlags", integer)) visual.osu_flags = integer & 31;
-    XmlColor(node, L"OsuAccent", visual.osu_accent);
-    XmlColor(node, L"OsuBackground", visual.osu_background);
-    if (XmlInteger(node, L"OsuBpm", integer)) visual.osu_bpm = std::clamp(integer, 20, 400);
-    if (XmlInteger(node, L"OsuLogo", integer)) {
-        visual.osu_logo = std::clamp(integer, 0, 2);
-        visual.osu_logo_path = XmlAttribute(node, L"OsuLogoPath");
-    }
-    if (XmlInteger(node, L"OsuIntro", integer)) visual.osu_intro = integer != 0;
-    if (XmlInteger(node, L"OsuOutro", integer)) visual.osu_outro = integer != 0;
-    if (XmlInteger(node, L"OsuLazerLogo", integer)) {
-        visual.osu_lazer_logo=std::clamp(integer,0,2);
-        visual.osu_lazer_logo_path=XmlAttribute(node,L"OsuLazerLogoPath");
-    } else if (XmlInteger(node,L"OsuLogo",integer)) {
-        visual.osu_lazer_logo=visual.osu_logo;
-        visual.osu_lazer_logo_path=visual.osu_logo_path;
-    }
-    if (XmlInteger(node,L"OsuLazerCustomText",integer)) visual.osu_lazer_custom_text=integer!=0;
-    const wchar_t* text_keys[]{L"OsuLazerText1",L"OsuLazerText2",L"OsuLazerText3"};
-    for (size_t i=0;i<3;++i) {
-        IXMLDOMNamedNodeMap* attributes{};
-        IXMLDOMNode* attribute{};
-        if(SUCCEEDED(node->get_attributes(&attributes)) && attributes) {
-            attributes->getNamedItem(_bstr_t(text_keys[i]),&attribute);
-            attributes->Release();
-        }
-        if(attribute) {
-            attribute->Release();
-            visual.osu_lazer_text[i]=XmlAttribute(node,text_keys[i]).substr(0,64);
-        }
-    }
-    if (XmlInteger(node, L"OsuLazerIntro", integer)) visual.osu_lazer_intro = integer != 0;
-    if (XmlInteger(node, L"OsuLazerOutro", integer)) visual.osu_lazer_outro = integer != 0;
     LOGFONTW font = visual.font;
     if (XmlFont(node, font)) {
         visual.font = font;
@@ -318,32 +268,10 @@ bool SaveVisualProfile(const std::filesystem::path& path,
     SetXmlAttribute(element, L"SpectrumWide", visual.spectrum_wide);
     SetXmlAttribute(element, L"BlurSpeed", visual.blur_speed);
     SetXmlAttribute(element, L"Blur", visual.blur ? 1 : 0);
-    SetXmlAttribute(element, L"Type", std::clamp(visual.type, 0, settings::kMaximumVisualType));
+    SetXmlAttribute(element, L"Type", std::clamp(visual.type, 0, 4));
     SetXmlAttribute(element, L"BlurScopeColor",
                     ColorText(visual.blur_scope_color));
     SetXmlAttribute(element, L"TextColor", ColorText(visual.text_color));
-    SetXmlAttribute(element, L"PulseColor", ColorText(visual.pulse_color));
-    SetXmlAttribute(element, L"RippleColor", ColorText(visual.ripple_color));
-    SetXmlAttribute(element, L"PulseBackground", ColorText(visual.pulse_background));
-    SetXmlAttribute(element, L"RippleBackground", ColorText(visual.ripple_background));
-    SetXmlAttribute(element, L"PulseFollowLyric", visual.pulse_follow_lyric ? 1 : 0);
-    SetXmlAttribute(element, L"RippleFollowLyric", visual.ripple_follow_lyric ? 1 : 0);
-    SetXmlAttribute(element, L"OsuFlags", visual.osu_flags & 31);
-    SetXmlAttribute(element, L"OsuAccent", ColorText(visual.osu_accent));
-    SetXmlAttribute(element, L"OsuBackground", ColorText(visual.osu_background));
-    SetXmlAttribute(element, L"OsuBpm", std::clamp(visual.osu_bpm, 20, 400));
-    SetXmlAttribute(element, L"OsuLogo", std::clamp(visual.osu_logo, 0, 2));
-    SetXmlAttribute(element, L"OsuLogoPath", visual.osu_logo_path);
-    SetXmlAttribute(element,L"OsuLazerLogo",std::clamp(visual.osu_lazer_logo,0,2));
-    SetXmlAttribute(element,L"OsuLazerLogoPath",visual.osu_lazer_logo_path);
-    SetXmlAttribute(element,L"OsuLazerCustomText",visual.osu_lazer_custom_text?1:0);
-    SetXmlAttribute(element,L"OsuLazerText1",visual.osu_lazer_text[0]);
-    SetXmlAttribute(element,L"OsuLazerText2",visual.osu_lazer_text[1]);
-    SetXmlAttribute(element,L"OsuLazerText3",visual.osu_lazer_text[2]);
-    SetXmlAttribute(element, L"OsuIntro", visual.osu_intro ? 1 : 0);
-    SetXmlAttribute(element, L"OsuOutro", visual.osu_outro ? 1 : 0);
-    SetXmlAttribute(element, L"OsuLazerIntro", visual.osu_lazer_intro ? 1 : 0);
-    SetXmlAttribute(element, L"OsuLazerOutro", visual.osu_lazer_outro ? 1 : 0);
     if (visual.font_valid)
         SetXmlAttribute(element, L"Font", FontText(visual.font));
 
@@ -376,89 +304,23 @@ void SetFramesText(HWND dialog, HMODULE resources, int frames) {
     SetDlgItemTextW(dialog, kVisualFramesText, text);
 }
 
-int& SelectedVisualFrames(HWND dialog, settings::VisualSettings& visual) {
-    return VisualOptionsTabs::IsLazerSelected(dialog) ? visual.osu_lazer_frames_per_second :
-        VisualOptionsTabs::IsOsuSelected(dialog) ? visual.osu_frames_per_second : visual.frames_per_second;
-}
-void SyncVisualFrames(HWND dialog, HMODULE resources, const settings::VisualSettings& visual) {
-    const bool osu=VisualOptionsTabs::IsOsuSelected(dialog);
-    const int maximum=osu?240:100;
-    const int value=VisualOptionsTabs::IsLazerSelected(dialog)?visual.osu_lazer_frames_per_second:
-        osu?visual.osu_frames_per_second:visual.frames_per_second;
-    SendDlgItemMessageW(dialog,kVisualFrames,TBM_SETRANGE,TRUE,MAKELPARAM(10,maximum));
-    SendDlgItemMessageW(dialog,kVisualFrames,TBM_SETTICFREQ,osu?10:1,0);
-    SendDlgItemMessageW(dialog,kVisualFrames,TBM_SETPOS,TRUE,value);
-    SetDlgItemInt(dialog,kVisualFramesMaximum,maximum,FALSE);
-    SetFramesText(dialog,resources,value);
-}
-
-void SyncOptionsOsuLogo(HWND dialog,const settings::VisualSettings& visual) {
-    if(!GetDlgItem(dialog,kVisualOsuLogoChoice))return;
-    const bool lazer=VisualOptionsTabs::IsLazerSelected(dialog);
-    const int kind=lazer?visual.osu_lazer_logo:visual.osu_logo;
-    const auto& path=lazer?visual.osu_lazer_logo_path:visual.osu_logo_path;
-    SendDlgItemMessageW(dialog,kVisualOsuLogoChoice,CB_SETCURSEL,std::clamp(kind,0,2),0);
-    SetDlgItemTextW(dialog,kVisualOsuLogoPath,path.c_str());
-    VisualOptionsTabs::SetVisible(dialog,kVisualOsuLogoPath,kind==2 && !lazer);
-    VisualOptionsTabs::SetVisible(dialog,kVisualOsuLogoBrowse,kind==2);
-    CheckDlgButton(dialog,kVisualLazerCustomText,visual.osu_lazer_custom_text?BST_CHECKED:BST_UNCHECKED);
-    VisualOptionsTabs::SetVisible(dialog,kVisualLazerCustomText,lazer);
-    // Ignore EN_CHANGE generated while refreshing the three shared edit HWNDs.
-    SetPropW(dialog,L"TTPlayer.OsuTextSync",reinterpret_cast<HANDLE>(1));
-    for(int i=0;i<3;++i) {
-        SetDlgItemTextW(dialog,kVisualLazerText1+i,visual.osu_lazer_text[i].c_str());
-        EnableWindow(GetDlgItem(dialog,kVisualLazerText1+i),visual.osu_lazer_custom_text);
-        VisualOptionsTabs::SetVisible(dialog,kVisualLazerText1+i,lazer);
-    }
-    RemovePropW(dialog,L"TTPlayer.OsuTextSync");
-}
-
 void SyncVisualPage(HWND dialog, HMODULE resources,
                     const settings::VisualSettings& visual, bool first) {
-    PopulateCombo(dialog, kVisualType, resources, 5, -1);
-    for (const UINT id : {IDS_VISUAL_PULSE, IDS_VISUAL_RIPPLE}) {
-        const auto label = i18n::ResourceText(GetModuleHandleW(nullptr), id);
-        SendDlgItemMessageW(dialog, kVisualType, CB_ADDSTRING, 0,
-                            reinterpret_cast<LPARAM>(label.c_str()));
-    }
-    SendDlgItemMessageW(dialog, kVisualType, CB_SETCURSEL,
-                        AvailableVisualType(visual.type), 0);
+    PopulateCombo(dialog, kVisualType, resources, 5,
+                  std::clamp(visual.type, 0, 4));
     PopulateCombo(dialog, kScopeSpeed, resources, 3,
                   std::clamp((visual.blur_speed - 1) / 2, 0, 2));
     CheckDlgButton(dialog, kSpectrumWide,
                    visual.spectrum_wide ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dialog, kScopeBlur,
                    visual.blur ? BST_CHECKED : BST_UNCHECKED);
-    if (first) {
-        // The immutable 5.7.9 template has an anonymous "40" static under
-        // the slider. Keep its right edge, but update/size the new maximum.
-        for (HWND label = GetWindow(dialog, GW_CHILD); label;
-             label = GetWindow(label, GW_HWNDNEXT)) {
-            wchar_t klass[32]{}, text[16]{};
-            GetClassNameW(label, klass, 32);
-            GetWindowTextW(label, text, 16);
-            if (GetDlgCtrlID(label) != -1 || _wcsicmp(klass, WC_STATICW) != 0 ||
-                wcscmp(text, L"40") != 0) continue;
-            RECT bounds{}, width{0, 0, 15, 0};
-            GetWindowRect(label, &bounds);
-            MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT*>(&bounds), 2);
-            i18n::MapDialogRect(dialog, &width);
-            SetWindowLongPtrW(label,GWLP_ID,kVisualFramesMaximum);
-            SetWindowPos(label, nullptr, bounds.right - width.right, bounds.top,
-                width.right, bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
-            break;
-        }
+    const HWND track = GetDlgItem(dialog, kVisualFrames);
+    if (track) {
+        SendMessageW(track, TBM_SETRANGE, TRUE, MAKELPARAM(10, 40));
+        SendMessageW(track, TBM_SETTICFREQ, 1, 0);
+        SendMessageW(track, TBM_SETPOS, TRUE, visual.frames_per_second);
     }
-    CheckDlgButton(dialog, IDC_VISUAL_PULSE_FOLLOW, visual.pulse_follow_lyric ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(dialog, IDC_VISUAL_RIPPLE_FOLLOW, visual.ripple_follow_lyric ? BST_CHECKED : BST_UNCHECKED);
-    EnableWindow(GetDlgItem(dialog, IDC_VISUAL_PULSE_COLOR), !visual.pulse_follow_lyric);
-    EnableWindow(GetDlgItem(dialog, IDC_VISUAL_RIPPLE_COLOR), !visual.ripple_follow_lyric);
-    for (UINT bit = 0; bit < 5; ++bit)
-        CheckDlgButton(dialog, IDC_VISUAL_OSU_SPECTRUM + bit,
-            (visual.osu_flags & (1 << bit)) ? BST_CHECKED : BST_UNCHECKED);
-    SetDlgItemInt(dialog, IDC_VISUAL_OSU_BPM, visual.osu_bpm, FALSE);
-    VisualOptionsTabs::SelectForType(dialog, AvailableVisualType(visual.type,true));
-    SyncVisualFrames(dialog,resources,visual);
+    SetFramesText(dialog, resources, visual.frames_per_second);
     for (const UINT control : kColorControls) {
         const HWND button = GetDlgItem(dialog, static_cast<int>(control));
         if (first && button) {
@@ -607,39 +469,22 @@ INT_PTR PlayerWindow::HandleVisualOptionsDialog(
     };
 
     switch (message) {
-    case kVisualAvailabilityChanged:
-        VisualOptionsTabs::RefreshAvailability(dialog);
-        SyncVisualPage(dialog,resources,settings_.visual,false);
-        return TRUE;
-    case kVisualTabChanged: {
-        SyncOptionsOsuLogo(dialog,settings_.visual);
-        SyncVisualFrames(dialog,resources,settings_.visual);
-        const bool lazer=VisualOptionsTabs::IsLazerSelected(dialog);
-        CheckDlgButton(dialog,IDC_VISUAL_OSU_INTRO,
-            (lazer?settings_.visual.osu_lazer_intro:settings_.visual.osu_intro)?BST_CHECKED:BST_UNCHECKED);
-        CheckDlgButton(dialog,IDC_VISUAL_OSU_OUTRO,
-            (lazer?settings_.visual.osu_lazer_outro:settings_.visual.osu_outro)?BST_CHECKED:BST_UNCHECKED);
-        return TRUE;
-    }
     case WM_INITDIALOG: {
         const auto description = ResourceText(kVisualOptionsPage);
         if (!description.empty()) SetWindowTextW(dialog, description.c_str());
-        VisualOptionsTabs::Attach(dialog);
         SyncVisualPage(dialog, resources, settings_.visual, true);
         InstallOptionsBitmapButton(dialog, kVisualFont, resources, 0x161);
         InstallOptionsBitmapButton(dialog, kVisualProfile, resources, 0x160);
-        InstallOptionsBitmapButton(dialog, kVisualOsuLogoBrowse, resources, 1023);
         return TRUE;
     }
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lparam) ==
                 GetDlgItem(dialog, kVisualFrames)) {
-            auto& frames=SelectedVisualFrames(dialog,settings_.visual);
-            frames = static_cast<int>(
+            settings_.visual.frames_per_second = static_cast<int>(
                 SendDlgItemMessageW(dialog, kVisualFrames,
                                     TBM_GETPOS, 0, 0));
             SetFramesText(dialog, resources,
-                          frames);
+                          settings_.visual.frames_per_second);
             refresh();
             return TRUE;
         }
@@ -649,105 +494,16 @@ INT_PTR PlayerWindow::HandleVisualOptionsDialog(
         const COLORREF* color = item
             ? VisualColor(settings_.visual, item->CtlID) : nullptr;
         if (!item || !color) break;
-        const bool follow = (item->CtlID == IDC_VISUAL_PULSE_COLOR && settings_.visual.pulse_follow_lyric) ||
-            (item->CtlID == IDC_VISUAL_RIPPLE_COLOR && settings_.visual.ripple_follow_lyric);
-        DrawOptionsColorButton(*item, follow ? settings_.lyric.highlight_color : *color);
+        DrawOptionsColorButton(*item, *color);
         return TRUE;
     }
     case WM_COMMAND: {
         const UINT control = LOWORD(wparam);
         const UINT notification = HIWORD(wparam);
-        if (audio::HasOsuTransitionSupport() && notification == BN_CLICKED &&
-            (control == IDC_VISUAL_OSU_INTRO || control == IDC_VISUAL_OSU_OUTRO)) {
-            const bool lazer=VisualOptionsTabs::IsLazerSelected(dialog);
-            (control == IDC_VISUAL_OSU_INTRO
-                ? (lazer?settings_.visual.osu_lazer_intro:settings_.visual.osu_intro)
-                : (lazer?settings_.visual.osu_lazer_outro:settings_.visual.osu_outro)) =
-                IsDlgButtonChecked(dialog, control) == BST_CHECKED;
-            refresh();
-            return TRUE;
-        }
-        if(audio::HasOsuIntroTextSupport() && VisualOptionsTabs::IsLazerSelected(dialog)) {
-            if(control==kVisualLazerCustomText && notification==BN_CLICKED) {
-                settings_.visual.osu_lazer_custom_text=IsDlgButtonChecked(dialog,control)==BST_CHECKED;
-                SyncOptionsOsuLogo(dialog,settings_.visual);refresh();return TRUE;
-            }
-            if(control>=kVisualLazerText1 && control<kVisualLazerText1+3 && notification==EN_CHANGE) {
-                if(!GetPropW(dialog,L"TTPlayer.OsuTextSync")) {
-                    wchar_t text[65]{};GetDlgItemTextW(dialog,control,text,65);
-                    settings_.visual.osu_lazer_text[control-kVisualLazerText1]=text;
-                    refresh();
-                }
-                return TRUE;
-            }
-        }
-        if(audio::HasOsuLogoSupport() &&
-           ((control==kVisualOsuLogoChoice && notification==CBN_SELCHANGE) ||
-            (control==kVisualOsuLogoBrowse && notification==BN_CLICKED))) {
-            const int kind=control==kVisualOsuLogoBrowse?2:static_cast<int>(
-                SendDlgItemMessageW(dialog,kVisualOsuLogoChoice,CB_GETCURSEL,0,0));
-            const bool lazer=VisualOptionsTabs::IsLazerSelected(dialog);
-            const auto& logo_path=lazer?settings_.visual.osu_lazer_logo_path:settings_.visual.osu_logo_path;
-            HRESULT result=S_OK;
-            if(kind==2) {
-                ModernOpenFileOptions chooser;
-                chooser.owner=dialog;chooser.initial_path=logo_path;
-                chooser.title=i18n::ResourceText(GetModuleHandleW(nullptr),IDS_OSU_LOGO_TITLE);
-                chooser.filters={{i18n::ResourceText(GetModuleHandleW(nullptr),IDS_OSU_LOGO_FILTER),
-                    L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff"}};
-                const bool reuse=control==kVisualOsuLogoChoice && !logo_path.empty() &&
-                    SUCCEEDED(SetOsuLogoChoice(2,logo_path,lazer));
-                if(!reuse) {
-                    // A moved/deleted previously selected file must not trap
-                    // the user in a hidden custom-file row.
-                    if(const auto path=ModernOpenFile(chooser))result=SetOsuLogoChoice(2,*path,lazer);
-                }
-            } else result=SetOsuLogoChoice(kind,{},lazer);
-            if(FAILED(result))MessageBoxW(dialog,
-                i18n::ResourceText(GetModuleHandleW(nullptr),IDS_OSU_LOGO_ERROR).c_str(),
-                i18n::ResourceText(GetModuleHandleW(nullptr),IDS_OSU_LOGO_CHOICE).c_str(),MB_OK|MB_ICONERROR);
-            SyncOptionsOsuLogo(dialog,settings_.visual);
-            return TRUE;
-        }
-        if (control >= IDC_VISUAL_OSU_SPECTRUM && control <= IDC_VISUAL_OSU_LOGO &&
-            notification == BN_CLICKED) {
-            const int bit = 1 << (control - IDC_VISUAL_OSU_SPECTRUM);
-            settings_.visual.osu_flags = (settings_.visual.osu_flags & ~bit) |
-                (IsDlgButtonChecked(dialog, control) == BST_CHECKED ? bit : 0);
-            refresh();
-            return TRUE;
-        }
-        if (control == IDC_VISUAL_OSU_BPM &&
-            (notification == EN_CHANGE || notification == EN_KILLFOCUS)) {
-            BOOL valid{};
-            const UINT value = GetDlgItemInt(dialog, control, &valid, FALSE);
-            if (valid && value >= 20 && value <= 400 &&
-                settings_.visual.osu_bpm != static_cast<int>(value)) {
-                settings_.visual.osu_bpm = static_cast<int>(value);
-                refresh();
-            } else if (notification == EN_KILLFOCUS && (!valid || value < 20 || value > 400)) {
-                SetDlgItemInt(dialog, control, settings_.visual.osu_bpm, FALSE);
-            }
-            return TRUE;
-        }
-        if ((control == IDC_VISUAL_PULSE_FOLLOW || control == IDC_VISUAL_RIPPLE_FOLLOW) &&
-            notification == BN_CLICKED) {
-            const bool follow = IsDlgButtonChecked(dialog, control) == BST_CHECKED;
-            const bool pulse = control == IDC_VISUAL_PULSE_FOLLOW;
-            (pulse ? settings_.visual.pulse_follow_lyric : settings_.visual.ripple_follow_lyric) = follow;
-            const HWND button = GetDlgItem(dialog, pulse ? IDC_VISUAL_PULSE_COLOR : IDC_VISUAL_RIPPLE_COLOR);
-            EnableWindow(button, !follow);
-            InvalidateRect(button, nullptr, TRUE);
-            refresh();
-            return TRUE;
-        }
         if (control == kVisualType && notification == CBN_SELCHANGE) {
             const int type = static_cast<int>(SendDlgItemMessageW(
                 dialog, kVisualType, CB_GETCURSEL, 0, 0));
-            if (type != CB_ERR) {
-                SetVisualType(type);
-                SyncVisualPage(dialog, resources, settings_.visual, false);
-            }
+            if (type != CB_ERR) SetVisualType(type);
             return TRUE;
         }
         if (control == kScopeSpeed && notification == CBN_SELCHANGE) {
@@ -840,7 +596,7 @@ INT_PTR PlayerWindow::HandleVisualOptionsDialog(
         }
         if (control == kSaveAllOptions && notification == BN_CLICKED) {
             CaptureWindowState();
-            SaveSettingsWithFeedback();
+            settings::SaveWindowState(settings_.source_path, settings_);
             return TRUE;
         }
         if (control == kResetAllOptions && notification == BN_CLICKED) {

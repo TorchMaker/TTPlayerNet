@@ -1,5 +1,5 @@
-#include "ttplayer/i18n/i18n.h"
 #include "ttplayer/lyrics/online_search.h"
+#include "ttplayer/lyrics/lyric_http.h"
 #include "ttplayer/core/text.h"
 
 #include <algorithm>
@@ -64,8 +64,7 @@ public:
     HRESULT STDMETHODCALLTYPE OnError(LPCWSTR text) override {
         return Update([&](SearchSnapshot& s) {
             if (s.phase == Phase::downloaded) return;
-            s.error = text ? text : L"";
-            s.phase = s.phase == Phase::downloading ? Phase::download_failed : Phase::failed;
+            s.error = text ? text : L""; s.phase = Phase::failed;
         });
     }
     HRESULT STDMETHODCALLTYPE OnServer(LPCWSTR name) override {
@@ -86,10 +85,10 @@ private:
     std::shared_ptr<OnlineSearch::State> state_;
 };
 
-bool Run(const std::shared_ptr<OnlineSearch::State>& state,
+void Run(const std::shared_ptr<OnlineSearch::State>& state,
          const std::shared_ptr<plugins::PluginManager>& library,
          size_t provider, const settings::NetworkSettings& network,
-         const std::wstring& artist, const std::wstring& title, const LyricService* service = nullptr) {
+         const std::wstring& artist, const std::wstring& title) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto* callback = new Callback(state);
     try {
@@ -98,7 +97,7 @@ bool Run(const std::shared_ptr<OnlineSearch::State>& state,
             if (state->canceled) {
                 callback->Release();
                 if (SUCCEEDED(com)) CoUninitialize();
-                return true;
+                return;
             }
         }
         plugins::LyricNetworkConfig config;
@@ -108,13 +107,7 @@ bool Run(const std::shared_ptr<OnlineSearch::State>& state,
         config.username = network.proxy_username.c_str();
         config.password = network.proxy_password.c_str();
         HRESULT hr = E_NOINTERFACE;
-        auto session = library ? library->CreateLyricSearch(provider, callback, &config, &hr, nullptr,
-            service ? service->name.c_str() : nullptr, service ? service->url.c_str() : nullptr) : nullptr;
-        if (service && !session) {
-            callback->Release();
-            if (SUCCEEDED(com)) CoUninitialize();
-            return false; // Try another installed provider supporting explicit services.
-        }
+        auto session = library ? library->CreateLyricSearch(provider, callback, &config, &hr) : nullptr;
         // FUN_0043B9CE retries creator zero, not a hard-coded HTTP endpoint.
         if (!session && library && provider != 0) {
             provider = 0;
@@ -122,7 +115,7 @@ bool Run(const std::shared_ptr<OnlineSearch::State>& state,
         }
         {
             std::lock_guard lock(state->mutex);
-            if (!service) state->snapshot.provider = provider;
+            state->snapshot.provider = provider;
         }
         bool canceled;
         { std::lock_guard lock(state->mutex); canceled = state->canceled; }
@@ -157,7 +150,7 @@ bool Run(const std::shared_ptr<OnlineSearch::State>& state,
                     lock.lock();
                     continue;
                 }
-                if (phase != Phase::results && phase != Phase::downloaded && phase != Phase::download_failed &&
+                if (phase != Phase::results && phase != Phase::downloaded &&
                     std::chrono::steady_clock::now() >= deadline) {
                     state->snapshot.phase = Phase::failed;
                     ++state->snapshot.revision;
@@ -166,18 +159,10 @@ bool Run(const std::shared_ptr<OnlineSearch::State>& state,
                 state->changed.wait_for(lock, std::chrono::milliseconds(100));
             }
         }
-        if (session) {
-            plugins::LyricSearchControl* control{};
-            if (SUCCEEDED(session->QueryInterface(plugins::kLyricControlId, reinterpret_cast<void**>(&control))) && control) {
-                control->Cancel();
-                control->Release();
-            }
-        }
         // session (and DLL's internal worker) is released here, never by WM_CLOSE.
     } catch (...) { callback->OnError(L""); }
     callback->Release();
     if (SUCCEEDED(com)) CoUninitialize();
-    return true;
 }
 }
 
@@ -201,22 +186,30 @@ OnlineSearch::OnlineSearch(const plugins::PluginManager& plugins, size_t provide
 OnlineSearch::~OnlineSearch() { Cancel(); }
 
 OnlineSearch::OnlineSearch(LyricService service, size_t index, settings::NetworkSettings network,
-    std::wstring artist, std::wstring title, const plugins::PluginManager* library) : state_(std::make_shared<State>()) {
+    std::wstring artist, std::wstring title) : state_(std::make_shared<State>()) {
     state_->snapshot.provider = index;
     state_->snapshot.server = service.name;
-    auto retained = library ? library->RetainForBackground() : nullptr;
-    std::thread([state = state_, retained = std::move(retained), service = std::move(service), network = std::move(network),
+    std::thread([state = state_, service = std::move(service), network = std::move(network),
         artist = std::move(artist), title = std::move(title)] {
+        const auto canceled = [state] { std::lock_guard lock(state->mutex); return state->canceled; };
         try {
-            if (retained) {
-                for (size_t i = 0; i < retained->LyricSearchProviders().size(); ++i)
-                    if (Run(state, retained, i, network, artist, title, &service)) return;
-            }
-            std::lock_guard lock(state->mutex);
-            if (!state->canceled) {
-                state->snapshot.phase = Phase::failed;
-                state->snapshot.error = i18n::Literal(L"歌词搜索组件缺失或版本过旧，请更新 AddIn\\ttp_lrcsh.dll");
-                ++state->snapshot.revision;
+            const auto results = SearchHttpLyrics(service.url, artist, title, network, canceled);
+            std::unique_lock lock(state->mutex);
+            if (state->canceled) return;
+            for (const auto& item : results) state->snapshot.results.push_back({item.artist,item.title});
+            state->snapshot.phase = Phase::results; ++state->snapshot.revision;
+            while (!state->canceled) {
+                state->changed.wait(lock, [&] { return state->canceled || state->download >= 0; });
+                if (state->canceled) break;
+                const int selected = std::exchange(state->download, -1);
+                lock.unlock();
+                const auto downloaded = DownloadHttpLyric(service.url, results.at(selected), network, canceled);
+                lock.lock();
+                if (state->canceled) break;
+                state->snapshot.text = downloaded.text;
+                state->snapshot.extra_title = downloaded.extra_title;
+                state->snapshot.extra_url = downloaded.extra_url;
+                state->snapshot.phase = Phase::downloaded; ++state->snapshot.revision;
             }
         } catch (const std::exception& e) {
             std::lock_guard lock(state->mutex);
@@ -242,11 +235,10 @@ SearchSnapshot OnlineSearch::Snapshot() const {
 bool OnlineSearch::Download(int index) {
     std::lock_guard lock(state_->mutex);
     if (state_->canceled || (state_->snapshot.phase != Phase::results &&
-        state_->snapshot.phase != Phase::downloaded && state_->snapshot.phase != Phase::download_failed) || index < 0 ||
+        state_->snapshot.phase != Phase::downloaded) || index < 0 ||
         static_cast<size_t>(index) >= state_->snapshot.results.size()) return false;
     state_->download = index;
     state_->snapshot.text.clear();
-    state_->snapshot.error.clear();
     state_->snapshot.phase = Phase::downloading;
     ++state_->snapshot.revision;
     state_->changed.notify_all();
