@@ -44,6 +44,27 @@
 | `src/ui/player_window_playlist_network.cpp` | +437/-1 | +116/-0 | 2 | 我方 MusicFree 网络列表 |
 | `tests` | 删除 | 改 gitlink | 0 | 保持删除 |
 
+## 编译验证结果（2026-11-05）
+
+工具链：MSVC 14.51.36231 Hostx86/x86 + Windows SDK 10.0.28000.0 + Ninja 1.13.2，
+目标 `ttplayer_rebuild`。编译前需设置 `INCLUDE` / `LIB` / `LIBPATH`（含
+`atlmfc\include` 与 SDK 的 `ucrt/shared/um/winrt/cppwinrt`），否则连 `windows.h`
+都找不到。
+
+为让上游新增 SDK 头文件可见，`ttplayer_core` 的 include 目录已补上
+`third_party/ttpcomm-sdk/include`、`ttpres-sdk/include`、`ttp-osu-sdk/include`。
+
+`ninja -k 0` 全量结果：**81 个步骤中 27 个失败**，失败单元集中在
+`src/audio/audio_engine.cpp` 与 `src/ui/player_window_*.cpp` 系列、
+`src/skin/skin.cpp`、`src/musicfree/*`。错误类型是 C2511（找不到重载成员）、
+C2597（非法引用非静态成员）、C2352（调用非静态成员需对象）等，每个文件
+超过 100 个错误后停止。
+
+根因：上游重构了 `AudioEngine` / `PlayerWindow` 的类成员与函数签名，
+但这 21 个实现文件保留了我方版本，二者接口对不上。**不是缺失文件，
+而是需要成组移植**。因此 `master` 采用可编译的安全合并状态，
+完整合并树保存在分支 `upstream/full-merge-pending`。
+
 ## 建议移植顺序
 
 1. `include/ttplayer/ui/player_window.h` + `src/ui/player_window_internal.h`

@@ -159,6 +159,9 @@ add_library(ttplayer_core
 )
 target_include_directories(ttplayer_core
   PUBLIC include
+         third_party/ttpcomm-sdk/include
+         third_party/ttpres-sdk/include
+         third_party/ttp-osu-sdk/include
   PRIVATE "${TTPLAYER_GENERATED_INCLUDE_DIR}"
 )
 add_dependencies(ttplayer_core ttplayer_build_date)
