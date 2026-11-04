@@ -21,7 +21,7 @@ namespace ttplayer::ui::detail {
 // backend numbering so bitmap 0x167 and the 16-byte persisted keys remain
 // compatible with FUN_004991F1.
 struct LegacyOutputDevice {
-    int backend{}; // 0 waveOut, 1 DirectSound, 2 KS, 3 ASIO
+    int backend{}; // 0 waveOut, 1 DirectSound, 2 KS, 3 ASIO, 4/5 WASAPI shared/exclusive
     unsigned int wave_device_id{static_cast<unsigned int>(-1)};
     std::wstring key;
     std::wstring name;
@@ -30,6 +30,12 @@ struct LegacyOutputDevice {
     bool has_class_id{};
     std::array<std::wstring, 4> details;
 };
+
+// Native settings persist the selected physical path/CLSID, while catalogue
+// keys keep their legacy ordinals for old settings and worker snapshots.
+[[nodiscard]] std::wstring StableOutputDeviceKey(const LegacyOutputDevice& device);
+[[nodiscard]] bool OutputDeviceMatchesKey(const LegacyOutputDevice& device,
+                                          std::wstring_view key);
 
 enum class NativeOutputResolutionError {
     none, invalid_key, wrong_backend, missing_device, ambiguous_device,

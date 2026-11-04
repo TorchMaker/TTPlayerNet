@@ -8,8 +8,13 @@
 #include <vector>
 #include <windows.h>
 #include <commctrl.h>
+#include "update_controls.h"
+#include "ttplayer/i18n/i18n.h"
 
 namespace ttplayer::ui::detail {
+inline constexpr int kGeneralPersonalNameLabel = 0xe92d;
+inline constexpr int kGeneralPersonalName = 0xe92e;
+inline constexpr int kGeneralPersonalNameNotice = 0xe92f;
 
 // Keep the original controls and their parent HWND: switching tabs changes
 // visibility, while the existing notification and settings handlers stay intact.
@@ -25,21 +30,22 @@ class GeneralOptionsTabs {
     void Layout() {
         if (laying_out_) return;
         laying_out_ = true;
-        RECT client{}, padding{0, 0, 7, 7}, inset{0, 0, 4, 4};
+        // Match InitializeOptionsSkinTabs: the tab frame fills the page,
+        // including its top/left origin, without a second outer gutter.
+        RECT client{}, inset{0, 0, 4, 4};
         GetClientRect(page_, &client);
-        MapDialogRect(page_, &padding);
-        MapDialogRect(page_, &inset);
-        SetWindowPos(tab_, HWND_BOTTOM, padding.right, padding.bottom,
-                     client.right - 2 * padding.right, client.bottom - 2 * padding.bottom,
+        i18n::MapDialogRect(page_, &inset);
+        SetWindowPos(tab_, HWND_BOTTOM, client.left, client.top,
+                     client.right - client.left, client.bottom - client.top,
                      SWP_NOACTIVATE);
         RECT content{};
         GetClientRect(tab_, &content);
         TabCtrl_AdjustRect(tab_, FALSE, &content);
         MapWindowPoints(tab_, page_, reinterpret_cast<POINT*>(&content), 2);
-        constexpr std::array<int, 3> first_row{18, 143, 189};
+        constexpr std::array<int, 4> first_row{18, 18, 143, 189};
         for (const auto& control : controls_) {
             RECT origin{0, first_row[control.group], 0, 0};
-            MapDialogRect(page_, &origin);
+            i18n::MapDialogRect(page_, &origin);
             const auto& rect = control.bounds;
             const int right = std::min<int>(rect.right, content.right - inset.right);
             SetWindowPos(control.window, nullptr, rect.left,
@@ -52,7 +58,7 @@ class GeneralOptionsTabs {
     }
 
     void Select(int group) {
-        if (group < 0 || group >= 3) return;
+        if (group < 0 || group >= 4) return;
         selected_ = group;
         TabCtrl_SetCurSel(tab_, group);
         const HWND focus = GetFocus();
@@ -92,18 +98,21 @@ public:
         auto* self = new GeneralOptionsTabs;
         self->page_ = page;
         RECT groups{0, 130, 0, 179};
-        MapDialogRect(page, &groups);
-        std::array<std::wstring, 3> captions;
+        i18n::MapDialogRect(page, &groups);
+        std::array<std::wstring, 4> captions;
+        captions[1] = i18n::Text(L"个性化");
         for (HWND control = GetWindow(page, GW_CHILD); control;
              control = GetWindow(control, GW_HWNDNEXT)) {
             RECT rect{};
             GetWindowRect(control, &rect);
             MapWindowPoints(nullptr, page, reinterpret_cast<POINT*>(&rect), 2);
             const int id = GetDlgCtrlID(control);
-            // New Discord/language controls belong to Options, regardless of
-            // their Y position. Resource controls retain their original groups.
-            const int group = id >= 0xe900 ? 0 : rect.top >= groups.bottom ? 2 :
-                rect.top >= groups.top ? 1 : 0;
+            const bool personal = id == 2188 || id == 0xe913 ||
+                (id >= kGeneralPersonalNameLabel && id <= kGeneralPersonalNameNotice);
+            const int group = personal ? 1 :
+                id >= kUpdateSourceLabel && id <= kUpdateStatus ? 3 :
+                id >= 0xe900 ? 0 : rect.top >= groups.bottom ? 3 :
+                rect.top >= groups.top ? 2 : 0;
             const auto style = GetWindowLongPtrW(control, GWL_STYLE);
             wchar_t klass[32]{};
             GetClassNameW(control, klass, static_cast<int>(std::size(klass)));
@@ -112,7 +121,7 @@ public:
                 caption.resize(GetWindowTextW(control, caption.data(), static_cast<int>(caption.size())));
                 // Reuse the already translated resource captions. The command
                 // line group's parenthetical explanation is too long for a tab.
-                if (group == 1) {
+                if (group == 2) {
                     const auto explanation = caption.find_first_of(L"(（");
                     if (explanation != caption.npos) caption.resize(explanation);
                     while (!caption.empty() && caption.back() == L' ') caption.pop_back();
@@ -138,7 +147,7 @@ public:
             return;
         }
         SendMessageW(self->tab_, WM_SETFONT, SendMessageW(page, WM_GETFONT, 0, 0), FALSE);
-        for (int group = 0; group < 3; ++group) {
+        for (int group = 0; group < 4; ++group) {
             TCITEMW item{};
             item.mask = TCIF_TEXT;
             item.pszText = captions[group].data();
@@ -146,6 +155,21 @@ public:
         }
         self->Layout();
         self->Select(0);
+    }
+
+    static void SetVisible(HWND page,int id,bool visible) {
+        const HWND window=GetDlgItem(page,id);
+        if(!window)return;
+        DWORD_PTR data{};
+        if(GetWindowSubclass(page,PageProc,kSubclass,&data)) {
+            auto* self=reinterpret_cast<GeneralOptionsTabs*>(data);
+            for(auto& control:self->controls_)if(control.window==window) {
+                control.visible=visible;
+                ShowWindow(window,visible && self->selected_==control.group?SW_SHOW:SW_HIDE);
+                return;
+            }
+        }
+        ShowWindow(window,visible?SW_SHOW:SW_HIDE);
     }
 
     static void ShowControl(HWND page, HWND control) {

@@ -1,4 +1,7 @@
 #pragma once
+#include <ttpcomm/audio_format_probe.h>
+#include "ttplayer/audio/builtin_file_info.h"
+#include "ttplayer/audio/hires_output.h"
 
 #include <array>
 #include <atomic>
@@ -7,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +28,7 @@ namespace ttplayer::testing { struct ProgressSeekAccess; struct MidiPlaybackAcce
 
 namespace ttplayer::audio {
 class WinampDspChain;
+class ArchivePlaybackSession;
 enum class PlaybackState { stopped, opening, playing, paused, failed };
 
 struct PlaybackClockSnapshot {
@@ -93,6 +98,20 @@ struct AudioMetadata {
     std::vector<std::pair<std::wstring, std::wstring>> entries;
     bool thumbnail_interface{};
     std::vector<unsigned char> thumbnail;
+    // Empty artwork is not a confirmed absence while archive/sidecar I/O runs.
+    bool thumbnail_pending{};
+    std::optional<ttp::format::Result> source_format;
+    std::wstring source_format_version;
+    // An empty complete snapshot means deletion, not unavailable metadata.
+    bool tags_authoritative{};
+};
+
+struct LyricSaveFailure {
+    std::filesystem::path path;
+    int subtrack{};
+    std::wstring text;
+    HRESULT result{E_FAIL};
+    std::filesystem::path recovery_path;
 };
 
 // The original visualization pipeline asks the sound player for two blocks
@@ -108,10 +127,35 @@ struct VisualizationSamples {
     uint64_t revision{};
 };
 
+// Independent analysis window for newer visualization components. Each
+// snapshot is copied from contiguous output PCM at the actual output cursor;
+// a short/low-latency output queue uses retained preceding PCM to complete the
+// window. Callers must never concatenate successive (overlapping) snapshots.
+// Like the legacy snapshot, channels are front left/right (mono duplicated),
+// after decoding/resampling/DSP and before the output sink's volume/balance.
+// No analysis work or additional decoding takes place on the audio callback.
+struct ExtendedVisualizationSamples {
+    static constexpr size_t capacity = 2048;
+
+    std::array<int16_t, capacity> left{};
+    std::array<int16_t, capacity> right{};
+    size_t count{};
+    uint32_t sample_rate{};
+    uint32_t source_channels{};
+    uint64_t revision{};
+    uint64_t first_frame{}; // track position in output-rate sample frames
+    uint64_t playback_frame{}; // actual output cursor, also for beat timing
+    uint64_t timeline_revision{};
+    std::chrono::steady_clock::time_point observed_at;
+};
+
 // TTPlayer.xml /Playback and /Device values consumed by the recovered sound
 // pipeline.  Keeping them at the engine boundary prevents UI code from
 // silently substituting hard-coded buffering and output-format defaults.
 struct PlaybackOptions {
+    PcmPlaybackMode pcm_mode{PcmPlaybackMode::compatible};
+    Mp3TagPolicy mp3_tags;
+    std::filesystem::path lyric_recovery_folder;
     int file_buffer_bytes{16384};
     int output_buffer_ms{1000};
     int output_bits{16};
@@ -127,7 +171,11 @@ struct PlaybackOptions {
     // CSettings::Device/@DeviceType is the textual form of the original
     // 16-byte output key.  A zero-tail key uses Data1.low as waveOut id + 1
     // and Data1.high as the backend discriminator (0 waveOut, 2 KS, 3 ASIO);
-    // a non-zero tail denotes DirectSound.  Empty keeps the reconstruction's
+    // a non-zero tail denotes DirectSound. WASAPI uses a separate
+    // wasapi:shared:/wasapi:exclusive: prefix plus an opaque endpoint ID.
+    // New native selections persist native:asio:<CLSID> / native:ks:<path>;
+    // legacy ordinal keys still load and migrate when the device page saves.
+    // Empty keeps the reconstruction's
     // backwards-compatible WAVE_MAPPER default.
     std::wstring device_type;
     bool hardware_buffer{true};
@@ -145,6 +193,26 @@ struct PlaybackOptions {
     int sound_fade_mode{15};
     std::array<int, 4> fade_duration{300, 500, 800, 800};
     int track_fade_duration{5000};
+    // HTTP I/O runs on decoder threads; cancellation is observed during every
+    // async wait, including Open. This callback must outlive the source.
+    std::function<bool()> network_canceled;
+    // An explicitly handed-off archive consumer survives the outgoing reader's
+    // cancellation. It is never used for a different backing member.
+    std::shared_ptr<ArchivePlaybackSession> archive_session;
+    // Publish the backing member before a far CUE position waits for bytes.
+    std::function<void(const std::shared_ptr<ArchivePlaybackSession>&)> archive_opened;
+    int network_timeout_ms{15000};
+    int network_proxy_type{1}, network_proxy_port{};
+    std::wstring network_proxy_server, network_proxy_username, network_proxy_password;
+    bool network_cache_enabled{true};
+    std::filesystem::path network_cache_folder;
+    int network_cache_space_mb{600};
+    std::filesystem::path network_download_folder, network_download_list;
+    // Optional caller-owned network profile (no system settings are changed).
+    std::wstring network_pac_url;
+    int network_auto_detect{-1};
+    std::vector<unsigned char> network_ca_pem;
+    size_t network_live_cache_bytes{8U * 1024U * 1024U};
 };
 
 // Read-only decoded PCM boundary shared by playback and offline conversion.
@@ -161,21 +229,35 @@ public:
                       std::vector<std::byte>& output,
                       bool& end_of_stream) = 0;
     virtual bool Seek(std::chrono::milliseconds position) = 0;
+    // Legacy readers return their actual (possibly coarse) position through
+    // the Seek argument. Segment readers need it before discarding PCM.
+    [[nodiscard]] virtual std::optional<std::chrono::milliseconds> LastSeekPosition() const { return {}; }
     // Push decoders (the optional mp3PRO input DLL) also have a producer
     // thread. Called on the source owner thread, never directly by the UI.
     // Read may temporarily resume that producer for paused seek prefill.
     virtual void SetPaused(bool) {}
+    // Content downloaded, not the short playout buffer; -1 means unavailable.
+    // Queried on the decoder thread. UI consumes the engine's atomic snapshot.
+    virtual int DownloadedPercent() { return -1; }
+    [[nodiscard]] virtual std::shared_ptr<ArchivePlaybackSession> ArchiveSession() const { return {}; }
     [[nodiscard]] virtual const WAVEFORMATEX& OutputFormat() const = 0;
     [[nodiscard]] virtual AudioFormat DisplayFormat() const = 0;
     [[nodiscard]] virtual std::chrono::milliseconds Duration() const = 0;
     [[nodiscard]] virtual std::wstring Error() const = 0;
     [[nodiscard]] virtual HRESULT ErrorResult() const { return E_FAIL; }
     [[nodiscard]] virtual AudioMetadata Metadata() const { return {}; }
+    // Changes when deferred container metadata becomes available.
+    [[nodiscard]] virtual uint64_t MetadataRevision() const noexcept { return 0; }
+    // Removable sources identify the medium actually opened, for deferred writes.
+    [[nodiscard]] virtual std::wstring SourceIdentity() const { return {}; }
     // CPlayerWnd retains an outgoing reader only when (capabilities & 9) == 0.
     // Native file readers can overlap; wrappers must forward the inner gate.
     [[nodiscard]] virtual bool CanOverlapPlayback() const { return true; }
     // Called only by the source's owning playback thread, between reads.
     virtual HRESULT WriteLyrics(std::wstring_view) { return E_NOINTERFACE; }
+    // Called after playback has finished, on the owning thread. Close decoder
+    // handles before committing pending tags; never rewrite MP3 in Read().
+    virtual HRESULT FinishLyrics() { return S_FALSE; }
 };
 
 // Creates (but does not open) the recovered source selected for `path`.
@@ -194,6 +276,8 @@ public:
     AudioEngine& operator=(const AudioEngine&) = delete;
 
     bool Play(const std::filesystem::path& path, int subtrack = 0);
+    void PrepareArchiveTrackChange(const std::filesystem::path& path, int subtrack);
+    void CancelArchiveTrackChange();
     // A stable second session lets the old sound finish its stop fade while
     // the new sound opens/fades in (CPlayerWnd +0x4344 / +0x4348).
     [[nodiscard]] std::shared_ptr<AudioEngine> CreateSuccessor() const;
@@ -201,7 +285,7 @@ public:
     // WaveOut volume can be shared across handles. Fade on the current
     // handle, then let the UI open the successor after TryReapStopped().
     [[nodiscard]] bool BeginWaveOutTrackChange();
-    void StopAsync() noexcept { RequestStop(); }
+    void StopAsync() noexcept;
     [[nodiscard]] bool TryReapStopped() noexcept;
     bool PlayWave(const std::filesystem::path& path) { return Play(path); }
     // Device-page changes reopen the current source with a new output object.
@@ -217,6 +301,9 @@ public:
     // fade gate. Keep playback state and leave play/pause/stop fades alone.
     void SeekWithoutFade(std::chrono::milliseconds position);
     void Stop();
+    // File editors must wait until the decoder releases its file and commits
+    // pending tags; ordinary playback controls keep the bounded Stop().
+    void StopAndWait();
     // Explicit UI stop follows bit 3 of SoundFadeMode.  Stop() remains the
     // immediate lifetime/cancellation primitive used before Play and during
     // destruction.
@@ -224,7 +311,7 @@ public:
     // Close starts the same fade but must not synchronously stop when the
     // option/backend/state gate is false. The window message loop polls the
     // lock-free flag while continuing to dispatch paint/timer messages.
-    [[nodiscard]] bool BeginStopFade(bool detach_dsp = false);
+    [[nodiscard]] bool BeginStopFade(bool detach_dsp = false, bool preserve_archive = false);
     [[nodiscard]] bool StopFadePending() const noexcept {
         return stop_fade_pending_.load(std::memory_order_acquire);
     }
@@ -234,7 +321,15 @@ public:
     }
     void SetTtpCommModule(HMODULE module) noexcept { ttpcomm_module_ = module; }
     void SetDspParentWindow(HWND window);
+    // Wake the window thread after the worker has released its source/output.
+    // The message is a request to inspect current state, not an EOF command.
+    void SetStateNotification(HWND window, UINT message);
+    void SetDspStorageDirectory(const std::filesystem::path& directory);
+    [[nodiscard]] bool ConfigureDsp(const std::filesystem::path& module);
+    [[nodiscard]] bool IsDspActive(const std::filesystem::path& module) const;
+    [[nodiscard]] std::vector<HWND> DspWindows() const;
     void SetVolume(float volume);
+    [[nodiscard]] float Volume() const;
     void SetBalance(int balance);
     void SetEqualizer(int profile, int surround,
                       const std::array<int, 11>& values);
@@ -242,7 +337,7 @@ public:
     [[nodiscard]] static bool IsRecoveredFormatPath(const std::filesystem::path& path);
     [[nodiscard]] static bool IsNetworkMediaLocation(
         const std::filesystem::path& path) noexcept;
-    [[nodiscard]] PlaybackState State() const noexcept { return state_.load(); }
+    [[nodiscard]] PlaybackState State() const noexcept;
     // Read position and its seek generation together: even a one-millisecond
     // seek must be distinguishable from an ordinary output-clock refresh.
     [[nodiscard]] PlaybackClockSnapshot ClockSnapshot() const;
@@ -257,31 +352,40 @@ public:
     [[nodiscard]] std::chrono::milliseconds Duration() const noexcept {
         return std::chrono::milliseconds(duration_ms_.load());
     }
+    [[nodiscard]] int DownloadedPercent() const noexcept;
     [[nodiscard]] std::wstring LastError() const;
     [[nodiscard]] HRESULT LastErrorResult() const;
     // Successful fallback is intentionally separate from LastError: choosing
     // an unavailable/unsupported legacy backend must not make playback look
     // failed, but callers and diagnostic probes still need an audit trail.
     [[nodiscard]] std::wstring LastDiagnostic() const;
+    [[nodiscard]] std::wstring SignalPathDescription() const;
     [[nodiscard]] AudioFormat Format() const;
     [[nodiscard]] AudioMetadata Metadata() const;
+    [[nodiscard]] uint64_t MetadataRevision() const noexcept { return metadata_revision_.load(); }
     // nullopt: no matching live source, caller may open a metadata reader.
     // A live-source failure must not retry through a conflicting file handle.
     std::optional<HRESULT> WriteCurrentLyrics(const std::filesystem::path& path,
                                             int subtrack, std::wstring_view text);
+    [[nodiscard]] std::optional<AudioMetadata> CurrentMetadata(
+        const std::filesystem::path& path, int subtrack) const;
+    [[nodiscard]] std::vector<LyricSaveFailure> TakeLyricSaveFailures();
     [[nodiscard]] VisualizationSamples Visualization() const;
+    [[nodiscard]] ExtendedVisualizationSamples ExtendedVisualization() const;
 
 private:
     friend struct ttplayer::testing::ProgressSeekAccess;
     friend struct ttplayer::testing::MidiPlaybackAccess;
-    enum class Backend { none, wave_out, direct_sound, kernel_streaming, asio, midi };
+    enum class Backend { none, wave_out, direct_sound, kernel_streaming, asio, midi, wasapi };
     enum class FadeCompletion { none, pause, seek, seek_resume, stop };
     struct SeekRequest {
         int64_t position_ms{-1};
         uint64_t revision{};
     };
-    void PlaybackWorker(std::filesystem::path path, int subtrack);
-    void WaveOutWorker(const std::filesystem::path& path, int subtrack);
+    void PlaybackWorker(std::filesystem::path path, int subtrack,
+                        std::shared_ptr<ArchivePlaybackSession> archive = {});
+    void WaveOutWorker(const std::filesystem::path& path, int subtrack,
+                       std::shared_ptr<ArchivePlaybackSession> archive = {});
     struct LyricWriteRequest {
         std::wstring text;
         HRESULT result{E_PENDING};
@@ -290,6 +394,10 @@ private:
     };
     struct LyricSourceRegistration {
         AudioEngine& owner;
+        DecodedAudioSource& source;
+        std::filesystem::path path;
+        int subtrack{};
+        std::filesystem::path recovery_folder;
         ~LyricSourceRegistration();
     };
     void ProcessLyricWrite(DecodedAudioSource& source);
@@ -310,7 +418,8 @@ private:
                          int64_t seek_target_ms = -1);
     void FadeWorker(std::stop_token stop_token);
     void UpdateTrackFade(int64_t position_ms);
-    void PublishVisualization(VisualizationSamples samples);
+    void PublishVisualization(VisualizationSamples samples,
+                              ExtendedVisualizationSamples extended);
     void ClearVisualization();
     void RecordDiagnostic(std::wstring message);
     void SetError(std::wstring message, HRESULT result = E_FAIL);
@@ -318,25 +427,37 @@ private:
     std::atomic<PlaybackState> state_{PlaybackState::stopped};
     std::atomic<int64_t> position_ms_{};
     std::atomic<int64_t> duration_ms_{};
+    std::atomic<int> downloaded_percent_{-1};
     std::atomic<int64_t> seek_request_ms_{-1};
     std::atomic<int64_t> pending_seek_position_ms_{-1};
     uint64_t seek_revision_{}; // guarded by mutex_; also invalidates stale ACKs
+    int64_t opening_seek_ms_{-1}; // one-shot seek after an asynchronous open
+    bool opening_paused_{}; // guarded by mutex_
     std::atomic<bool> stop_requested_{true};
     mutable std::mutex mutex_;
+    HWND state_notification_window_{};
+    UINT state_notification_message_{};
     std::condition_variable lyric_write_condition_;
     std::shared_ptr<LyricWriteRequest> lyric_write_request_;
     std::filesystem::path lyric_source_path_;
     int lyric_source_subtrack_{};
+    std::optional<std::wstring> accepted_lyric_text_;
+    std::vector<LyricSaveFailure> lyric_save_failures_;
     std::condition_variable open_condition_;
     std::condition_variable fade_condition_;
     bool open_complete_{};
     std::wstring error_;
     HRESULT error_result_{S_OK};
     std::wstring diagnostic_;
+    std::wstring signal_path_;
+    std::atomic<PcmPlaybackMode> active_pcm_mode_{PcmPlaybackMode::compatible};
     AudioFormat format_{};
     AudioMetadata metadata_{};
+    std::shared_ptr<ArchivePlaybackSession> archive_session_, archive_handoff_;
+    std::atomic<uint64_t> metadata_revision_{};
     mutable std::mutex visualization_mutex_;
     VisualizationSamples visualization_{};
+    ExtendedVisualizationSamples extended_visualization_{};
     PlaybackOptions options_{};
     std::atomic<uint64_t> processor_revision_{};
     std::atomic<Backend> backend_{Backend::none};

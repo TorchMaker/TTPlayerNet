@@ -1,4 +1,7 @@
+#include <ttpcomm/client.h>
+#include <ttpcomm/runtime_pcm.h>
 #include "ttplayer/i18n/i18n.h"
+#include "ttplayer/audio/legacy_equalizer.h"
 #include "options_buttons.h"
 #include "ttplayer/ui/wtl_dialogs.h"
 #include "ttplayer/platform/optional_windows_api.h"
@@ -12,6 +15,7 @@
 #include "ttplayer/audio/file_encoder.h"
 #include "ttplayer/audio/cue_sheet.h"
 #include "ttplayer/audio/pcm_output_transform.h"
+#include "ttplayer/audio/pcm_effects.h"
 #include "ttplayer/audio/replay_gain_scanner.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/plugins/plugin_manager.h"
@@ -23,6 +27,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <map>
 #include <cwchar>
 #include <limits>
 #include <memory>
@@ -44,6 +49,7 @@ constexpr UINT kConvertProgressDialog = 221;
 constexpr int kScanList = 0x428;
 constexpr int kScanStatus = 0x41c;
 constexpr int kScanButton = 0x88b;
+constexpr int kScanConcurrency = 0xe960;
 constexpr UINT kScanRefresh = WM_APP + 0x2a0;
 constexpr UINT kConvertComplete = WM_APP + 0x2a1;
 constexpr UINT kConvertRowComplete = WM_APP + 0x2a2;
@@ -72,26 +78,9 @@ constexpr int kConvertSaveMode = 0x411;
 constexpr int kConvertAddToPlaylist = 0x7e1;
 constexpr int kConvertAddNumber = 0x89f;
 
-WORD OfflinePcmTag(const WAVEFORMATEX& format) noexcept {
-    if (format.wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
-        format.cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
-        return format.wFormatTag;
-    const auto& extended =
-        reinterpret_cast<const WAVEFORMATEXTENSIBLE&>(format);
-    static constexpr std::array<BYTE, 8> wave_tail{
-        0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
-    if (extended.SubFormat.Data2 != 0 ||
-        extended.SubFormat.Data3 != 0x0010 ||
-        !std::equal(wave_tail.begin(), wave_tail.end(),
-                    extended.SubFormat.Data4))
-        return format.wFormatTag;
-    if (extended.SubFormat.Data1 == WAVE_FORMAT_PCM ||
-        extended.SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT)
-        return static_cast<WORD>(extended.SubFormat.Data1);
-    return format.wFormatTag;
-}
 
-enum class RowState { waiting, scanning, completed, skipped, error };
+
+enum class RowState { waiting, scanning, writing, completed, skipped, cancelled, error };
 
 struct ScanDialogState {
     HMODULE resources{};
@@ -102,12 +91,34 @@ struct ScanDialogState {
     std::vector<RowState> rows;
     std::vector<std::wstring> diagnostics;
     std::mutex mutex;
-    std::atomic_size_t active{};
-    std::atomic_uint progress_percent{};
+    std::condition_variable condition;
+    bool paused{};
+    bool closing{}; // UI thread only; retain the singleton until the worker exits.
+    std::wstring pause_text, resume_text;
+    std::thread worker;
+    size_t active_jobs{}; // protected with rows by mutex
+    std::vector<unsigned> progress_percent;
+    std::atomic_uint concurrency{2};
+    std::function<void(unsigned)> concurrency_changed;
     std::atomic_bool finished{};
+    std::atomic_bool refresh_pending{};
     std::atomic_bool had_error{};
     std::atomic<HWND> dialog{};
     std::stop_source cancellation;
+
+    bool Checkpoint() {
+        std::unique_lock lock(mutex);
+        condition.wait(lock, [this] {
+            return !paused || cancellation.stop_requested();
+        });
+        return !cancellation.stop_requested();
+    }
+
+    void Cancel() {
+        cancellation.request_stop();
+        { const std::scoped_lock lock(mutex); paused = false; }
+        condition.notify_all();
+    }
 
     ~ScanDialogState() {
         if (ttpcomm) FreeLibrary(ttpcomm);
@@ -117,6 +128,7 @@ struct ScanDialogState {
 using ScanDialogLifetime = std::shared_ptr<ScanDialogState>;
 
 HWND g_scan_dialog{};
+std::weak_ptr<ScanDialogState> g_scan_lifetime;
 
 std::wstring LoadText(HMODULE module, UINT identifier) {
     return i18n::ResourceText(module, identifier);
@@ -181,6 +193,7 @@ HMODULE RetainModule(HMODULE module) noexcept {
 void PostScanRefresh(ScanDialogState& state, bool completed = false) noexcept {
     const HWND dialog = state.dialog.load(std::memory_order_acquire);
     if (dialog) {
+        if (!completed && state.refresh_pending.exchange(true)) return;
         // Carry the state identity so a stale post cannot mutate a newer scan
         // dialog if Windows recycles the old HWND after an early close.
         PostMessageW(dialog, kScanRefresh,
@@ -232,17 +245,23 @@ void RefreshDialog(HWND dialog, ScanDialogState& state) {
     auto statuses = Split(LoadText(state.resources, 0x8160));
     while (statuses.size() < 3) statuses.emplace_back();
     std::vector<RowState> rows;
+    std::vector<unsigned> progress;
+    size_t active{};
     {
         const std::scoped_lock lock(state.mutex);
         rows = state.rows;
+        progress = state.progress_percent;
+        active = state.active_jobs;
     }
     if (list) {
         for (size_t index{}; index < rows.size(); ++index) {
             std::wstring text;
             switch (rows[index]) {
             case RowState::scanning:
-                text = std::to_wstring(state.progress_percent.load()) + L"%";
+                text = std::to_wstring(progress[index]) + L"%";
                 break;
+            case RowState::writing: text = i18n::Text(L"正在保存"); break;
+            case RowState::cancelled: text = i18n::Text(L"已取消"); break;
             case RowState::completed: text = statuses[0]; break;
             case RowState::skipped: text = statuses[1]; break;
             case RowState::error: text = statuses[2]; break;
@@ -251,11 +270,12 @@ void RefreshDialog(HWND dialog, ScanDialogState& state) {
             ListView_SetItemText(list, static_cast<int>(index), 1, text.data());
         }
     }
-    const size_t active = state.active.load();
-    const size_t ordinal = state.tracks.empty()
-        ? 0 : std::min(active + 1, state.tracks.size());
-    auto status = FormatProgress(
-        state.resources, 0x8162, ordinal, state.tracks.size());
+    size_t completed{};
+    for (const auto row : rows)
+        if (row != RowState::waiting && row != RowState::scanning && row != RowState::writing)
+            ++completed;
+    auto status = i18n::Text(L"已处理") + L" " + std::to_wstring(completed) + L" / " +
+        std::to_wstring(rows.size()) + L"   " + i18n::Text(L"进行中") + L" " + std::to_wstring(active);
     SetDlgItemTextW(dialog, kScanStatus, status.c_str());
     if (state.finished.load()) {
         SetDlgItemTextW(dialog, kScanButton,
@@ -263,54 +283,195 @@ void RefreshDialog(HWND dialog, ScanDialogState& state) {
     }
 }
 
-void RunScan(ScanDialogLifetime lifetime, std::stop_token stop) {
-    auto* state = lifetime.get();
-    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    for (size_t index{}; index < state->tracks.size(); ++index) {
-        if (stop.stop_requested()) break;
-        state->active.store(index);
-        state->progress_percent.store(0);
-        {
-            const std::scoped_lock lock(state->mutex);
-            state->rows[index] = RowState::scanning;
-        }
-        PostScanRefresh(*state);
+// Coalesce repeated playlist references, but not distinct hard-link names:
+// a tag writer may replace one pathname and thereby split the hard link.
+std::wstring ScanTrackKey(const playlist::Track& track) {
+    std::error_code error;
+    auto key = std::filesystem::absolute(track.path, error).lexically_normal().wstring();
+    if (error) key = track.path.wstring();
+    CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
+    return key + L"|" + std::to_wstring(track.subtrack);
+}
 
+void RunScan(ScanDialogLifetime lifetime, std::stop_token stop) {
+    auto& state = *lifetime;
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    struct Job {
+        std::vector<size_t> rows;
         audio::ReplayGainScanResult result;
-        if (state->tracks[index].subtrack != 0) {
-            result.status = audio::ReplayGainScanStatus::unsupported;
-            result.result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-            result.diagnostic = L"CUE sub-track ReplayGain scan requires the "
-                                L"unrecovered segmented writer path";
-        } else {
-            result = audio::ScanReplayGainTrack(
-                *state->library, state->ttpcomm, state->tracks[index].path,
-                state->skip_existing, stop,
-                [state](std::uint64_t current, std::uint64_t total) {
-                    if (total) state->progress_percent.store(
-                        static_cast<unsigned>(std::min<std::uint64_t>(
-                            current * 100U / total, 100U)));
-                });
+        bool committed{};
+    };
+    std::vector<Job> jobs;
+    std::vector<size_t> pending;
+    std::unique_ptr<audio::ReplayGainScanConcurrency> policy;
+    std::vector<std::thread> workers;
+    size_t next{}, alive{};
+    const auto finish_row = [&](const Job& job, RowState row) {
+        for (auto index : job.rows) {
+            state.rows[index] = row;
+            if (row != RowState::scanning && row != RowState::writing)
+                state.diagnostics[index] = job.result.diagnostic;
         }
-        {
-            const std::scoped_lock lock(state->mutex);
-            state->diagnostics[index] = std::move(result.diagnostic);
-            if (result.status == audio::ReplayGainScanStatus::completed)
-                state->rows[index] = RowState::completed;
-            else if (result.status == audio::ReplayGainScanStatus::skipped ||
-                     result.status == audio::ReplayGainScanStatus::cancelled)
-                state->rows[index] = RowState::skipped;
-            else {
-                state->rows[index] = RowState::error;
-                state->had_error.store(true);
+    };
+    try {
+        std::map<std::wstring, size_t> unique;
+        for (size_t index{}; index < state.tracks.size() && !stop.stop_requested(); ++index) {
+            const auto [entry, inserted] = unique.emplace(ScanTrackKey(state.tracks[index]), jobs.size());
+            if (inserted) jobs.emplace_back();
+            jobs[entry->second].rows.push_back(index);
+        }
+        policy = std::make_unique<audio::ReplayGainScanConcurrency>(*state.library, state.ttpcomm);
+        pending.reserve(4);
+        const auto run = [&] {
+            const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            try { for (;;) {
+                size_t job_index;
+                {
+                    std::unique_lock lock(state.mutex);
+                    state.condition.wait(lock, [&] {
+                        return stop.stop_requested() || next == jobs.size() ||
+                            (!state.paused && state.active_jobs < state.concurrency.load());
+                    });
+                    if (stop.stop_requested() || next == jobs.size()) break;
+                    job_index = next++;
+                    ++state.active_jobs;
+                    finish_row(jobs[job_index], RowState::scanning);
+                }
+                PostScanRefresh(state);
+                auto& job = jobs[job_index];
+                const auto& track = state.tracks[job.rows.front()];
+                try {
+                    job.result = audio::AnalyzeReplayGainTrack(*state.library, state.ttpcomm,
+                        track.path, state.skip_existing, stop,
+                        [&](std::uint64_t current, std::uint64_t total) {
+                            if (!total) return;
+                            const auto percent = static_cast<unsigned>(std::min(100.0,
+                                static_cast<double>(current) * 100.0 / static_cast<double>(total)));
+                            bool changed{};
+                            {
+                                const std::scoped_lock lock(state.mutex);
+                                for (auto row : job.rows) {
+                                    changed |= state.progress_percent[row] != percent;
+                                    state.progress_percent[row] = percent;
+                                }
+                            }
+                            if (changed) PostScanRefresh(state);
+                        }, track.subtrack, [&] { return state.Checkpoint(); }, policy.get());
+                } catch (...) {
+                    job.result.status = audio::ReplayGainScanStatus::decode_error;
+                    job.result.result = E_FAIL;
+                }
+                {
+                    std::unique_lock lock(state.mutex);
+                    pending.push_back(job_index);
+                    state.condition.notify_all();
+                    // At most one pending measurement per worker; no unbounded
+                    // writer queue even for huge selections and slow plug-ins.
+                    state.condition.wait(lock, [&] { return job.committed || stop.stop_requested(); });
+                }
+            }
+            } catch (...) { state.had_error.store(true); state.Cancel(); }
+            if (SUCCEEDED(com)) CoUninitialize();
+            { const std::scoped_lock lock(state.mutex); --alive; }
+            state.condition.notify_all();
+        };
+        workers.reserve(4);
+        for (unsigned lane{}; lane < std::min<size_t>(4, jobs.size()); ++lane) {
+            { const std::scoped_lock lock(state.mutex); ++alive; }
+            try { workers.emplace_back(run); }
+            catch (...) {
+                { const std::scoped_lock lock(state.mutex); --alive; }
+                if (workers.empty()) throw;
+                break; // Continue with the workers that could be created.
             }
         }
-        state->progress_percent.store(100);
-        PostScanRefresh(*state);
+        // The coordinator is the batch writer. Playback's writer uses the same
+        // audio-layer gate, before loading a CUE snapshot or opening metadata.
+        for (;;) {
+            size_t index;
+            {
+                std::unique_lock lock(state.mutex);
+                state.condition.wait(lock, [&] { return !pending.empty() || alive == 0; });
+                if (pending.empty()) break;
+                index = pending.front(); pending.erase(pending.begin());
+                if (jobs[index].result.status == audio::ReplayGainScanStatus::completed)
+                    finish_row(jobs[index], RowState::writing);
+            }
+            PostScanRefresh(state);
+            auto& job = jobs[index];
+            const auto& track = state.tracks[job.rows.front()];
+            if (job.result.status == audio::ReplayGainScanStatus::completed) {
+                try {
+                    job.result = audio::CommitReplayGainTrack(*state.library, track.path, job.result,
+                        audio::ReplayGainCommitPolicy::manual_scan_clear_read_only, stop, track.subtrack,
+                        [&] { return state.Checkpoint(); });
+                } catch (...) {
+                    job.result.status = audio::ReplayGainScanStatus::write_error;
+                    job.result.result = E_FAIL;
+                }
+            }
+            RowState row = RowState::error;
+            switch (job.result.status) {
+            case audio::ReplayGainScanStatus::completed: row = RowState::completed; break;
+            case audio::ReplayGainScanStatus::skipped: row = RowState::skipped; break;
+            case audio::ReplayGainScanStatus::cancelled: row = RowState::cancelled; break;
+            default: state.had_error.store(true); break;
+            }
+            {
+                const std::scoped_lock lock(state.mutex);
+                finish_row(job, row); job.committed = true;
+                --state.active_jobs;
+            }
+            state.condition.notify_all();
+            PostScanRefresh(state);
+        }
+        // Join before policy/jobs (captured by reference) leave their scope.
+        for (auto& worker : workers) worker.join();
+    } catch (...) {
+        state.had_error.store(true);
+        state.Cancel();
+        for (auto& worker : workers) if (worker.joinable()) worker.join();
+    }
+    {
+        const std::scoped_lock lock(state.mutex);
+        state.active_jobs = 0;
+        for (auto& row : state.rows)
+            if (row == RowState::waiting || row == RowState::scanning || row == RowState::writing)
+                row = state.had_error.load() ? RowState::error : RowState::cancelled;
     }
     if (SUCCEEDED(initialized)) CoUninitialize();
-    state->finished.store(true);
-    PostScanRefresh(*state, true);
+    state.finished.store(true);
+    PostScanRefresh(state, true);
+}
+
+void AddScanConcurrencyControl(HWND dialog, ScanDialogState& state) {
+    RECT list{}; GetWindowRect(GetDlgItem(dialog, kScanList), &list);
+    MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT*>(&list), 2);
+    RECT units{0, 0, 160, 18}; i18n::MapDialogRect(dialog, &units);
+    const int row_height = units.bottom;
+    for (HWND child = GetWindow(dialog, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT rect{}; GetWindowRect(child, &rect);
+        MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT*>(&rect), 2);
+        if (rect.top >= list.bottom)
+            SetWindowPos(child, nullptr, rect.left, rect.top + row_height, 0, 0,
+                         SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    RECT window{}; GetWindowRect(dialog, &window);
+    SetWindowPos(dialog, nullptr, 0, 0, window.right - window.left,
+                 window.bottom - window.top + row_height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const HWND label = CreateWindowExW(0, L"STATIC", i18n::Literal(L"同时扫描："), WS_CHILD | WS_VISIBLE,
+        list.left, list.bottom + 6, units.right / 3, row_height, dialog, nullptr, nullptr, nullptr);
+    const HWND combo = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        CBS_DROPDOWNLIST | WS_VSCROLL, list.left + units.right / 3, list.bottom + 3,
+        units.right / 3, row_height * 7, dialog,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kScanConcurrency)), nullptr, nullptr);
+    const WPARAM font = SendMessageW(dialog, WM_GETFONT, 0, 0);
+    SendMessageW(label, WM_SETFONT, font, FALSE); SendMessageW(combo, WM_SETFONT, font, FALSE);
+    for (unsigned count = 1; count <= 4; ++count) {
+        const auto text = std::to_wstring(count);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    }
+    SendMessageW(combo, CB_SETCURSEL, state.concurrency.load() - 1, 0);
 }
 
 INT_PTR CALLBACK ScanDialogProc(HWND dialog, UINT message,
@@ -329,14 +490,20 @@ INT_PTR CALLBACK ScanDialogProc(HWND dialog, UINT message,
         state->dialog.store(dialog, std::memory_order_release);
         state->rows.assign(state->tracks.size(), RowState::waiting);
         state->diagnostics.resize(state->tracks.size());
+        state->progress_percent.resize(state->tracks.size());
+        AddScanConcurrencyControl(dialog, *state);
+        const auto captions = Split(WindowCaption(GetDlgItem(dialog, kScanButton)));
+        state->pause_text = captions.empty() ? L"" : captions[0];
+        state->resume_text = captions.size() > 1 ? captions[1] : state->pause_text;
+        SetDlgItemTextW(dialog, kScanButton, state->pause_text.c_str());
         PopulateList(dialog, *state);
         ShowWindow(dialog, SW_SHOWNORMAL);
         try {
             auto lifetime = *holder;
             const auto stop = state->cancellation.get_token();
-            std::thread([lifetime = std::move(lifetime), stop] {
+            state->worker = std::thread([lifetime = std::move(lifetime), stop] {
                 RunScan(lifetime, stop);
-            }).detach();
+            });
         } catch (...) {
             {
                 const std::scoped_lock lock(state->mutex);
@@ -352,30 +519,78 @@ INT_PTR CALLBACK ScanDialogProc(HWND dialog, UINT message,
     case kScanRefresh:
         if (!state || reinterpret_cast<ScanDialogState*>(wparam) != state)
             return TRUE;
+        state->refresh_pending.store(false);
         RefreshDialog(dialog, *state);
         if (lparam == 1 && state->finished.load() &&
-            !state->had_error.load()) {
+            (state->closing || !state->had_error.load())) {
             // FUN_004A58F3 closes the modeless dialog automatically after the
             // last successful row, but retains it when any row is in error.
             PostMessageW(dialog, WM_CLOSE, 0, 0);
         }
         return TRUE;
     case WM_COMMAND:
-        if (LOWORD(wparam) == IDCANCEL || LOWORD(wparam) == kScanButton) {
-            DestroyWindow(dialog);
+        if (LOWORD(wparam) == kScanConcurrency && HIWORD(wparam) == CBN_SELCHANGE && state && !state->closing) {
+            const auto selected = SendDlgItemMessageW(dialog, kScanConcurrency, CB_GETCURSEL, 0, 0);
+            if (selected >= 0 && selected < 4) {
+                const auto count = static_cast<unsigned>(selected + 1);
+                state->concurrency.store(count);
+                if (state->concurrency_changed) state->concurrency_changed(count);
+                state->condition.notify_all();
+            }
+            return TRUE;
+        }
+        if (LOWORD(wparam) == IDCANCEL) {
+            SendMessageW(dialog, WM_CLOSE, 0, 0);
+            return TRUE;
+        }
+        if (LOWORD(wparam) == kScanButton && state && !state->closing) {
+            if (state->finished.load()) {
+                SendMessageW(dialog, WM_CLOSE, 0, 0);
+            } else {
+                bool paused;
+                {
+                    const std::scoped_lock lock(state->mutex);
+                    state->paused = !state->paused;
+                    paused = state->paused;
+                }
+                state->condition.notify_all();
+                SetDlgItemTextW(dialog, kScanButton,
+                    (paused ? state->resume_text : state->pause_text).c_str());
+            }
             return TRUE;
         }
         break;
     case WM_CLOSE:
-        if (state) state->cancellation.request_stop();
+        if (state) {
+            state->closing = true;
+            state->Cancel();
+            if (!state->finished.load()) {
+                EnableWindow(GetDlgItem(dialog, kScanButton), FALSE);
+                EnableWindow(GetDlgItem(dialog, kScanConcurrency), FALSE);
+                EnableWindow(GetDlgItem(dialog, IDCANCEL), FALSE);
+                // Keep pumping messages until the reader and writer have
+                // closed. Reopening brings this same cancelling dialog up.
+                return TRUE;
+            }
+        }
         DestroyWindow(dialog);
         return TRUE;
     case WM_DESTROY:
         if (state) {
-            state->cancellation.request_stop();
+            state->Cancel();
             HWND expected = dialog;
             state->dialog.compare_exchange_strong(
                 expected, nullptr, std::memory_order_acq_rel);
+            if (state->worker.joinable()) {
+                if (state->finished.load()) state->worker.join();
+                else {
+                    // Forced owner destruction must not hang on a broken
+                    // input plugin. The worker retains its DLLs/library, has
+                    // no UI resource dependency and exits at its checkpoint.
+                    // g_scan_lifetime prevents a second scan in the interim.
+                    state->worker.detach();
+                }
+            }
         }
         if (g_scan_dialog == dialog) g_scan_dialog = nullptr;
         return TRUE;
@@ -397,6 +612,7 @@ struct ConvertProgressState {
     std::vector<std::filesystem::path> destinations;
     settings::ConvertSettings settings;
     settings::EqualizerSettings equalizer;
+    audio::PlaybackOptions source_options;
     std::mutex mutex;
     std::vector<PlaylistConversionResult> results;
     std::stop_source cancellation;
@@ -550,278 +766,24 @@ private:
 
 class OfflinePcmProcessor {
 public:
-    OfflinePcmProcessor(const WAVEFORMATEX& format, HMODULE ttpcomm) noexcept
-        : format_(format), ttpcomm_(ttpcomm) {
-        // Preserve the session's complete extensible format for the shared
-        // output transform, while this recovered double-PCM stage works on
-        // its explicitly identified PCM/IEEE-float sample representation.
-        format_.wFormatTag = OfflinePcmTag(format);
-    }
-
-    OfflinePcmProcessor(const OfflinePcmProcessor&) = delete;
-    OfflinePcmProcessor& operator=(const OfflinePcmProcessor&) = delete;
-
-    ~OfflinePcmProcessor() {
-#if defined(_MSC_VER) && defined(_M_IX86)
-        if (surround_) Destroy(surround_);
-        if (equalizer_) Destroy(equalizer_);
-#endif
-    }
-
-    __declspec(noinline) bool Open(
-        const settings::ConvertSettings& convert,
-        const settings::EqualizerSettings* equalizer,
+    OfflinePcmProcessor(const WAVEFORMATEX& format, HMODULE module) : effects_(format,module) {}
+    bool Open(const settings::ConvertSettings& convert, const settings::EqualizerSettings* equalizer,
         const audio::AudioMetadata& metadata) {
-        if (convert.replay_gain) {
-            // FUN_004B107E/FUN_004B180A activate per-track ReplayGain only
-            // when both values form a complete tag pair.
-            if (metadata.replay_gain_db && metadata.replay_peak &&
-                std::isfinite(*metadata.replay_gain_db) &&
-                std::isfinite(*metadata.replay_peak) &&
-                *metadata.replay_peak > 0.0)
-                replay_gain_ = std::pow(
-                    10.0, *metadata.replay_gain_db * 0.05);
-        }
-
-#if defined(_MSC_VER) && defined(_M_IX86)
-        if (convert.equalizer && equalizer && equalizer->profile != -2) {
-            if (!ttpcomm_) return Fail(i18n::Literal(L"ttpcomm equalizer is unavailable"));
-            equalizer_ = Create(ttpcomm_, 103);
-            if (!equalizer_ || !EqInitialize(
-                    equalizer_, format_.nSamplesPerSec, format_.nChannels) ||
-                !EqSet(equalizer_, equalizer->current.data()))
-                return Fail(i18n::Literal(L"ttpcomm equalizer initialization failed"));
-        }
-        if (convert.surround && equalizer && equalizer->surround != 0) {
-            if (!ttpcomm_) return Fail(i18n::Literal(L"ttpcomm surround is unavailable"));
-            surround_ = Create(ttpcomm_, 104);
-            if (!surround_ || !SurroundInitialize(
-                    surround_, format_.nSamplesPerSec, format_.nChannels,
-                    std::clamp(equalizer->surround, 0, 16)))
-                return Fail(i18n::Literal(L"ttpcomm surround initialization failed"));
-        }
-#else
-        if ((convert.equalizer && equalizer && equalizer->profile != -2) ||
-            (convert.surround && equalizer && equalizer->surround != 0))
-            return Fail(i18n::Literal(L"legacy PCM processors require the x86 host"));
-#endif
-        return true;
+        audio::PcmEffectSettings settings;
+        settings.gain=audio::PcmReplayGain(convert.replay_gain!=0,metadata.replay_gain_db,metadata.replay_peak);
+        settings.equalizer=convert.equalizer && equalizer && equalizer->profile!=-2;
+        if(equalizer){settings.bands=equalizer->current;settings.surround=convert.surround ? std::clamp(equalizer->surround,0,16) : 0;}
+        return effects_.Update(settings);
     }
-
-    bool Process(std::vector<std::byte>& bytes) {
-        if (!Active() || bytes.empty()) return true;
-        std::vector<double> samples;
-        if (!Decode(bytes, samples))
-            return Fail(i18n::Literal(L"offline processor does not support the PCM format"));
-
-        if (replay_gain_ != 1.0) {
-            for (auto& sample : samples) {
-                double value = sample * replay_gain_;
-                if (value > 0.5)
-                    value = (std::tan((value - 0.5) * 2.0) + 1.0) * 0.5;
-                else if (value < -0.5)
-                    value = std::tan((value + 0.5) * 2.0) * 0.5 - 0.5;
-                sample = value;
-            }
-        }
-#if defined(_MSC_VER) && defined(_M_IX86)
-        int count = static_cast<int>(std::min<size_t>(
-            samples.size(), static_cast<size_t>(
-                std::numeric_limits<int>::max())));
-        if (equalizer_ && !EqProcess(equalizer_, samples.data(), &count))
-            return Fail(i18n::Literal(L"ttpcomm equalizer processing failed"));
-        count = std::clamp(count, 0, static_cast<int>(samples.size()));
-        if (format_.nChannels > 1)
-            count -= count % format_.nChannels;
-        samples.resize(static_cast<size_t>(count));
-        if (surround_ && !SurroundProcess(
-                surround_, samples.data(), count))
-            return Fail(i18n::Literal(L"ttpcomm surround processing failed"));
-#endif
-        if (!Encode(samples, bytes))
-            return Fail(i18n::Literal(L"offline processor could not encode PCM"));
-        return true;
+    bool Process(std::vector<std::byte>& bytes, std::vector<double>* precise=nullptr) {
+        if(!precise && !effects_.Active())return true;
+        std::vector<double> samples;if(!effects_.Process(bytes,samples))return false;
+        if(precise){*precise=std::move(samples);return true;}
+        return effects_.Encode(samples,bytes);
     }
-
-    [[nodiscard]] const std::wstring& Error() const noexcept { return error_; }
-
+    const std::wstring& Error() const noexcept{return effects_.Error();}
 private:
-    [[nodiscard]] bool Active() const noexcept {
-        return replay_gain_ != 1.0 || equalizer_ || surround_;
-    }
-
-    bool Fail(std::wstring message) {
-        error_ = std::move(message);
-        return false;
-    }
-
-    bool Decode(const std::vector<std::byte>& bytes,
-                std::vector<double>& samples) const {
-        const size_t sample_bytes = (format_.wBitsPerSample + 7U) / 8U;
-        if (sample_bytes == 0 || bytes.size() % sample_bytes != 0)
-            return false;
-        samples.resize(bytes.size() / sample_bytes);
-        const auto* input = reinterpret_cast<const unsigned char*>(bytes.data());
-        for (size_t index{}; index < samples.size(); ++index) {
-            const auto* value = input + index * sample_bytes;
-            if (format_.wFormatTag == 3 && format_.wBitsPerSample == 32) {
-                float number{};
-                std::memcpy(&number, value, sizeof(number));
-                samples[index] = static_cast<double>(number) * 0.5;
-            } else if (format_.wFormatTag == 3 &&
-                       format_.wBitsPerSample == 64) {
-                double number{};
-                std::memcpy(&number, value, sizeof(number));
-                samples[index] = number * 0.5;
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 8) {
-                samples[index] = (static_cast<int>(value[0]) - 128) / 256.0;
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 16) {
-                std::int16_t number{};
-                std::memcpy(&number, value, sizeof(number));
-                samples[index] = number / 65536.0;
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 24) {
-                std::int32_t number = static_cast<std::int32_t>(value[0]) |
-                    (static_cast<std::int32_t>(value[1]) << 8) |
-                    (static_cast<std::int32_t>(value[2]) << 16);
-                if ((number & 0x800000) != 0) number |= ~0xffffff;
-                samples[index] = number / 16777216.0;
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 32) {
-                std::int32_t number{};
-                std::memcpy(&number, value, sizeof(number));
-                samples[index] = number / 4294967296.0;
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool Encode(const std::vector<double>& samples,
-                std::vector<std::byte>& bytes) const {
-        const size_t sample_bytes = (format_.wBitsPerSample + 7U) / 8U;
-        bytes.resize(samples.size() * sample_bytes);
-        auto* output = reinterpret_cast<unsigned char*>(bytes.data());
-        for (size_t index{}; index < samples.size(); ++index) {
-            auto* value = output + index * sample_bytes;
-            const double sample = std::isfinite(samples[index])
-                ? samples[index] : 0.0;
-            if (format_.wFormatTag == 3 && format_.wBitsPerSample == 32) {
-                const float number = static_cast<float>(std::clamp(
-                    sample * 2.0, -1.0, 1.0));
-                std::memcpy(value, &number, sizeof(number));
-            } else if (format_.wFormatTag == 3 &&
-                       format_.wBitsPerSample == 64) {
-                const double number = std::clamp(sample * 2.0, -1.0, 1.0);
-                std::memcpy(value, &number, sizeof(number));
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 8) {
-                const int number = static_cast<int>(std::llround(
-                    std::clamp(sample, -0.5, 127.0 / 256.0) * 256.0 + 128.0));
-                value[0] = static_cast<unsigned char>(
-                    std::clamp(number, 0, 255));
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 16) {
-                const auto number = static_cast<std::int16_t>(std::llround(
-                    std::clamp(sample, -0.5, 32767.0 / 65536.0) * 65536.0));
-                std::memcpy(value, &number, sizeof(number));
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 24) {
-                const auto number = static_cast<std::int32_t>(std::llround(
-                    std::clamp(sample, -0.5, 8388607.0 / 16777216.0) *
-                    16777216.0));
-                value[0] = static_cast<unsigned char>(number);
-                value[1] = static_cast<unsigned char>(number >> 8);
-                value[2] = static_cast<unsigned char>(number >> 16);
-            } else if (format_.wFormatTag == WAVE_FORMAT_PCM &&
-                       format_.wBitsPerSample == 32) {
-                const auto number = static_cast<std::int32_t>(std::llround(
-                    std::clamp(sample, -0.5,
-                               2147483647.0 / 4294967296.0) *
-                    4294967296.0));
-                std::memcpy(value, &number, sizeof(number));
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-#if defined(_MSC_VER) && defined(_M_IX86)
-    static void* Create(HMODULE module, WORD ordinal) noexcept {
-        const auto entry = GetProcAddress(module, MAKEINTRESOURCEA(ordinal));
-        if (!entry) return nullptr;
-        __try {
-            return reinterpret_cast<void* (__cdecl*)()>(entry)();
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-    }
-
-    static void Destroy(void* object) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            reinterpret_cast<void (__thiscall*)(void*, int)>(table[0])(
-                object, 1);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    static bool EqInitialize(void* object, DWORD rate, WORD channels) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            return reinterpret_cast<unsigned char (__thiscall*)(
-                void*, DWORD, WORD)>(table[1])(object, rate, channels) != 0;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    }
-
-    static bool EqSet(void* object, const int* values) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            reinterpret_cast<void (__thiscall*)(void*, const int*)>(
-                table[2])(object, values);
-            return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    }
-
-    static bool EqProcess(void* object, double* samples, int* count) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            reinterpret_cast<void (__thiscall*)(void*, double*, int)>(
-                table[4])(object, samples, *count);
-            reinterpret_cast<void (__thiscall*)(void*, double*, int*)>(
-                table[5])(object, samples, count);
-            return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    }
-
-    static bool SurroundInitialize(void* object, DWORD rate, WORD channels,
-                                   int amount) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            reinterpret_cast<void (__thiscall*)(void*, DWORD, WORD, int)>(
-                table[1])(object, rate, channels, amount);
-            return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    }
-
-    static bool SurroundProcess(void* object, double* samples,
-                                int count) noexcept {
-        __try {
-            auto table = *static_cast<void***>(object);
-            reinterpret_cast<void (__thiscall*)(void*, double*, int)>(
-                table[2])(object, samples, count);
-            return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    }
-#endif
-
-    WAVEFORMATEX format_{};
-    HMODULE ttpcomm_{};
-    double replay_gain_{1.0};
-    void* equalizer_{};
-    void* surround_{};
-    std::wstring error_;
+    audio::PcmSourceEffects effects_;
 };
 
 std::wstring SafeOutputStem(const playlist::Track& track) {
@@ -1191,7 +1153,7 @@ void RunConversion(ConvertLifetime lifetime) {
         try {
             converted = ConvertPlaylistTrack(*state.library,state.tracks[index],
                 state.encoder_index,state.destinations[index],state.settings,state.ttpcomm,
-                &state.equalizer,state.cancellation.get_token(),callbacks);
+                &state.equalizer,state.cancellation.get_token(),callbacks,state.source_options);
         } catch (...) {
             converted.result = E_FAIL;
             converted.diagnostic = i18n::Literal(L"conversion worker exception");
@@ -1544,7 +1506,7 @@ PlaylistConversionResult ConvertPlaylistTrack(
     size_t encoder_index, const std::filesystem::path& destination,
     const settings::ConvertSettings& settings, HMODULE ttpcomm,
     const settings::EqualizerSettings* equalizer, std::stop_token stop,
-    const ConversionCallbacks& callbacks) {
+    const ConversionCallbacks& callbacks, const audio::PlaybackOptions& network_options) {
     PlaylistConversionResult converted;
     converted.destination = destination;
     auto fail = [&](HRESULT error, std::wstring text) {
@@ -1610,11 +1572,14 @@ PlaylistConversionResult ConvertPlaylistTrack(
     if (!checkpoint()) return fail(HRESULT_FROM_WIN32(ERROR_CANCELLED), i18n::Literal(L"conversion cancelled"));
     auto source = audio::CreateDecodedAudioSource(track.path, track.subtrack, &library, ttpcomm);
     if (!source) return fail(E_OUTOFMEMORY, i18n::Literal(L"unable to create decoded audio source"));
-    audio::PlaybackOptions source_options;
+    audio::PlaybackOptions source_options=network_options;
     source_options.file_buffer_bytes = 64 * 1024;
+    source_options.network_canceled=[stop, previous=source_options.network_canceled] {
+        return stop.stop_requested() || (previous && previous());
+    };
     if (!source->Open(track.path, source_options))
-        return fail(!runtime.Available() ? runtime.Result() :
-                    HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), source->Error());
+        return fail(stop.stop_requested() ? HRESULT_FROM_WIN32(ERROR_CANCELLED) :
+                    (!runtime.Available() ? runtime.Result() : source->ErrorResult()), source->Error());
     const WAVEFORMATEX& source_format = source->OutputFormat();
     if (!source_format.nChannels || !source_format.nSamplesPerSec ||
         !source_format.nAvgBytesPerSec || !source_format.nBlockAlign)
@@ -1631,7 +1596,7 @@ PlaylistConversionResult ConvertPlaylistTrack(
         return fail(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), decoded_transform.Error());
     const auto intermediate = decoded_transform.OutputFormat();
     const auto metadata = source->Metadata();
-    OfflinePcmProcessor processors(intermediate, ttpcomm);
+    OfflinePcmProcessor processors(source_format, ttpcomm);
     if (!processors.Open(settings, equalizer, metadata))
         return fail(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), processors.Error());
 
@@ -1639,11 +1604,7 @@ PlaylistConversionResult ConvertPlaylistTrack(
     WAVEFORMATEX output_format = intermediate;
     if (wave || lame) {
         audio::PcmOutputTransformOptions output_options;
-        int bits=settings.output_bits ? settings.output_bits
-                                     : source->DisplayFormat().bits_per_sample;
-        // 004122CD asks the reader (slot 10), not the double-PCM decoder;
-        // unreported/unsupported source depths fall back to 16 bits.
-        if (bits!=8 && bits!=16 && bits!=24 && bits!=32) bits=16;
+        const int bits=audio::ResolveOutputBits(settings.output_bits,source->DisplayFormat().bits_per_sample);
         output_options.output_bits = lame ? 16 : bits;
         if (!quantizer.Open(intermediate, output_options, ttpcomm))
             return fail(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), quantizer.Error());
@@ -1678,13 +1639,16 @@ PlaylistConversionResult ConvertPlaylistTrack(
         }
         bool end{};
         if (!source->Read(64 * 1024, pcm, end)) {
-            result = E_FAIL; converted.diagnostic = source->Error(); break;
+            result = stop.stop_requested() ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : source->ErrorResult();
+            converted.diagnostic = source->Error(); break;
         }
         if (pcm.size() % source_format.nBlockAlign) {
             result = E_UNEXPECTED; converted.diagnostic = i18n::Literal(L"partial decoded PCM frame"); break;
         }
         converted.pcm_bytes += pcm.size();
-        if (!decoded_transform.Process(pcm, transformed, end) || !processors.Process(transformed)) {
+        std::vector<double> processed;
+        if (!processors.Process(pcm, &processed) ||
+            !decoded_transform.ProcessSamples(std::move(processed), transformed, end)) {
             result = E_FAIL;
             converted.diagnostic = processors.Error().empty()
                 ? decoded_transform.Error() : processors.Error();
@@ -1721,7 +1685,7 @@ PlaylistConversionResult ConvertPlaylistTrack(
             if (!entry.name.empty() && !entry.value.empty() &&
                 _wcsnicmp(entry.name.c_str(), L"replaygain_", 11) != 0)
                 tags.push_back({core::WideToUtf8(entry.name), entry.value});
-        const auto written = audio::WriteBuiltinFileInfo(transaction.temporary, {}, tags);
+        const auto written = audio::WriteBuiltinFileInfo(transaction.temporary, source_options.mp3_tags, tags);
         if (FAILED(written.status)) {
             result = written.status; converted.diagnostic = i18n::Literal(L"MP3 metadata write failed");
         }
@@ -1744,7 +1708,7 @@ bool ShowPlaylistConverter(
     const plugins::PluginManager* library, std::vector<playlist::Track> tracks,
     settings::ConvertSettings& settings, const settings::EqualizerSettings& equalizer,
     std::function<void(const std::filesystem::path&)> completed,
-    std::vector<std::wstring> display_titles) {
+    std::vector<std::wstring> display_titles, const audio::PlaybackOptions& source_options) {
     // 00412A8D/00412AB8: one modeless conversion task; reopening raises it.
     if (g_convert_dialog && IsWindow(g_convert_dialog)) {
         ShowWindow(g_convert_dialog,SW_RESTORE);
@@ -1776,6 +1740,7 @@ bool ShowPlaylistConverter(
     state->encoder_index=encoder;
     state->settings=settings;
     state->equalizer=equalizer;
+    state->source_options=source_options;
     state->completed=std::move(completed);
     state->tracks=std::move(tracks);
     state->display_titles=std::move(display_titles);
@@ -1820,12 +1785,15 @@ void ClosePlaylistConverter(HWND owner) {
 bool ShowPlaylistReplayGainScanner(
     HWND owner, HMODULE resources, HMODULE ttpcomm,
     const plugins::PluginManager* library,
-    std::vector<playlist::Track> tracks, bool skip_existing) {
+    std::vector<playlist::Track> tracks, bool skip_existing,
+    unsigned concurrency, std::function<void(unsigned)> concurrency_changed) {
     if (g_scan_dialog && IsWindow(g_scan_dialog)) {
         ShowWindow(g_scan_dialog, SW_RESTORE);
         BringWindowToTop(g_scan_dialog);
         return true;
     }
+    if (auto pending = g_scan_lifetime.lock(); pending && !pending->finished.load())
+        return false;
     if (!owner || !resources || tracks.empty() ||
         !ReplayGainScanCommandAvailable(library, ttpcomm))
         return false;
@@ -1845,7 +1813,10 @@ bool ShowPlaylistReplayGainScanner(
         state->library = retained_library;
         state->tracks = std::move(tracks);
         state->skip_existing = skip_existing;
+        state->concurrency.store(std::clamp(concurrency, 1U, 4U));
+        state->concurrency_changed = std::move(concurrency_changed);
         holder = new ScanDialogLifetime(state);
+        g_scan_lifetime = state;
     } catch (...) {
         if (retained_ttpcomm) FreeLibrary(retained_ttpcomm);
         return false;
@@ -1858,6 +1829,18 @@ bool ShowPlaylistReplayGainScanner(
         return false;
     }
     return true;
+}
+
+bool TranslatePlaylistReplayGainScannerMessage(MSG& message) {
+    return g_scan_dialog && IsWindow(g_scan_dialog) &&
+        (message.hwnd == g_scan_dialog || IsChild(g_scan_dialog, message.hwnd)) &&
+        IsDialogMessageW(g_scan_dialog, &message);
+}
+
+void ClosePlaylistReplayGainScanner(HWND owner) {
+    if (g_scan_dialog && IsWindow(g_scan_dialog) &&
+        GetWindow(g_scan_dialog, GW_OWNER) == owner)
+        SendMessageW(g_scan_dialog, WM_CLOSE, 0, 0);
 }
 
 } // namespace ttplayer::ui

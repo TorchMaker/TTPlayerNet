@@ -1,6 +1,13 @@
 #include "ttplayer/plugins/plugin_manager.h"
+#include <ttpcomm/audio_format_probe_impl.h>
+#include "nero_config_layout.h"
+#include "builtin_mpeg_decoder.h"
+#include "builtin_acm_decoder.h"
+#include "ttplayer/audio/format_probe.h"
+#include "ttplayer/audio/file_mutation.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/core/text.h"
+#include "ttplayer/skin/skin_plugin_api.h"
 
 #include <algorithm>
 #include <array>
@@ -644,6 +651,24 @@ HRESULT InvokeQueryInterface(void* object, REFIID iid, void** result) noexcept {
 #endif
 }
 
+HRESULT InvokeFormatProbe(void* object, const ttp::format::Request* request,
+                          ttp::format::Result* result) noexcept {
+#if defined(_MSC_VER)
+    __try { return static_cast<ttp::format::Probe*>(object)->ProbeFormat(request, result); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+#else
+    return static_cast<ttp::format::Probe*>(object)->ProbeFormat(request, result);
+#endif
+}
+HRESULT InvokeFormatInfo(void* object, ttp::format::Result* result) noexcept {
+#if defined(_MSC_VER)
+    __try { return static_cast<ttp::format::SourceInfo*>(object)->GetFormatInfo(result); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+#else
+    return static_cast<ttp::format::SourceInfo*>(object)->GetFormatInfo(result);
+#endif
+}
+
 HRESULT InvokeMetadataCount(void* metadata, DWORD* count) noexcept {
     auto table = Vtable(metadata);
     if (!table || !table[3] || !count) return E_POINTER;
@@ -952,6 +977,55 @@ bool SafeWideLength(const wchar_t* value, size_t maximum, size_t* length) noexce
 #endif
 }
 
+HRESULT ReadOptionalMetadataValue(void* metadata, const char* name,
+                                  const wchar_t* wide_name, std::wstring& value) {
+    value.clear();
+    wchar_t* allocated{};
+    const HRESULT result = InvokeMetadataValue(metadata, name, &allocated);
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> owner(allocated, CoTaskMemFree);
+    if (SUCCEEDED(result)) {
+        if (!allocated) return S_FALSE;
+        size_t length{};
+        if (!SafeWideLength(allocated, 1024U * 1024U, &length))
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        value.assign(allocated, length);
+        return S_OK;
+    }
+    // The private GetValue contract uses E_INVALIDARG for an absent field.
+    // Keep actual I/O/access failures; MetadataValue() intentionally hides
+    // those for display callers and is unsuitable for write verification.
+    if (result == E_INVALIDARG || result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+        return S_FALSE;
+    if (result != E_FAIL) return result;
+
+    // Some shipped writers return E_FAIL for missing keys. Accept that only
+    // when a complete, current enumeration confirms the key is absent. A Get
+    // implementation can expose additional keys, so successful Get wins above.
+    DWORD count{};
+    const HRESULT counted = InvokeMetadataCount(metadata, &count);
+    if (FAILED(counted)) return counted;
+    if (count > 65536U) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    for (DWORD index = 0; index < count; ++index) {
+        wchar_t* entry_name{};
+        wchar_t* entry_value{};
+        const HRESULT enumerated = InvokeMetadataAt(metadata, index, &entry_name, &entry_value);
+        const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> name_owner(entry_name, CoTaskMemFree);
+        const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> value_owner(entry_value, CoTaskMemFree);
+        if (FAILED(enumerated)) return enumerated;
+        size_t length{};
+        if (!SafeWideLength(entry_name, 32768U, &length))
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (_wcsicmp(entry_name, wide_name) == 0) {
+            size_t value_length{};
+            if (!SafeWideLength(entry_value, 1024U * 1024U, &value_length))
+                return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            // An explicitly empty enumerated field is equivalent to absent.
+            return value_length == 0 ? S_FALSE : result;
+        }
+    }
+    return S_FALSE;
+}
+
 std::wstring ReadInterfaceString(void* object, size_t slot) {
     wchar_t* allocated{};
     std::wstring value;
@@ -1051,6 +1125,8 @@ std::string Win32ErrorText(DWORD error) {
 bool IsSoundAddInName(const std::filesystem::path& path) {
     const auto name = path.filename().wstring();
     return _wcsicmp(name.c_str(), L"ttp_i18n.dll") != 0 &&
+           _wcsicmp(name.c_str(), L"ttp_https.dll") != 0 &&
+           _wcsicmp(name.c_str(), L"ttp_osu.dll") != 0 &&
            name.size() > 8 && _wcsnicmp(name.c_str(), L"ttp_", 4) == 0 &&
            _wcsicmp(path.extension().c_str(), L".dll") == 0;
 }
@@ -1066,8 +1142,9 @@ bool LessPath(const std::filesystem::path& left,
 
 bool PatternMatchesPath(std::wstring_view pattern,
                         const std::filesystem::path& path) {
+    // Empty restrictions are generic readers (004CBC1F).
+    if (pattern.empty()) return true;
     const auto extension = path.extension().wstring();
-    if (extension.empty()) return false;
     const std::wstring needle = L"*" + extension;
     size_t begin{};
     while (begin <= pattern.size()) {
@@ -1151,6 +1228,7 @@ struct LegacyReaderSession::Impl {
     void* metadata{};
     void* thumbnail_object{};
     std::unique_ptr<LegacyDecoderSession> decoder;
+    bool decoder_input_ended{};
     std::vector<std::byte> encoded_format;
     // Keep the complete cbSize-qualified format alive.  A by-value
     // WAVEFORMATEX loses WAVEFORMATEXTENSIBLE's valid-bit count, channel mask
@@ -1163,9 +1241,35 @@ struct LegacyReaderSession::Impl {
     DWORD encoded_bits_per_second{};
     DWORD capabilities{};
     std::wstring codec_name;
+    std::optional<ttp::format::Result> detected_format;
     std::filesystem::path module_path;
     std::vector<MetadataEntry> metadata_entries;
     std::vector<unsigned char> thumbnail;
+    bool metadata_committed{};
+    HRESULT metadata_commit_result{S_OK};
+    std::filesystem::path source_path;
+    audio::FileSourceVersion source_version;
+    std::unique_ptr<audio::FileMutationGuard> mutation;
+    bool mutation_started{};
+
+    HRESULT BeginMutation() noexcept {
+        if (mutation_started) return S_OK;
+        try {
+            if (!source_version.valid) return E_ACCESSDENIED;
+            if (!mutation) {
+                auto acquired = std::make_unique<audio::FileMutationGuard>();
+                const HRESULT status = acquired->Acquire(source_path, {}, 2000);
+                if (FAILED(status)) return status;
+                if (!audio::SameFileSourceVersion(source_version, acquired->Version()))
+                    return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+                mutation = std::move(acquired);
+            }
+            const HRESULT current = mutation->Validate();
+            if (FAILED(current)) return current;
+            mutation_started = true;
+            return S_OK;
+        } catch (...) { return E_OUTOFMEMORY; }
+    }
 
     ~Impl() {
         // The decoder can still hold a temporary reference to the staging
@@ -1187,7 +1291,7 @@ HRESULT LegacyReaderSession::Read(size_t requested_bytes,
                                   bool& end_of_stream) noexcept {
     output.clear();
     end_of_stream = false;
-    if (!impl_ || !impl_->reader) return E_UNEXPECTED;
+    if (!impl_ || !impl_->reader || impl_->metadata_committed) return E_UNEXPECTED;
 
     constexpr size_t maximum = 64U * 1024U * 1024U;
     if (impl_->decoder) {
@@ -1195,7 +1299,8 @@ HRESULT LegacyReaderSession::Read(size_t requested_bytes,
         // encoded input is required, fill the persistent input buffer through
         // reader slot 14 and submit it to decoder slot 7; then ask slot 6
         // whether PCM is available and drain it through slot 8.
-        const HRESULT needs_input = impl_->decoder->NeedsInput();
+        const HRESULT needs_input = impl_->decoder_input_ended
+            ? S_FALSE : impl_->decoder->NeedsInput();
         if (needs_input == S_OK) {
             DWORD decoder_input{}, decoder_output{};
             HRESULT result = impl_->decoder->BufferSizes(
@@ -1218,6 +1323,14 @@ HRESULT LegacyReaderSession::Read(size_t requested_bytes,
             result = InvokeReaderRead(impl_->reader, &encoded_buffer);
             if (result != S_OK) {
                 output.clear();
+                if (SUCCEEDED(result)) {
+                    const HRESULT finished = impl_->decoder->FinishInput();
+                    if (finished == S_OK) {
+                        impl_->decoder_input_ended = true;
+                        goto drain_decoder;
+                    }
+                    if (FAILED(finished)) return finished;
+                }
                 // ASF's shipped reader returns the positive status 0x26 on
                 // exhaustion rather than S_FALSE.  FUN_004E3D60 treats every
                 // non-zero result as terminal.
@@ -1239,11 +1352,16 @@ HRESULT LegacyReaderSession::Read(size_t requested_bytes,
             return needs_input;
         }
 
+drain_decoder:
         const HRESULT available = impl_->decoder->OutputAvailable();
         if (available == S_OK)
             return impl_->decoder->ReadOutput(
                 requested_bytes, output, end_of_stream);
         output.clear();
+        if (available == S_FALSE && impl_->decoder_input_ended) {
+            end_of_stream = true;
+            return S_FALSE;
+        }
         return FAILED(available) ? available : S_OK;
     }
 
@@ -1289,9 +1407,10 @@ HRESULT LegacyReaderSession::Read(size_t requested_bytes,
 }
 
 HRESULT LegacyReaderSession::Seek(DWORD& position_ms) noexcept {
-    if (!impl_ || !impl_->reader) return E_UNEXPECTED;
+    if (!impl_ || !impl_->reader || impl_->metadata_committed) return E_UNEXPECTED;
     const HRESULT result = InvokeReaderSeek(impl_->reader, &position_ms);
     if (FAILED(result) || !impl_->decoder) return result;
+    impl_->decoder_input_ended = false;
     return impl_->decoder->Reset();
 }
 
@@ -1318,6 +1437,11 @@ DWORD LegacyReaderSession::Capabilities() const noexcept {
     return impl_ ? impl_->capabilities : 0;
 }
 
+const std::optional<ttp::format::Result>& LegacyReaderSession::DetectedFormat() const noexcept {
+    static const std::optional<ttp::format::Result> empty;
+    return impl_ ? impl_->detected_format : empty;
+}
+
 const std::wstring& LegacyReaderSession::CodecName() const noexcept {
     static const std::wstring empty;
     return impl_ ? impl_->codec_name : empty;
@@ -1337,6 +1461,13 @@ bool LegacyReaderSession::HasThumbnailInterface() const noexcept {
     return impl_ && impl_->thumbnail_object;
 }
 
+DWORD LegacyReaderSession::MaximumThumbnailBytes() const noexcept {
+    DWORD maximum{};
+    if (impl_ && impl_->thumbnail_object &&
+        SUCCEEDED(InvokeThumbnailDword(impl_->thumbnail_object, 4, &maximum))) return maximum;
+    return 0;
+}
+
 const std::vector<unsigned char>& LegacyReaderSession::Thumbnail() const noexcept {
     static const std::vector<unsigned char> empty;
     return impl_ ? impl_->thumbnail : empty;
@@ -1345,6 +1476,7 @@ const std::vector<unsigned char>& LegacyReaderSession::Thumbnail() const noexcep
 HRESULT LegacyReaderSession::ReplaceThumbnails(
     std::span<const ThumbnailData> thumbnails) noexcept {
     if (!impl_ || !impl_->thumbnail_object) return E_NOINTERFACE;
+    if (impl_->metadata_committed) return E_UNEXPECTED;
     // Reader slot 4 capability bit 2 is the metadata-write flag; bit 4 is the
     // independent ISoundThumbnail write flag tested at 004AD696.
     if ((impl_->capabilities & 4U) == 0) return E_ACCESSDENIED;
@@ -1370,6 +1502,8 @@ HRESULT LegacyReaderSession::ReplaceThumbnails(
         impl_->thumbnail_object, 3, &current_count);
     if (FAILED(result)) return result;
     // 004AD6E4 removes from count-1 down to zero so every index stays valid.
+    result = impl_->BeginMutation();
+    if (FAILED(result)) return result;
     while (current_count != 0) {
         result = InvokeThumbnailRemove(
             impl_->thumbnail_object, --current_count);
@@ -1425,12 +1559,33 @@ std::optional<std::wstring> LegacyReaderSession::MetadataValue(
     return value;
 }
 
+HRESULT LegacyReaderSession::ReadMetadataValue(
+    std::string_view name, std::wstring& value) const noexcept {
+    value.clear();
+    if (!impl_ || !impl_->metadata) return E_NOINTERFACE;
+    if (name.empty() || name.find('\0') != std::string_view::npos)
+        return E_INVALIDARG;
+    try {
+        const std::string terminated_name(name);
+        const std::wstring wide_name = core::Utf8ToWide(name);
+        return ReadOptionalMetadataValue(impl_->metadata,
+            terminated_name.c_str(), wide_name.c_str(), value);
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (...) {
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+}
+
 HRESULT LegacyReaderSession::SetMetadataValue(
     std::string_view name, std::wstring_view value) noexcept {
     if (!impl_ || !impl_->metadata) return E_NOINTERFACE;
+    if (impl_->metadata_committed) return E_UNEXPECTED;
     // Reader slot 4 capability bit 2 is the exact write guard used by
     // FUN_004ADD9C before metadata slot 6.
     if ((impl_->capabilities & 4U) == 0) return E_ACCESSDENIED;
+    const HRESULT current = impl_->BeginMutation();
+    if (FAILED(current)) return current;
     try {
         const std::string terminated_name(name);
         const std::wstring terminated_value(value);
@@ -1444,6 +1599,9 @@ HRESULT LegacyReaderSession::SetMetadataValue(
 HRESULT LegacyReaderSession::SetMetadataValueDirect(
     std::string_view name, std::wstring_view value) noexcept {
     if (!impl_ || !impl_->metadata) return E_NOINTERFACE;
+    if (impl_->metadata_committed) return E_UNEXPECTED;
+    const HRESULT current = impl_->BeginMutation();
+    if (FAILED(current)) return current;
     try {
         const std::string terminated_name(name);
         const std::wstring terminated_value(value);
@@ -1454,12 +1612,91 @@ HRESULT LegacyReaderSession::SetMetadataValueDirect(
     }
 }
 
+HRESULT LegacyReaderSession::SetLyrics(std::wstring_view text) noexcept {
+    if (!impl_ || !impl_->metadata) return E_NOINTERFACE;
+    if (impl_->metadata_committed) return E_UNEXPECTED;
+    if (text.find(L'\0') != std::wstring_view::npos) return E_INVALIDARG;
+    try {
+        std::wstring original_canonical, original_singular;
+        HRESULT result = ReadOptionalMetadataValue(impl_->metadata, "Lyrics", L"Lyrics", original_canonical);
+        if (FAILED(result)) return result;
+        result = ReadOptionalMetadataValue(impl_->metadata, "Lyric", L"Lyric", original_singular);
+        if (FAILED(result)) return result;
+        // Old readers persist dirty metadata at final Release, even when a
+        // later setter failed. Keep both views before touching either key.
+        // Empty fields must be restored first: the two setters may address
+        // one canonical value, so clearing an absent alias last would erase
+        // the original lyrics again. Rollback is best-effort; a third-party
+        // writer can reject restoration too. Never mask the original error.
+        struct RestoreLyrics {
+            void* metadata;
+            const std::wstring& canonical;
+            const std::wstring& singular;
+            bool pending{};
+            ~RestoreLyrics() noexcept {
+                if (!pending) return;
+                if (singular.empty()) InvokeMetadataSet(metadata, "Lyric", L"");
+                if (canonical.empty()) InvokeMetadataSet(metadata, "Lyrics", L"");
+                if (!singular.empty()) InvokeMetadataSet(metadata, "Lyric", singular.c_str());
+                if (!canonical.empty()) InvokeMetadataSet(metadata, "Lyrics", canonical.c_str());
+            }
+        } restore{impl_->metadata, original_canonical, original_singular};
+        result = impl_->BeginMutation();
+        if (FAILED(result)) return result;
+        restore.pending = true; // A failed setter may still have changed data.
+        if (!original_singular.empty()) {
+            result = SetMetadataValueDirect("Lyric", {});
+            if (FAILED(result)) return result;
+            std::wstring previous;
+            result = ReadOptionalMetadataValue(impl_->metadata, "Lyric", L"Lyric", previous);
+            if (FAILED(result)) return result;
+            if (!previous.empty()) return STG_E_WRITEFAULT;
+        }
+        // Do this last: standard host tags canonicalize both names to Lyrics.
+        result = SetMetadataValueDirect("Lyrics", text);
+        if (FAILED(result)) return result;
+        std::wstring actual;
+        result = ReadOptionalMetadataValue(impl_->metadata, "Lyrics", L"Lyrics", actual);
+        if (FAILED(result)) return result;
+        if (actual != text) return STG_E_WRITEFAULT;
+        if (text.empty()) {
+            result = ReadOptionalMetadataValue(impl_->metadata, "Lyric", L"Lyric", actual);
+            if (FAILED(result)) return result;
+            if (!actual.empty()) return STG_E_WRITEFAULT;
+        }
+        restore.pending = false;
+        return S_OK;
+    } catch (...) {
+        return E_OUTOFMEMORY;
+    }
+}
+
+HRESULT LegacyReaderSession::CommitMetadata() noexcept {
+    if (!impl_ || !impl_->reader) return E_UNEXPECTED;
+    if (impl_->metadata_committed) return impl_->metadata_commit_result;
+    void* commit{};
+    const HRESULT queried = InvokeQueryInterface(
+        impl_->reader, kMetadataCommitInterface, &commit);
+    if (queried == E_NOINTERFACE) return S_FALSE;
+    if (FAILED(queried)) return queried;
+    if (!commit) return E_UNEXPECTED;
+    impl_->metadata_committed = true;
+    impl_->metadata_commit_result = InvokeNoArgument(commit, 3);
+    Release(commit);
+    return impl_->metadata_commit_result;
+}
+
 struct LegacyDecoderSession::Impl {
     void* decoder{};
+    bool builtin_mpeg{};
+    bool builtin_acm{};
     alignas(WAVEFORMATEX) std::array<std::byte, 0x28> output_format{};
     DWORD input_bytes{};
     DWORD output_bytes{};
     std::vector<std::byte> input_storage;
+    std::vector<std::byte> pending_pcm;
+    size_t pending_offset{};
+    HRESULT pending_result{S_OK};
     // FUN_004E3CF3 passes the persistent CBuffer stored at source +0x60 to
     // decoder slot 7.  Shipped DMO decoders retain that object until their
     // pending output is drained; a stack-local wrapper becomes dangling even
@@ -1487,11 +1724,13 @@ HRESULT LegacyDecoderSession::BufferSizes(
 }
 
 HRESULT LegacyDecoderSession::NeedsInput() const noexcept {
+    if (impl_ && impl_->pending_offset < impl_->pending_pcm.size()) return S_FALSE;
     return !impl_ || !impl_->decoder
         ? E_UNEXPECTED : InvokeNoArgument(impl_->decoder, 5);
 }
 
 HRESULT LegacyDecoderSession::OutputAvailable() const noexcept {
+    if (impl_ && impl_->pending_offset < impl_->pending_pcm.size()) return S_OK;
     return !impl_ || !impl_->decoder
         ? E_UNEXPECTED : InvokeNoArgument(impl_->decoder, 6);
 }
@@ -1517,6 +1756,13 @@ HRESULT LegacyDecoderSession::PushInput(
         impl_->decoder, 7, &impl_->input_buffer);
 }
 
+HRESULT LegacyDecoderSession::FinishInput() noexcept {
+    if (!impl_ || !impl_->decoder) return E_UNEXPECTED;
+    return impl_->builtin_mpeg
+        ? detail::FinishBuiltinMpegDecoder(impl_->decoder)
+        : impl_->builtin_acm ? detail::FinishBuiltinAcmDecoder(impl_->decoder) : S_FALSE;
+}
+
 HRESULT LegacyDecoderSession::ReadOutput(
     size_t requested_bytes, std::vector<std::byte>& pcm,
     bool& end_of_stream) noexcept {
@@ -1538,29 +1784,54 @@ HRESULT LegacyDecoderSession::ReadOutput(
     }
     if (capacity > maximum || capacity > std::numeric_limits<DWORD>::max())
         return E_INVALIDARG;
+    const auto drain = [&]() -> HRESULT {
+        const size_t bytes = std::min(capacity, impl_->pending_pcm.size() - impl_->pending_offset);
+        try {
+            pcm.assign(impl_->pending_pcm.begin() + impl_->pending_offset,
+                       impl_->pending_pcm.begin() + impl_->pending_offset + bytes);
+        } catch (...) { return E_OUTOFMEMORY; }
+        impl_->pending_offset += bytes;
+        if (impl_->pending_offset < impl_->pending_pcm.size()) return S_OK;
+        const HRESULT result = impl_->pending_result;
+        impl_->pending_pcm.clear(); impl_->pending_offset = 0;
+        end_of_stream = result != S_OK;
+        return result;
+    };
+    if (impl_->pending_offset < impl_->pending_pcm.size()) return drain();
+    // The decoder's slot-4 size is a minimum for whole packets (notably
+    // WMA/DMO). Preserve excess PCM when a CUE/converter requests less.
+    const size_t packet_capacity = std::max<size_t>(capacity, impl_->output_bytes);
+    if (packet_capacity > maximum) return E_INVALIDARG;
     try {
-        pcm.resize(capacity);
+        impl_->pending_pcm.resize(packet_capacity);
     } catch (...) {
         pcm.clear();
         return E_OUTOFMEMORY;
     }
     LegacyBuffer buffer{
-        &kLegacyBufferVtable, 1, reinterpret_cast<BYTE*>(pcm.data()),
-        static_cast<DWORD>(capacity), 0};
+        &kLegacyBufferVtable, 1, reinterpret_cast<BYTE*>(impl_->pending_pcm.data()),
+        static_cast<DWORD>(packet_capacity), 0};
     const HRESULT result = InvokeDecoderBuffer(impl_->decoder, 8, &buffer);
     if (FAILED(result) || buffer.length > buffer.capacity) {
-        pcm.clear();
+        impl_->pending_pcm.clear();
         return FAILED(result) ? result : E_UNEXPECTED;
     }
-    pcm.resize(buffer.length);
-    end_of_stream = result != S_OK;
-    return result;
+    if (output_format.nBlockAlign && buffer.length % output_format.nBlockAlign) {
+        impl_->pending_pcm.clear(); return E_UNEXPECTED;
+    }
+    impl_->pending_pcm.resize(buffer.length);
+    impl_->pending_offset = 0;
+    impl_->pending_result = result;
+    return drain();
 }
 
 HRESULT LegacyDecoderSession::Reset() noexcept {
     if (!impl_ || !impl_->decoder) return E_UNEXPECTED;
     const HRESULT result = InvokeNoArgument(impl_->decoder, 9);
     if (SUCCEEDED(result)) {
+        impl_->pending_pcm.clear();
+        impl_->pending_offset = 0;
+        impl_->pending_result = S_OK;
         impl_->input_storage.clear();
         impl_->input_buffer.bytes = nullptr;
         impl_->input_buffer.capacity = 0;
@@ -1906,6 +2177,32 @@ HRESULT PluginManager::Load(const std::filesystem::path& directory) {
             continue;
         }
 
+        // MAKI is a provider dependency, not a sound AddIn. The skin DLL owns
+        // its ABI check and lifetime; do not report a missing sound factory.
+        if (GetProcAddress(module, "ttpGetMakiVM")) {
+            FreeLibrary(module);
+            continue;
+        }
+        // Skin providers share AddIn discovery but use a separate versioned ABI.
+        // Their module/instance lifetime is owned by the UI skin manager.
+        if (const auto skin_factory = reinterpret_cast<TtpGetSkinPlugin>(
+                GetProcAddress(module, TTP_SKIN_ENTRY))) {
+            info.skin_provider = true;
+            TtpSkinPlugin api{};
+            api.size = sizeof(api);
+            info.result = skin_factory(TTP_SKIN_ABI, &api);
+            info.registered = SUCCEEDED(info.result) && api.version == TTP_SKIN_ABI &&
+                api.size >= TTP_SKIN_PLUGIN_DECLARATION_SIZE && api.probe && api.create && api.attach &&
+                api.detach && api.destroy && api.preview && api.shade && api.paint && api.translate &&
+                api.skin_directory && api.extensions;
+            if (!info.registered) {
+                info.result = E_NOINTERFACE;
+                info.error = "unsupported skin provider ABI";
+            }
+            FreeLibrary(module);
+            plugins_.push_back(std::move(info));
+            continue;
+        }
         const FARPROC factory = GetProcAddress(module, "ttpGetSoundAddIn");
         info.has_legacy_entry = factory != nullptr;
         if (!factory) {
@@ -1962,19 +2259,17 @@ HRESULT PluginManager::Load(const std::filesystem::path& directory) {
             if (category_interface &&
                 InlineIsEqualGUID(category, kReaderCreatorCategory)) {
                 wchar_t* description{};
-                if (SUCCEEDED(InvokeDescription(category_interface, &description)) &&
-                    description) {
-                    std::wstring text(description);
+                if (SUCCEEDED(InvokeDescription(category_interface, &description))) {
+                    std::wstring text = description ? description : L"";
                     auto pattern = PatternFromDescription(text);
-                    if (!text.empty() && !pattern.empty()) {
-                        ReaderFormat format{
-                            std::move(text), std::move(pattern), path};
-                        reader_formats_.push_back(format);
-                        reader_factories_.push_back(
-                            ReaderFactory{std::move(format), module_index,
-                                          index, nullptr});
-                        ++info.reader_count;
-                    }
+                    if (text.empty()) text = ReadInterfaceString(category_interface, 4);
+                    ReaderFormat format{std::move(text), std::move(pattern), path};
+                    // Generic factories participate in opening, but do not
+                    // introduce an empty entry in file-dialog filter lists.
+                    if (!format.pattern.empty()) reader_formats_.push_back(format);
+                    reader_factories_.push_back(
+                        ReaderFactory{std::move(format), module_index, index, nullptr});
+                    ++info.reader_count;
                 }
                 if (description) CoTaskMemFree(description);
             }
@@ -2076,15 +2371,39 @@ bool PluginManager::HasReaderForPath(const std::filesystem::path& path) const {
     });
 }
 
+bool PluginManager::HasReaderForContent(const std::filesystem::path& path) const {
+    if (HasReaderForPath(path)) return true;
+    if (path.native().find(L"://") != std::wstring::npos ||
+        path.native().find(L'|') != std::wstring::npos) return false;
+    IStream* stream{};
+    if (FAILED(CreateNamedFileStream(path, STGM_READ | STGM_SHARE_DENY_NONE, &stream)) || !stream)
+        return false;
+    ttp::format::Snapshot snapshot;
+    const auto sampled = ttp::format::ReadSnapshot(stream, snapshot);
+    stream->Release();
+    if (sampled != S_OK) return false;
+    for (const auto& factory : reader_factories_) {
+        void* creator = ResolveCategoryInterface(factory.module_index,
+            factory.enumeration_index, kReaderCreatorCategory, factory.provider);
+        if (!creator) continue;
+        void* probe{};
+        bool matched{};
+        if (InvokeQueryInterface(creator, ttp::format::iid_probe, &probe) == S_OK && probe) {
+            ttp::format::Result result;
+            matched = InvokeFormatProbe(probe, &snapshot.request, &result) == S_OK &&
+                ttp::format::Valid(result) && result.confidence >= ttp::format::Tentative;
+        }
+        if (probe) Release(probe);
+        Release(creator);
+        if (matched) return true;
+    }
+    return false;
+}
+
 std::unique_ptr<LegacyReaderSession> PluginManager::OpenReader(
     const std::filesystem::path& path, HRESULT* result,
     std::wstring* diagnostic) const {
     if (diagnostic) diagnostic->clear();
-    if (!HasReaderForPath(path)) {
-        if (result) *result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        if (diagnostic) *diagnostic = L"no registered reader matched the extension";
-        return {};
-    }
     IStream* stream{};
     const HRESULT opened = CreateNamedFileStream(
         path, STGM_READ | STGM_SHARE_DENY_WRITE, &stream);
@@ -2103,10 +2422,11 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderForMetadata(
     const std::filesystem::path& path, HRESULT* result,
     std::wstring* diagnostic) const {
     if (diagnostic) diagnostic->clear();
-    if (!HasReaderForPath(path)) {
-        if (result) *result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        if (diagnostic)
-            *diagnostic = L"no registered reader matched the extension";
+    auto mutation = std::make_unique<audio::FileMutationGuard>();
+    const HRESULT acquired = mutation->Acquire(path);
+    if (FAILED(acquired)) {
+        if (result) *result = acquired;
+        if (diagnostic) *diagnostic = L"acquiring metadata file transaction";
         return {};
     }
     IStream* stream{};
@@ -2120,6 +2440,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderForMetadata(
     }
     auto session = OpenReaderWithFlags(path, stream, 0, result, diagnostic);
     stream->Release();
+    if (session) session->impl_->mutation = std::move(mutation);
     return session;
 }
 
@@ -2166,10 +2487,55 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
         if (diagnostic) *diagnostic = L"reader input IStream is null";
         return {};
     }
+    audio::FileSourceVersion source_version;
+    static_cast<void>(audio::ReadFileSourceVersion(logical_path, source_version));
+    // 004CBC1F uses 004CBA11's corrected hint to select creators, while the
+    // IStream/Stat filename remains the real file (also for archive members).
+    auto extension = audio::AudioExtensionHint(logical_path);
+    ttp::format::Snapshot snapshot;
+    const HRESULT probed = ttp::format::ReadSnapshot(stream, snapshot);
+    if (probed == S_OK) {
+        extension = audio::RecoverAudioFormatHint(extension,
+            {snapshot.request.data, snapshot.request.bytes});
+        const auto builtin = ttp::format::Identify(snapshot.request, ttp::format::Builtin);
+        if (builtin.confidence >= ttp::format::Strong) extension = builtin.extension;
+    }
+    if (FAILED(probed)) {
+        if (result) *result = probed;
+        if (diagnostic) *diagnostic = L"probing reader input stream";
+        return {};
+    }
+    auto routing_path = logical_path;
+    routing_path.replace_extension(extension);
     HRESULT last_result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     bool matched{};
+    struct Candidate { const ReaderFactory* factory; unsigned priority; };
+    std::vector<Candidate> candidates;
     for (const auto& factory : reader_factories_) {
-        if (!PatternMatchesPath(factory.format.pattern, logical_path)) continue;
+        unsigned priority = PatternMatchesPath(factory.format.pattern, routing_path) ? 1 : 0;
+        if (probed == S_OK) {
+            void* creator = ResolveCategoryInterface(factory.module_index,
+                factory.enumeration_index, kReaderCreatorCategory, factory.provider);
+            if (creator) {
+                void* probe{};
+                if (InvokeQueryInterface(creator, ttp::format::iid_probe, &probe) == S_OK && probe) {
+                    ttp::format::Result detected;
+                    if (InvokeFormatProbe(probe, &snapshot.request, &detected) == S_OK &&
+                        ttp::format::Valid(detected)) {
+                        if (detected.confidence == ttp::format::Strong) priority = 3;
+                        else if (detected.confidence == ttp::format::Tentative) priority = 2;
+                    }
+                }
+                if (probe) Release(probe);
+                Release(creator);
+            }
+        }
+        if (priority) candidates.push_back({&factory, priority});
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const Candidate& a, const Candidate& b) { return a.priority > b.priority; });
+    for (const auto& candidate : candidates) {
+        const auto& factory = *candidate.factory;
         matched = true;
 
         void* creator = ResolveCategoryInterface(
@@ -2188,6 +2554,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
             if (reader) Release(reader);
             last_result = current;
             if (diagnostic) *diagnostic = L"reader creator slot 3";
+            if (audio::IsTerminalAudioOpenError(current)) break;
             continue;
         }
 
@@ -2201,6 +2568,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
             Release(reader);
             last_result = current;
             if (diagnostic) *diagnostic = L"reader slot 3 Open(IStream, flags)";
+            if (audio::IsTerminalAudioOpenError(current)) break;
             continue;
         }
 
@@ -2213,11 +2581,19 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
         if (copied)
             std::memcpy(&format, encoded_format.data(), sizeof(format));
         if (allocated_format) CoTaskMemFree(allocated_format);
+        // ASF can legitimately leave the average encoded bitrate unset for
+        // VBR MP3 (the original reader returns zero as well). PCM requires a
+        // concrete byte rate; compressed formats are checked again after the
+        // decoder has negotiated their actual PCM output.
+        const bool missing_pcm_rate = copied && format.nAvgBytesPerSec == 0 &&
+            IsDecodedPcmFormat(*reinterpret_cast<const WAVEFORMATEX*>(
+                encoded_format.data()));
         if (!copied || format.nChannels == 0 || format.nSamplesPerSec == 0 ||
-            format.nAvgBytesPerSec == 0 || format.nBlockAlign == 0) {
+            missing_pcm_rate || format.nBlockAlign == 0) {
             Release(reader);
             last_result = FAILED(current) ? current : E_UNEXPECTED;
             if (diagnostic) *diagnostic = L"reader slot 6 GetFormat";
+            if (audio::IsTerminalAudioOpenError(last_result)) break;
             continue;
         }
 
@@ -2227,6 +2603,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
             Release(reader);
             last_result = current;
             if (diagnostic) *diagnostic = L"reader slot 7 GetBufferSize";
+            if (audio::IsTerminalAudioOpenError(current)) break;
             continue;
         }
         if (suggested == 0) {
@@ -2250,6 +2627,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
             if (!decoder) {
                 Release(reader);
                 last_result = FAILED(current) ? current : E_NOINTERFACE;
+                if (audio::IsTerminalAudioOpenError(last_result)) break;
                 continue;
             }
             DWORD decoder_input{}, decoder_output{};
@@ -2354,12 +2732,24 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
             while (!codec.empty() && iswspace(codec.back())) codec.pop_back();
         }
 
+        std::optional<ttp::format::Result> detected_format;
+        void* format_info{};
+        if (InvokeQueryInterface(reader, ttp::format::iid_info, &format_info) == S_OK && format_info) {
+            ttp::format::Result detected;
+            if (InvokeFormatInfo(format_info, &detected) == S_OK &&
+                ttp::format::Valid(detected) && detected.confidence == ttp::format::Opened)
+                detected_format = detected;
+        }
+        if (format_info) Release(format_info);
         try {
             auto implementation = std::make_unique<LegacyReaderSession::Impl>();
+            implementation->detected_format = detected_format;
             // Transfer ownership immediately: any later string/path allocation
             // failure now releases the private reader through Impl::~Impl.
             implementation->reader = reader;
             reader = nullptr;
+            implementation->source_path = logical_path;
+            implementation->source_version = source_version;
             implementation->metadata = metadata_owner.release();
             implementation->thumbnail_object = thumbnail_owner.release();
             implementation->decoder = std::move(decoder);
@@ -2409,6 +2799,7 @@ std::unique_ptr<LegacyReaderSession> PluginManager::OpenReaderWithFlags(
 
 bool PluginManager::HasDecoderForFormat(
     const WAVEFORMATEX& format) const noexcept {
+    if (detail::SupportsBuiltinMpegDecoder(format)) return true;
     const GUID subtype = WaveSubtype(format);
     for (const auto& factory : decoder_factories_) {
         void* creator = ResolveCategoryInterface(
@@ -2422,7 +2813,7 @@ bool PluginManager::HasDecoderForFormat(
         // still a valid candidate.
         if (SUCCEEDED(supported)) return true;
     }
-    return false;
+    return detail::SupportsBuiltinAcmDecoder(format);
 }
 
 std::unique_ptr<LegacyDecoderSession> PluginManager::OpenDecoder(
@@ -2439,24 +2830,46 @@ std::unique_ptr<LegacyDecoderSession> PluginManager::OpenDecoder(
     const GUID subtype = WaveSubtype(encoded_format);
     HRESULT last_result = E_NOTIMPL;
     bool matched{};
-    for (const auto& factory : decoder_factories_) {
-        void* creator = ResolveCategoryInterface(
-            factory.module_index, factory.enumeration_index,
-            kDecoderCreatorCategory, factory.provider);
-        if (!creator) {
-            last_result = E_NOINTERFACE;
-            continue;
-        }
-        const HRESULT supported = InvokeSubtypeSupport(creator, &subtype);
-        if (FAILED(supported)) {
-            Release(creator);
-            continue;
-        }
-        matched = true;
-
+    for (size_t candidate = 0; candidate <= decoder_factories_.size() + 1; ++candidate) {
+        const bool builtin = candidate == 0;
+        const bool acm = candidate == decoder_factories_.size() + 1;
+        if (builtin && !detail::SupportsBuiltinMpegDecoder(encoded_format)) continue;
+        if (acm && !detail::SupportsBuiltinAcmDecoder(encoded_format)) continue;
+        const auto* factory = builtin || acm ? nullptr : &decoder_factories_[candidate - 1];
+        std::filesystem::path decoder_module;
+        HRESULT supported = S_OK;
         void* decoder{};
-        HRESULT current = InvokeCreateReader(creator, &decoder);
-        Release(creator);
+        HRESULT current{};
+        if (builtin) {
+            // 004CA86C registers the dedicated 004C9AC1 MPEG creator before
+            // the general decoder candidates. Its 004C9748 instance uses
+            // ttpcomm ordinals 10..14, independently of ASF/DMO and ACM.
+            matched = true;
+            current = detail::CreateBuiltinMpegDecoder(&decoder, decoder_module);
+        } else if (acm) {
+            // 004CA0A0 / 004C9C1F is the host's final generic ACM decoder.
+            // Keep format-specific Sound AddIn decoders ahead of this fallback.
+            matched = true;
+            current = detail::CreateBuiltinAcmDecoder(&decoder, decoder_module);
+        } else {
+            void* creator = ResolveCategoryInterface(
+                factory->module_index, factory->enumeration_index,
+                kDecoderCreatorCategory, factory->provider);
+            if (!creator) {
+                last_result = E_NOINTERFACE;
+                continue;
+            }
+            supported = InvokeSubtypeSupport(creator, &subtype);
+            if (FAILED(supported)) {
+                Release(creator);
+                continue;
+            }
+            matched = true;
+
+            current = InvokeCreateReader(creator, &decoder);
+            Release(creator);
+            decoder_module = factory->info.module_path;
+        }
         if (FAILED(current) || !decoder) {
             if (SUCCEEDED(current)) current = E_NOINTERFACE;
             if (decoder) Release(decoder);
@@ -2466,15 +2879,29 @@ std::unique_ptr<LegacyDecoderSession> PluginManager::OpenDecoder(
         }
 
         alignas(WAVEFORMATEX) std::array<std::byte, 0x28> output_format{};
-        reinterpret_cast<WAVEFORMATEX*>(output_format.data())->wFormatTag =
-            requested_output_tag;
+        auto* negotiated_format =
+            reinterpret_cast<WAVEFORMATEX*>(output_format.data());
+        negotiated_format->wFormatTag = requested_output_tag;
+        // 004E3A3D passes 0x28 to 004B0908, which sets cbSize to size-0x12.
+        // Decoder slot 3 uses this as the available extension capacity on
+        // input. The WM/DMO decoder needs all 40 bytes to negotiate 24-bit
+        // and multichannel WAVEFORMATEXTENSIBLE without falling back to 16-bit.
+        negotiated_format->cbSize = static_cast<WORD>(
+            output_format.size() - sizeof(WAVEFORMATEX));
         current = InvokeDecoderInitialize(
-            decoder, &encoded_format,
-            reinterpret_cast<WAVEFORMATEX*>(output_format.data()));
+            decoder, &encoded_format, negotiated_format);
         if (FAILED(current)) {
             Release(decoder);
             last_result = current;
             if (diagnostic) *diagnostic = L"decoder slot 3 initialize";
+            continue;
+        }
+
+        if (sizeof(WAVEFORMATEX) + negotiated_format->cbSize >
+                output_format.size()) {
+            Release(decoder);
+            last_result = E_UNEXPECTED;
+            if (diagnostic) *diagnostic = L"decoder returned an oversized format";
             continue;
         }
 
@@ -2492,11 +2919,13 @@ std::unique_ptr<LegacyDecoderSession> PluginManager::OpenDecoder(
         try {
             auto implementation = std::make_unique<LegacyDecoderSession::Impl>();
             implementation->decoder = decoder;
+            implementation->builtin_mpeg = builtin;
+            implementation->builtin_acm = acm;
             decoder = nullptr;
             implementation->output_format = output_format;
             implementation->input_bytes = input_bytes;
             implementation->output_bytes = output_bytes;
-            implementation->module_path = factory.info.module_path;
+            implementation->module_path = std::move(decoder_module);
             auto session = std::unique_ptr<LegacyDecoderSession>(
                 new LegacyDecoderSession(std::move(implementation)));
             // FUN_004CD045 returns the successful creator slot-5 status;
@@ -2530,6 +2959,7 @@ HRESULT PluginManager::ConfigureEncoder(size_t index, HWND parent,
         factory.module_index, factory.enumeration_index,
         kEncoderCreatorCategory, factory.provider);
     if (!creator) return E_NOINTERFACE;
+    detail::NeroConfigLayoutScope nero_layout;
     const HRESULT result = InvokeEncoderConfigure(creator, parent);
     Release(creator);
     return result;
@@ -2589,7 +3019,7 @@ std::unique_ptr<LegacyEncoderSession> PluginManager::CreateEncoder(
 
 std::unique_ptr<LegacyLyricSearchSession> PluginManager::CreateLyricSearch(
     size_t index, LyricSearchCallback* context, const LyricNetworkConfig* network,
-    HRESULT* result, std::wstring* diagnostic) const {
+    HRESULT* result, std::wstring* diagnostic, LPCWSTR service_name, LPCWSTR service_url) const {
     if (diagnostic) diagnostic->clear();
     if (index >= lyric_providers_.size()) {
         if (result) *result = E_INVALIDARG;
@@ -2616,6 +3046,20 @@ std::unique_ptr<LegacyLyricSearchSession> PluginManager::CreateLyricSearch(
         if (result) *result = current;
         if (diagnostic) *diagnostic = L"lyric provider slot 3";
         return {};
+    }
+    if (service_url) {
+        LyricSearchControl* control{};
+        current = InvokeQueryInterface(search, kLyricControlId, reinterpret_cast<void**>(&control));
+        if (SUCCEEDED(current) && control) {
+            current = control->Configure(service_name ? service_name : L"", service_url, 0);
+            control->Release();
+        } else if (SUCCEEDED(current)) current = E_NOINTERFACE;
+        if (FAILED(current)) {
+            Release(search);
+            if (result) *result = current;
+            if (diagnostic) *diagnostic = L"lyric service configuration extension";
+            return {};
+        }
     }
     current = InvokeLyricSearchInitialize(
         search, context, network);

@@ -5,6 +5,20 @@
 #include <windows.h>
 
 namespace ttplayer::skin {
+// Shared ownership also keeps fallback desktop-bar icons alive after the
+// temporary default skin is released.
+class SkinIcon {
+public:
+    void Reset(HICON icon) {
+        handle_.reset(icon, [](void* value) { if (value) DestroyIcon(static_cast<HICON>(value)); });
+    }
+    [[nodiscard]] HICON Get() const noexcept { return static_cast<HICON>(handle_.get()); }
+private:
+    std::shared_ptr<void> handle_;
+};
+struct SkinIcons { SkinIcon small_icon, large_icon; };
+void DrawNativeSkinIcon(HDC dc, HICON icon, const RECT& bounds);
+RECT NativeSkinIconBounds(HICON icon, RECT bounds);
 // 6.1.2 SkinImage (00417411/00522A01) owns either a BMP DIB or a GDI+
 // image. Keep the encoded-image representation until drawing: converting
 // PNG to a colour-keyed bitmap loses its partially transparent edges.
@@ -14,7 +28,9 @@ public:
     SkinImage(std::nullptr_t) noexcept {}
     // Borrowed GDI handles used by existing synthetic layouts/tests.
     SkinImage(HBITMAP bitmap) noexcept : borrowed_(bitmap) {}
-    static SkinImage Load(const std::filesystem::path& path);
+    // replacement_started distinguishes 004A9D8C's outer rejection (retain
+    // the old slot) from 00408CF4's destructive DIB decode (replace/clear).
+    static SkinImage Load(const std::filesystem::path& path, bool* replacement_started = nullptr);
     [[nodiscard]] bool IsGdiPlus() const noexcept;
     [[nodiscard]] SIZE Size() const noexcept;
     // Resource multiplier (1 = @1x, 2 = @2x, ...). Lets nine-grid source split
@@ -25,6 +41,12 @@ public:
     // This binary mask is only for HWND shape/hit testing, never for painting.
     // BMP callers retain their original RGB colour-key region path.
     [[nodiscard]] SkinImage CoverageMask() const;
+    // Caller owns the returned region. NULL means rectangular/default;
+    // a non-NULL NULLREGION means empty (notably an alpha-empty PNG).
+    // Normal-frame masks are cached for owned images.
+    [[nodiscard]] HRGN CreateRegion(COLORREF key, int frames = 1) const;
+    [[nodiscard]] COLORREF ButtonColorKey(COLORREF key) const;
+    [[nodiscard]] SkinImage DarkenedBufferFill(COLORREF key) const;
     // A DIB view for legacy size/region APIs, never the PNG drawing source.
     [[nodiscard]] operator HBITMAP() const noexcept;
     [[nodiscard]] int SourceScale() const noexcept { return source_scale_; }

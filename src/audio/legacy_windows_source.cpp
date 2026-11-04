@@ -14,18 +14,19 @@ using Microsoft::WRL::ComPtr;
 
 class WindowsMediaSource final : public DecodedAudioSource {
 public:
-    explicit WindowsMediaSource(HMODULE ttpcomm) : ttpcomm_(ttpcomm) {}
+    WindowsMediaSource(HMODULE ttpcomm, IStream* input) : ttpcomm_(ttpcomm), stream_(input) {}
     ~WindowsMediaSource() override { if (reader_) reader_->Close(); }
 
     bool Open(const std::filesystem::path& path, const PlaybackOptions&) override {
         HRESULT result = platform::WMCreateSyncReader(nullptr, 0, &reader_);
         if (FAILED(result)) return Fail(L"Windows Media Format runtime is unavailable", result);
         ArchiveMemberPath member;
-        if (ParseArchiveMemberPath(path.native(), member)) {
+        if (stream_) result = reader_->OpenStream(stream_.Get());
+        else if (ParseArchiveMemberPath(path.native(), member)) {
             try {
-                const auto bytes = ReadArchiveMember(member, ttpcomm_);
-                if (bytes.size() > UINT_MAX) return Fail(L"Archive member is too large", E_INVALIDARG);
-                stream_.Attach(platform::SHCreateMemStream(bytes.data(), static_cast<UINT>(bytes.size())));
+                stream_.Attach(OpenArchiveMemberStream(member, ttpcomm_));
+            } catch (const ArchiveError& error) {
+                return Fail(error.Message().c_str(), error.Result());
             } catch (const std::exception&) {
                 return Fail(L"Cannot read archive member", E_FAIL);
             }
@@ -132,8 +133,10 @@ public:
     }
     std::chrono::milliseconds Duration() const override { return duration_; }
     std::wstring Error() const override { return error_; }
+    HRESULT ErrorResult() const override { return error_result_; }
 private:
     bool Fail(const wchar_t* operation, HRESULT result) {
+        error_result_ = result;
         error_ = std::wstring(operation) + L" (HRESULT " + std::to_wstring(result) + L")";
         return false;
     }
@@ -147,10 +150,11 @@ private:
     size_t pending_offset_{};
     bool ended_{};
     std::wstring error_;
+    HRESULT error_result_{E_FAIL};
 };
 } // namespace
 
-std::unique_ptr<DecodedAudioSource> CreateLegacyWindowsSource(HMODULE ttpcomm) {
-    return std::make_unique<WindowsMediaSource>(ttpcomm);
+std::unique_ptr<DecodedAudioSource> CreateLegacyWindowsSource(HMODULE ttpcomm, IStream* input) {
+    return std::make_unique<WindowsMediaSource>(ttpcomm, input);
 }
 } // namespace ttplayer::audio

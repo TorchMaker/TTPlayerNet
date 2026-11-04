@@ -1,9 +1,16 @@
+#include <ttpcomm/runtime_tags.h>
+#include <ttpcomm/client.h>
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/ui/wtl_menu.h"
 #include "ttplayer/ui/wtl_window.h"
 #include "ttplayer/platform/optional_windows_api.h"
 #include "player_window_internal.h"
 #include "album_background.h"
+#include "player_visual_effect.h"
+#include "osu_visual_client.h"
+#include "track_metadata.h"
+#include "osu_library_artwork.h"
+#include "ttplayer/core/text.h"
 #include "ttplayer/ui/cover_image.h"
 #include "ttplayer/app/worker_process.h"
 #include "../app/resource_ids.h"
@@ -26,13 +33,35 @@
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <windowsx.h>
+#include <mmsystem.h>
+#include <vfw.h>
 
 namespace ttplayer::ui {
 using namespace detail;
+void detail::AppendPlayerVisualMenuItems(HMENU menu,bool fullscreen) {
+    const HMENU popup = FindCommandMenu(menu, kCmdVisualScope);
+    if (!popup) return;
+    int position = 0;
+    for (; position < GetMenuItemCount(popup); ++position)
+        if (GetMenuItemID(popup, position) == kCmdVisualScope) { ++position; break; }
+    for (const UINT id : {IDS_VISUAL_PULSE, IDS_VISUAL_RIPPLE, IDS_VISUAL_OSU, IDS_VISUAL_OSU_LAZER}) {
+        const UINT command=id==IDS_VISUAL_PULSE?kCmdVisualPulse:id==IDS_VISUAL_RIPPLE?kCmdVisualRipple:id==IDS_VISUAL_OSU?kCmdVisualOsu:kCmdVisualOsuLazer;
+        if((id==IDS_VISUAL_OSU && (!fullscreen || !OsuVisualAvailable())) ||
+           (id==IDS_VISUAL_OSU_LAZER && (!fullscreen || !OsuLazerAvailable()))) {
+            DeleteMenu(popup,command,MF_BYCOMMAND);continue;
+        }
+        if(FindCommandMenu(popup,command)){++position;continue;}
+        const auto label = i18n::ResourceText(GetModuleHandleW(nullptr), id);
+        InsertMenuW(popup, position++, MF_BYPOSITION | MF_STRING,
+                    command, label.c_str());
+    }
+}
 namespace {
 
 constexpr size_t kAnalysisSamples = 512;
 constexpr uint32_t kMaximumPictureBytes = 64U * 1024U * 1024U;
+constexpr UINT_PTR kOsuExitTimer = 0x6121;
+constexpr UINT_PTR kOsuLyricFadeTimer = 0x6122;
 
 void MarkShellFullscreen(HWND window, bool fullscreen) noexcept {
     if (!window || !IsWindow(window)) return;
@@ -101,18 +130,8 @@ RECT WindowRectForClientTarget(HWND window, RECT target) noexcept {
     return target;
 }
 
-uint32_t BigEndian32(const unsigned char* value) noexcept {
-    return (static_cast<uint32_t>(value[0]) << 24) |
-           (static_cast<uint32_t>(value[1]) << 16) |
-           (static_cast<uint32_t>(value[2]) << 8) |
-           static_cast<uint32_t>(value[3]);
-}
-
 uint32_t SyncSafe32(const unsigned char* value) noexcept {
-    return (static_cast<uint32_t>(value[0] & 0x7fU) << 21) |
-           (static_cast<uint32_t>(value[1] & 0x7fU) << 14) |
-           (static_cast<uint32_t>(value[2] & 0x7fU) << 7) |
-           static_cast<uint32_t>(value[3] & 0x7fU);
+    return ttpcomm::bytes::Synchsafe32(value);
 }
 
 bool ReadExact(std::ifstream& input, void* destination, size_t size) {
@@ -142,40 +161,12 @@ bool CoverPictureMimeMatches(std::string_view mime,
 
 std::vector<unsigned char> ParseFlacPictureBlock(
     const std::vector<unsigned char>& block, uint32_t* picture_type) {
-    size_t cursor{};
-    auto take32 = [&](uint32_t& result) {
-        if (cursor + 4 > block.size()) return false;
-        result = BigEndian32(block.data() + cursor);
-        cursor += 4;
-        return true;
-    };
-    uint32_t type{}, mime_length{}, description_length{};
-    if (!take32(type) || !take32(mime_length) ||
-        mime_length > block.size() - cursor) return {};
-    const std::string mime(
-        reinterpret_cast<const char*>(block.data() + cursor), mime_length);
-    cursor += mime_length;
-    if (!take32(description_length) ||
-        description_length > block.size() - cursor) return {};
-    cursor += description_length;
-    uint32_t width{}, height{}, depth{}, colors{};
-    if (!take32(width) || !take32(height) || !take32(depth) ||
-        !take32(colors)) return {};
-    static_cast<void>(colors);
-    // The original reader metadata path rejects malformed PICTURE records
-    // before CVisualCtrl sees their byte blob.  In particular, the reference
-    // FLAC carries a decodable JPEG but declares a zero-sized picture; the
-    // stock 5.7.9 player deliberately shows the skin background instead.
-    if (width == 0 || height == 0 || depth == 0) return {};
-    uint32_t data_length{};
-    if (!take32(data_length) || data_length == 0 ||
-        data_length > kMaximumPictureBytes ||
-        data_length > block.size() - cursor) return {};
-    const std::span<const unsigned char> data(block.data() + cursor,
-                                               data_length);
-    if (!CoverPictureMimeMatches(mime, data)) return {};
-    if (picture_type) *picture_type = type;
-    return {data.begin(), data.end()};
+    const auto picture = ttpcomm::host::tags::FlacPicture({block.data(), block.size()});
+    if (!picture || !picture->width || !picture->height || !picture->depth ||
+        picture->data.empty() || picture->data.size() > kMaximumPictureBytes ||
+        !CoverPictureMimeMatches(picture->mime, {picture->data.data(), picture->data.size()})) return {};
+    if (picture_type) *picture_type = picture->type;
+    return {picture->data.begin(), picture->data.end()};
 }
 
 std::vector<unsigned char> ReadFlacPicture(std::ifstream& input,
@@ -209,92 +200,43 @@ std::vector<unsigned char> ReadFlacPicture(std::ifstream& input,
     }
 }
 
-size_t SkipId3Description(std::span<const unsigned char> frame,
-                          size_t cursor, unsigned char encoding) {
-    if (encoding == 1 || encoding == 2) {
-        while (cursor + 1 < frame.size()) {
-            if (frame[cursor] == 0 && frame[cursor + 1] == 0)
-                return cursor + 2;
-            cursor += 2;
-        }
-    } else {
-        while (cursor < frame.size() && frame[cursor] != 0) ++cursor;
-        if (cursor < frame.size()) ++cursor;
-    }
-    return cursor;
-}
+
 
 std::vector<unsigned char> ParseId3Apic(
     std::span<const unsigned char> frame, unsigned int version,
     unsigned int* picture_type) {
-    if (frame.size() < 4) return {};
-    size_t cursor = 1;
-    std::string mime;
-    if (version == 2) {
-        if (cursor + 3 > frame.size()) return {};
-        const std::string_view format(
-            reinterpret_cast<const char*>(frame.data() + cursor), 3);
-        if (format == "JPG") mime = "image/jpeg";
-        else if (format == "PNG") mime = "image/png";
-        else if (format == "BMP") mime = "image/bmp";
-        else if (format == "GIF") mime = "image/gif";
-        else mime.assign(format);
-        cursor += 3;
-    } else {
-        const size_t mime_begin = cursor;
-        while (cursor < frame.size() && frame[cursor] != 0) ++cursor;
-        if (cursor == frame.size()) return {};
-        mime.assign(reinterpret_cast<const char*>(frame.data() + mime_begin),
-                    cursor - mime_begin);
-        ++cursor;
-    }
-    if (cursor >= frame.size()) return {};
-    const unsigned int type = frame[cursor++];
-    cursor = SkipId3Description(frame, cursor, frame[0]);
-    if (cursor >= frame.size() || frame.size() - cursor > kMaximumPictureBytes)
-        return {};
-    const std::span<const unsigned char> data(frame.data() + cursor,
-                                               frame.size() - cursor);
-    if (!CoverPictureMimeMatches(mime, data)) return {};
-    if (picture_type) *picture_type = type;
-    return {data.begin(), data.end()};
+    const auto picture = ttpcomm::host::tags::Id3Picture({frame.data(), frame.size()}, version);
+    if (!picture || picture->data.empty() || picture->data.size() > kMaximumPictureBytes ||
+        !CoverPictureMimeMatches(picture->mime, {picture->data.data(), picture->data.size()})) return {};
+    if (picture_type) *picture_type = picture->type;
+    return {picture->data.begin(), picture->data.end()};
 }
 
 std::vector<unsigned char> ReadId3Picture(std::ifstream& input,
                                           const unsigned char header[10],
                                           bool* picture_declared) {
-    const unsigned int version = header[3];
-    if (version < 2 || version > 4) return {};
+    const unsigned version = header[3];
     const uint32_t tag_size = SyncSafe32(header + 6);
-    if (tag_size == 0 || tag_size > kMaximumPictureBytes) return {};
+    if (version < 2 || version > 4 || !tag_size || tag_size > kMaximumPictureBytes) return {};
     std::vector<unsigned char> tag(tag_size);
     if (!ReadExact(input, tag.data(), tag.size())) return {};
-    size_t cursor{};
-    while (cursor < tag.size()) {
-        const size_t frame_header = version == 2 ? 6 : 10;
-        if (cursor + frame_header > tag.size() || tag[cursor] == 0) break;
-        const bool apic = version == 2
-            ? std::memcmp(tag.data() + cursor, "PIC", 3) == 0
-            : std::memcmp(tag.data() + cursor, "APIC", 4) == 0;
-        const uint32_t frame_size = version == 2
-            ? (static_cast<uint32_t>(tag[cursor + 3]) << 16) |
-              (static_cast<uint32_t>(tag[cursor + 4]) << 8) |
-              tag[cursor + 5]
-            : (version == 4 ? SyncSafe32(tag.data() + cursor + 4)
-                            : BigEndian32(tag.data() + cursor + 4));
-        cursor += frame_header;
-        if (frame_size == 0 || frame_size > tag.size() - cursor) break;
-        if (apic) {
-            if (picture_declared) *picture_declared = true;
-            unsigned int picture_type{};
-            auto picture = ParseId3Apic(
-                std::span<const unsigned char>(tag.data() + cursor,
-                                               frame_size),
-                version, &picture_type);
-            static_cast<void>(picture_type);
-            return picture;
-        }
-        cursor += frame_size;
+    // v2.4 sizes describe stored frames; removing bytes from the whole tag
+    // would shift later headers. Decode unsynchronization inside each frame.
+    const bool unsynchronized = version < 4 && (header[5] & 0x80U) != 0;
+    if (unsynchronized) tag = ttpcomm::host::tags::RemoveUnsynchronization({tag.data(), tag.size()});
+    const auto start = ttpcomm::host::tags::FrameStart({tag.data(), tag.size()}, version, header[5]);
+    if (!start) return {};
+    size_t cursor = *start;
+    ttpcomm::host::tags::Frame frame;
+    while (ttpcomm::host::tags::NextFrame({tag.data(), tag.size()}, version, cursor, frame) == ttpcomm::host::tags::FrameStatus::frame) {
+        if (frame.identifier != "APIC" && frame.identifier != "PIC") continue;
+        if (picture_declared) *picture_declared = true;
+        std::vector<unsigned char> storage;
+        uint64_t budget = kMaximumPictureBytes;
+        const auto decoded = ttpcomm::host::tags::DecodePayload(frame.payload, static_cast<unsigned char>(version),
+            static_cast<unsigned char>(frame.flags), unsynchronized, storage, budget);
+        if (!decoded) return {};
+        return ParseId3Apic({decoded->data(), decoded->size()}, version, nullptr);
     }
     return {};
 }
@@ -427,23 +369,12 @@ void* SafeSpectrumCreate(SpectrumFactory function) noexcept {
 }
 
 bool SafeSpectrumProcess(void* object, int16_t* buffer, int mode) noexcept {
-    __try {
-        if (!object || !buffer) return false;
-        auto** table = *reinterpret_cast<void***>(object);
-        if (!table || !table[1]) return false;
-        reinterpret_cast<SpectrumProcess>(table[1])(object, buffer, mode);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
+    return ttpcomm::client::Spectrum(object, buffer, mode);
+    }
 
 void SafeSpectrumDestroy(void* object) noexcept {
-    __try {
-        if (!object) return;
-        auto** table = *reinterpret_cast<void***>(object);
-        if (table && table[0])
-            reinterpret_cast<SpectrumDestroy>(table[0])(object, 1);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
+    ttpcomm::client::Destroy(object);
+    }
 #else
 void* SafeDreamCreate(DreamCreate, uint32_t, int) noexcept { return nullptr; }
 bool SafeDreamResize(DreamResize, void*, uint32_t, int) noexcept { return false; }
@@ -458,7 +389,7 @@ void SafeSpectrumDestroy(void*) noexcept {}
 
 } // namespace
 
-HBITMAP detail::LoadTaskbarCoverBitmap(const std::filesystem::path& path,
+static HBITMAP LoadEmbeddedTaskbarCoverBitmap(const std::filesystem::path& path,
                                      const audio::AudioMetadata& metadata, SIZE* size) {
     *size = {};
     try {
@@ -510,12 +441,26 @@ HBITMAP detail::LoadTaskbarCoverBitmap(const std::filesystem::path& path,
     } catch (const std::exception&) { return nullptr; }
 }
 
+HBITMAP detail::LoadTaskbarCoverBitmap(const std::filesystem::path& path,
+                                     const audio::AudioMetadata& metadata, SIZE* size) {
+    if (auto cover = LoadEmbeddedTaskbarCoverBitmap(path, metadata, size)) return cover;
+    const auto background = OsuLibraryBackgroundPath(metadata);
+    const auto image = DecodeCoverImage(ReadCoverImageFile(background), 1024);
+    *size = image.size;
+    return image.bitmap;
+}
+
 // Runtime counterpart of the original CVisualCtrl object at CPlayerWnd+0x438.
 // It deliberately owns only renderer state; the child HWND and settings remain
 // in PlayerWindow, matching the original lifetime split.
 class VisualRuntime {
 public:
+    void SetPlayerEffectColor(COLORREF color) {
+        std::scoped_lock lock(mutex_);
+        player_effect_color_ = color;
+    }
     ~VisualRuntime() {
+        osu_visual_.Detach();
         DestroyDream();
         DestroySpectrumProcessor();
         DestroySurface();
@@ -528,7 +473,9 @@ public:
         if (module_ == module) return;
         DestroyDream();
         DestroySpectrumProcessor();
-        module_ = module;
+        module_reference_ = ttpcomm::client::ModuleReference(module);
+        module_ = module_reference_.get();
+        module = module_;
         create_ = module ? reinterpret_cast<DreamCreate>(
             GetProcAddress(module, MAKEINTRESOURCEA(90))) : nullptr;
         resize_ = module ? reinterpret_cast<DreamResize>(
@@ -545,7 +492,8 @@ public:
 
     void Configure(const settings::VisualSettings& settings, SIZE size,
                    bool full_screen = false, const skin::SkinImage& background = {},
-                   const RECT* background_bounds = nullptr) {
+                   const RECT* background_bounds = nullptr, bool preserve_cover = false,
+                   const settings::FullScreenSettings* dream_options = nullptr) {
         std::scoped_lock lock(mutex_);
         output_width_ = std::max(0, static_cast<int>(size.cx));
         output_height_ = std::max(0, static_cast<int>(size.cy));
@@ -555,11 +503,21 @@ public:
         // empty and renders at the visual element's exact skin dimensions.
         int next_width = output_width_;
         int next_height = output_height_;
+        dream_stretch_ = !full_screen || !dream_options || dream_options->dream_stretch;
         if (full_screen) {
             switch (settings.type) {
             case 1:
-                next_width = std::min(next_width, 320);
-                next_height = std::min(next_height, 240);
+                if(dream_options && dream_options->dream_resolution!=0 &&
+                   next_width>=2 && next_height>=2) {
+                    const bool custom=dream_options->dream_resolution==2;
+                    next_width=custom?std::clamp(dream_options->dream_width,
+                        settings::FullScreenSettings::dream_min_size,settings::FullScreenSettings::dream_max_size):800;
+                    next_height=custom?std::clamp(dream_options->dream_height,
+                        settings::FullScreenSettings::dream_min_size,settings::FullScreenSettings::dream_max_size):800;
+                } else {
+                    next_width = std::min(next_width, 320);
+                    next_height = std::min(next_height, 240);
+                }
                 break;
             case 2:
                 next_width = std::min(next_width, 240);
@@ -575,14 +533,31 @@ public:
         }
         const bool geometry_changed = next_width != width_ ||
                                       next_height != height_;
+        const bool leaving_full_screen = full_screen_ && !full_screen;
+        const bool player_effect_mode_changed = settings_.type != settings.type;
+        const bool preserve_player_effect_frame = !player_effect_mode_changed &&
+            settings.type >= 5 && have_dynamic_frame_;
         settings_ = settings;
-        settings_.type = std::clamp(settings_.type, 0, 4);
+        settings_.type = AvailableVisualType(settings_.type,full_screen);
+        if(IsOsuVisualType(settings_.type)) {
+            // HWND transitions detach explicitly. The renderer handles size
+            // changes with Reset; changing settings does not need a new GPU.
+            osu_visual_.Configure(settings_);
+        } else osu_visual_.Release(); // effect ended: release CPU assets and worker too
         settings_.frames_per_second = std::clamp(
             settings_.frames_per_second, 0, 100);
         settings_.blur_speed = std::clamp(settings_.blur_speed, 0, 255);
         width_ = next_width;
         height_ = next_height;
         full_screen_ = full_screen;
+        if(leaving_full_screen) {
+            // assign/clear alone retain the peak fullscreen allocation even
+            // after the visible control returns to its small skin rectangle.
+            std::vector<unsigned char>().swap(scope_);
+            std::vector<uint32_t>().swap(background_pixels_);
+            std::vector<unsigned char>().swap(thumbnail_);
+        }
+        cover_frame_.reset();
         album_background_mode_ = false;
         album_frame_dirty_ = true;
         // FUN_0045775A reinitializes the active renderer on every call, even
@@ -593,12 +568,26 @@ public:
         peaks_.assign(static_cast<size_t>(width_), int16_t{});
         peak_speed_.assign(static_cast<size_t>(width_), int16_t{});
         previous_peaks_.assign(static_cast<size_t>(width_), int16_t{});
-        scope_.assign(static_cast<size_t>(width_ + 2) * (height_ + 2), 0);
-        have_dynamic_frame_ = false;
+        if(IsOsuVisualType(settings_.type)) std::vector<unsigned char>().swap(scope_);
+        else scope_.assign(static_cast<size_t>(width_ + 2) * (height_ + 2), 0);
+        have_dynamic_frame_ = preserve_player_effect_frame;
+        // Baidu's layout only changes Draw's RECT. Reset is dispatched when
+        // the mode changes, so resizing while paused retains the spectrum.
+        if (player_effect_mode_changed) {
+            player_effect_.Reset();
+        }
+        ++spectrum_generation_;
         dream_bits_ = nullptr;
-        if (geometry_changed || !surface_dc_ || !surface_bits_)
-            RecreateSurface();
-        CacheBackground(background, background_bounds);
+        if(IsOsuVisualType(settings_.type) || width_<=0 || height_<=0) {
+            // The DLL owns its own CPU/D3D surfaces. Do not also allocate a
+            // fullscreen host DIB and a duplicate cached skin background.
+            DestroySurface();
+            std::vector<uint32_t>().swap(background_pixels_);
+        } else {
+            if (geometry_changed || !surface_dc_ || !surface_bits_)
+                RecreateSurface();
+            CacheBackground(background, background_bounds);
+        }
         if (settings_.type == 1) EnsureDream(true);
         else DestroyDream();
         if (settings_.type == 2) EnsureSpectrumProcessor();
@@ -606,7 +595,9 @@ public:
         // Both branches of FUN_0045775A clear the raw picture buffer, decoded
         // IPicture and prompt CString.  Only CPlayerWnd::Run in playing state
         // may repopulate Type 4 after any mode/geometry configuration.
+        if (preserve_cover) return;
         source_.clear();
+        osu_background_.clear();
         fallback_.clear();
         thumbnail_interface_ = false;
         thumbnail_.clear();
@@ -626,23 +617,27 @@ public:
     void ConfigureAlbum(const settings::VisualSettings& visual, SIZE size,
                         const settings::FullScreenSettings& album,
                         COLORREF background, const std::filesystem::path& source,
-                        const audio::AudioMetadata& metadata) {
+                        const audio::AudioMetadata& metadata, bool source_ready = true) {
         // Configure and publish the current track in one renderer transaction.
         // The paint worker must never see an intermediate fallback-only frame
         // while resizing/switching into an album that already has artwork.
         std::scoped_lock lock(mutex_);
-        Configure(visual, size, true);
+        const bool retain = settings_.type == 4;
+        Configure(visual, size, true, {}, nullptr, retain);
         album_background_mode_ = settings_.type == 4;
         album_settings_ = album;
         album_background_color_ = background;
-        SetSource(source, {}, metadata);
+        if (source_ready) SetSource(source, {}, metadata, true);
         LoadAlbumFallback(); // also handles stopped/no-track entry
     }
 
     void SetSource(const std::filesystem::path& source,
                    std::wstring fallback,
-                   const audio::AudioMetadata& metadata) {
+                   const audio::AudioMetadata& metadata, bool force_reload = false) {
         std::scoped_lock lock(mutex_);
+        // Publish path, payload and decoded picture together. Deferred empty
+        // metadata must not replace a known image with a temporary fallback.
+        if (settings_.type == 4 && metadata.thumbnail_pending) return;
         // With a reader-owned ISoundThumbnail whose first entry produces no
         // bytes, the original worker leaves Type 4 as the bare skin panel:
         // it never initializes the 0x821B prompt/hit rectangle.  This is
@@ -650,11 +645,21 @@ public:
         // compatibility metadata path may still yield a picture or prompt.
         fallback_ = metadata.thumbnail_interface && metadata.thumbnail.empty()
             ? std::wstring{} : std::move(fallback);
-        const bool metadata_changed =
+        const auto osu_background = OsuLibraryBackgroundPath(metadata);
+        const bool metadata_changed = osu_background_ != osu_background ||
             thumbnail_interface_ != metadata.thumbnail_interface ||
             thumbnail_ != metadata.thumbnail;
-        if (source_ == source && !metadata_changed) return;
+        if(IsOsuVisualType(settings_.type)) {
+            std::filesystem::path beatmap,background;
+            for(const auto& [name,value]:metadata.entries) {
+                if(name==L"TTPlayer.Osu.Beatmap")beatmap=value;
+                else if(name==L"TTPlayer.Osu.Background")background=value;
+            }
+            osu_visual_.Source(source,metadata.thumbnail,module_,beatmap,background);
+        }
+        if (source_ == source && !metadata_changed && !force_reload) return;
         source_ = source;
+        osu_background_ = osu_background;
         thumbnail_interface_ = metadata.thumbnail_interface;
         thumbnail_ = metadata.thumbnail;
         if (settings_.type == 4) LoadCover();
@@ -676,10 +681,13 @@ public:
         have_dynamic_frame_ = settings_.type == 1 && dream_bits_ != nullptr;
     }
 
-    void ClearPlayback() {
+    void ClearPlayback(bool retain_cover = false) {
         std::scoped_lock lock(mutex_);
+        if (retain_cover && settings_.type == 4) return;
+        if(IsOsuVisualType(settings_.type))osu_visual_.Source({}, {}, module_);
         ClearDynamic();
         source_.clear();
+        osu_background_.clear();
         // FUN_00457BCF releases the decoded picture and calls FUN_00403A2B on
         // CVisualCtrl+0x1588, clearing the 0x821B prompt as well. Spectrum,
         // scope and cover expose the backing; a prior dream frame is the
@@ -702,40 +710,104 @@ public:
         LoadAlbumFallback();
     }
 
+    bool IsOsu() const {std::scoped_lock lock(mutex_);return IsOsuVisualType(settings_.type);}
+    void SetOsuFallbackImage(const std::filesystem::path& path) {
+        std::scoped_lock lock(mutex_);osu_visual_.FallbackImage(path);
+    }
+    void SetOsuViewport(HWND window,const RECT& bounds) {
+        std::scoped_lock lock(mutex_);
+        if(IsOsuVisualType(settings_.type))osu_visual_.Viewport(window,bounds);
+    }
+    void UpdateOsu(const audio::ExtendedVisualizationSamples& samples,
+                   const audio::PlaybackClockSnapshot& clock,HWND window,float volume) {
+        std::scoped_lock lock(mutex_);
+        if(IsOsuVisualType(settings_.type))osu_visual_.Update(samples,clock,window,volume);
+    }
+    void DetachOsu() {std::scoped_lock lock(mutex_);osu_visual_.Detach();}
+    void ReleaseOsu() {std::scoped_lock lock(mutex_);osu_visual_.Release();}
+    bool BeginOsuExit() {std::scoped_lock lock(mutex_);return IsOsuVisualType(settings_.type) && osu_visual_.BeginExit();}
+    bool OsuExitComplete() {std::scoped_lock lock(mutex_);return !IsOsuVisualType(settings_.type) || osu_visual_.ExitComplete();}
+    bool OsuTransitionActive() {std::scoped_lock lock(mutex_);return IsOsuVisualType(settings_.type) && osu_visual_.TransitionActive();}
+    void CancelOsuTransition() {std::scoped_lock lock(mutex_);osu_visual_.CancelTransition();}
     void Update(const audio::VisualizationSamples& samples) {
         std::scoped_lock lock(mutex_);
         if (width_ <= 0 || height_ <= 0) return;
-        // FUN_004ABBDC asks the reader for exactly 0x200 samples per channel
-        // and refuses a short block.  The previous frame is retained until a
-        // complete analysis block is available.
-        if (samples.count < audio::VisualizationSamples::capacity) return;
+        // 004ABCC2 rejects only an empty read, not a positive short block.
+        // Dream still advances for those blocks. Define the missing tail as
+        // silence instead of repeating the original's uninitialized reads.
+        const size_t count=std::min(samples.count,kAnalysisSamples);
+        if (!count || (settings_.type != 1 && count < kAnalysisSamples)) return;
         // FUN_004ABBDC writes into one persistent 0xC00-byte scratch block.
         // Every visual mode refreshes the first 512 shorts, while only the
         // stereo dream mode refreshes the second 512; ordinal 105 owns the
         // final 512 spectrum slots.  Keeping this block persistent matters
         // for unusually wide embedded scope controls after a mode switch.
-        std::copy_n(samples.left.begin(), kAnalysisSamples,
+        std::copy_n(samples.left.begin(), count,
                     analysis_work_.begin());
         if (settings_.type == 1) {
-            std::copy_n(samples.right.begin(), kAnalysisSamples,
+            std::fill(analysis_work_.begin()+count,
+                      analysis_work_.begin()+kAnalysisSamples,int16_t{});
+            std::copy_n(samples.right.begin(), count,
                         analysis_work_.begin() + kAnalysisSamples);
+            std::fill(analysis_work_.begin()+kAnalysisSamples+count,
+                      analysis_work_.begin()+2*kAnalysisSamples,int16_t{});
         }
+        std::copy_n(analysis_work_.begin(),kAnalysisSamples,skin_pcm_left_.begin());
+        if(settings_.type==1)
+            std::copy_n(analysis_work_.begin()+kAnalysisSamples,kAnalysisSamples,skin_pcm_right_.begin());
+        else std::copy_n(samples.right.begin(),kAnalysisSamples,skin_pcm_right_.begin());
         switch (settings_.type) {
         case 1: UpdateDream(samples); break;
         case 2: UpdateSpectrum(samples); break;
         case 3: UpdateScope(samples); break;
+        case 5:
+        case 6: {
+            // Advance one native effect frame at the configured visual FPS.
+            const auto frequency = PlayerFrequencyData(samples.left);
+            player_effect_.Update(frequency);
+            have_dynamic_frame_ = true;
+            break;
+        }
         default: break;
         }
     }
 
-    void Paint(HDC dc, const RECT& bounds) {
+    void Paint(HDC dc, const RECT& bounds, const TtpSkinVisualColors* colors = nullptr,
+               bool allow_gpu = true) {
         std::scoped_lock lock(mutex_);
         if (!dc || bounds.right <= bounds.left || bounds.bottom <= bounds.top)
             return;
+        // The native renderer and FFT remain authoritative. A provider may
+        // supply a temporary palette without changing persisted visual options.
+        const auto original = settings_;
+        struct Restore {
+            VisualRuntime& runtime;
+            const settings::VisualSettings& settings;
+            ~Restore() {
+                // Complete GDI reads of our reusable DIB before releasing the
+                // render lock and letting another thread overwrite its pixels.
+                GdiFlush();
+                runtime.settings_ = settings; runtime.paint_colors_ = nullptr;
+            }
+        } restore{*this, original};
+        paint_colors_ = colors;
+        if (colors) {
+            settings_.spectrum_top_color = colors->top;
+            settings_.spectrum_middle_color = colors->middle;
+            settings_.spectrum_bottom_color = colors->bottom;
+            settings_.spectrum_peak_color = colors->peak;
+            settings_.blur_scope_color = colors->scope;
+        }
         switch (settings_.type) {
+        case 7:
+        case 8:
+            osu_visual_.Paint(dc,bounds,full_screen_ && allow_gpu);
+            break;
         case 1:
-            PaintCachedBackground(dc, bounds);
-            PaintDream(dc, bounds);
+            // Dream is an opaque, complete frame. Clearing the live DC first
+            // publishes a black intermediate image between two GDI calls.
+            // Only expose the cached background when there is no frame.
+            if (!PaintDream(dc, bounds)) PaintCachedBackground(dc, bounds);
             break;
         case 2:
             if (have_dynamic_frame_) PaintSpectrum(dc, bounds);
@@ -748,9 +820,59 @@ public:
         case 4:
             PaintCover(dc, bounds);
             break;
+        case 5:
+        case 6: {
+            // BaiduMusic.exe!00432740 paints a black backing and passes the
+            // middle half of the lyric surface to VisualEffectCtrl::Draw.
+            if (!have_dynamic_frame_ && !full_screen_) {
+                PaintCachedBackground(dc, bounds);
+                break;
+            }
+            if (!surface_dc_ || !surface_bits_) break;
+            RECT frame{0, 0, width_, height_};
+            const COLORREF background = settings_.type == 5
+                ? settings_.pulse_background : settings_.ripple_background;
+            GdiFlush();
+            if (full_screen_) {
+                SetDCBrushColor(surface_dc_, background);
+                FillRect(surface_dc_, &frame, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            } else {
+                // Always restore the skin before compositing coverage. Reusing
+                // the preceding frame would accumulate opacity and leave trails.
+                RestoreBackground();
+            }
+            if (have_dynamic_frame_) {
+                RECT effect = frame;
+                const LONG quarter = height_ / 4;
+                effect.top += quarter;
+                effect.bottom -= quarter;
+                const bool pulse = settings_.type == 5;
+                const bool follow = pulse ? settings_.pulse_follow_lyric : settings_.ripple_follow_lyric;
+                const COLORREF color = follow ? player_effect_color_
+                    : pulse ? settings_.pulse_color : settings_.ripple_color;
+                player_effect_.Paint(surface_dc_, effect, settings_.type, color,
+                                     background, !full_screen_);
+            }
+            StretchBlt(dc, bounds.left, bounds.top, bounds.right - bounds.left,
+                bounds.bottom - bounds.top, surface_dc_, 0, 0, width_, height_, SRCCOPY);
+            break;
+        }
         default:
             PaintCachedBackground(dc, bounds);
             break;
+        }
+    }
+
+    void SpectrumFrame(TtpSkinSpectrumFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        frame.type=static_cast<uint32_t>(settings_.type);
+        frame.generation=spectrum_generation_;frame.revision=spectrum_revision_;
+        frame.count=settings_.type==2 && have_dynamic_frame_?256:0;
+        if(frame.count) std::copy_n(analysis_work_.begin()+kAnalysisSamples*2,frame.count,frame.magnitudes);
+        frame.sample_count=settings_.type==3 && have_dynamic_frame_?kAnalysisSamples:0;
+        if(frame.sample_count) {
+            std::copy(skin_pcm_left_.begin(),skin_pcm_left_.end(),frame.samples_left);
+            std::copy(skin_pcm_right_.begin(),skin_pcm_right_.end(),frame.samples_right);
         }
     }
 
@@ -760,6 +882,47 @@ public:
             return;
         if (album_background_mode_) PaintCover(dc, bounds);
         else PaintCachedBackground(dc, bounds);
+        GdiFlush();
+    }
+
+    template<class Painter>
+    BOOL PaintContentFrame(HDC target, const RECT& bounds, Painter&& paint) {
+        // Providers normally supply a memory canvas. Preserve that fast path;
+        // only a visible target needs a second, whole-content transaction.
+        if (GetObjectType(target) == OBJ_MEMDC) return paint(target);
+        const int64_t width = int64_t(bounds.right) - bounds.left;
+        const int64_t height = int64_t(bounds.bottom) - bounds.top;
+        constexpr int64_t max_pixels = 64 * 1024 * 1024;
+        if (width <= 0 || height <= 0 || width > INT_MAX || height > INT_MAX ||
+            width * height > max_pixels) return FALSE;
+        // This lock is separate from the effect lock: fetching track/lyric
+        // state must not hold up the audio visualization worker.
+        std::scoped_lock lock(content_mutex_);
+        if (content_frame_in_use_) return FALSE;
+        content_frame_in_use_ = true;
+        struct End {bool& active;~End(){active=false;}} end{content_frame_in_use_};
+        if (!content_frame_ || content_frame_->size.cx < width || content_frame_->size.cy < height) {
+            SIZE capacity{std::max<LONG>(static_cast<LONG>(width),content_frame_?content_frame_->size.cx:0),
+                          std::max<LONG>(static_cast<LONG>(height),content_frame_?content_frame_->size.cy:0)};
+            if (int64_t(capacity.cx)*capacity.cy > max_pixels)
+                capacity={static_cast<LONG>(width),static_cast<LONG>(height)};
+            auto next=std::make_unique<CoverFrame>(capacity);
+            if (!next->previous || next->previous==HGDI_ERROR) return FALSE;
+            content_frame_=std::move(next);
+        }
+        const HDC canvas=content_frame_->dc;
+        const int saved=SaveDC(canvas);
+        if (!saved) return FALSE;
+        struct Restore {HDC dc;int saved;~Restore(){RestoreDC(dc,saved);}} restore{canvas,saved};
+        // Keep the provider's logical coordinates, including non-zero/negative
+        // origins. The caller's clip and mapping remain on the final target.
+        if (!SetWindowOrgEx(canvas,bounds.left,bounds.top,nullptr)) return FALSE;
+        GdiFlush();
+        if (!paint(canvas)) return FALSE;
+        const BOOL copied=BitBlt(target,bounds.left,bounds.top,static_cast<int>(width),static_cast<int>(height),
+            canvas,bounds.left,bounds.top,SRCCOPY);
+        GdiFlush(); // Finish using this frame before another callback reuses it.
+        return copied;
     }
 
     [[nodiscard]] bool FallbackHit(POINT point) const noexcept {
@@ -770,6 +933,24 @@ public:
     }
 
 private:
+    struct CoverFrame {
+        WTL::CDC dc;
+        WTL::CBitmap bitmap;
+        HGDIOBJ previous{};
+        SIZE size{};
+
+        explicit CoverFrame(SIZE target) : size(target) {
+            dc.CreateCompatibleDC();
+            if (!dc) return;
+            BITMAPINFO info{};
+            info.bmiHeader = {sizeof(BITMAPINFOHEADER), size.cx, -size.cy, 1, 32, BI_RGB};
+            void* pixels{};
+            bitmap.Attach(CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0));
+            if (bitmap) previous = SelectObject(dc, bitmap);
+        }
+        ~CoverFrame() { if (previous) SelectObject(dc, previous); }
+    };
+
     void DestroySurface() noexcept {
         if (surface_dc_ && surface_old_bitmap_)
             SelectObject(surface_dc_, surface_old_bitmap_);
@@ -826,11 +1007,13 @@ private:
             surface_bits_, surface_bits_ + static_cast<size_t>(width_) * height_);
     }
 
+    const TtpSkinVisualColors* paint_colors_{}; // protected by mutex_, paint call only
+
     bool RestoreBackground() {
         const size_t pixels = static_cast<size_t>(width_) * height_;
         if (!surface_bits_ || background_pixels_.size() != pixels) return false;
-        std::copy(background_pixels_.begin(), background_pixels_.end(),
-                  surface_bits_);
+        if (paint_colors_) std::fill_n(surface_bits_,pixels,DibColor(paint_colors_->background));
+        else std::copy(background_pixels_.begin(), background_pixels_.end(),surface_bits_);
         return true;
     }
 
@@ -844,6 +1027,8 @@ private:
 
     void DestroyDream() noexcept {
         if (dream_) SafeDreamDestroy(destroy_, dream_);
+        if (dream_draw_) DrawDibClose(dream_draw_);
+        dream_draw_ = nullptr;
         dream_ = nullptr;
         dream_bits_ = nullptr;
         dream_width_ = 0;
@@ -890,6 +1075,7 @@ private:
         if (!dream_)
             dream_ = SafeDreamCreate(create_, static_cast<uint32_t>(width), height);
         if (dream_) {
+            if (!dream_draw_) dream_draw_ = DrawDibOpen();
             dream_width_ = width;
             dream_height_ = height;
         }
@@ -907,6 +1093,8 @@ private:
     }
 
     void UpdateSpectrum(const audio::VisualizationSamples&) {
+        PrimePlayerSpectrumScale();
+        ++spectrum_revision_;
         if (spectrum_.size() != static_cast<size_t>(width_))
             spectrum_.assign(static_cast<size_t>(width_), int16_t{});
         if (peaks_.size() != spectrum_.size()) peaks_ = spectrum_;
@@ -1034,9 +1222,9 @@ private:
         have_dynamic_frame_ = true;
     }
 
-    void PaintDream(HDC dc, const RECT& bounds) const {
+    bool PaintDream(HDC dc, const RECT& bounds) const {
         if (!have_dynamic_frame_ || !dream_bits_ ||
-            dream_width_ <= 0 || dream_height_ <= 0) return;
+            dream_width_ <= 0 || dream_height_ <= 0) return false;
         if (dream_bits_ && dream_width_ > 0 && dream_height_ > 0) {
             BITMAPINFO information{};
             information.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1045,13 +1233,26 @@ private:
             information.bmiHeader.biPlanes = 1;
             information.bmiHeader.biBitCount = 32;
             information.bmiHeader.biCompression = BI_RGB;
-            SetStretchBltMode(dc, COLORONCOLOR);
-            StretchDIBits(dc, bounds.left, bounds.top,
-                bounds.right - bounds.left, bounds.bottom - bounds.top,
-                0, 0, dream_width_, dream_height_, dream_bits_, &information,
-                DIB_RGB_COLORS, SRCCOPY);
-            return;
+            // 0045697F presents the positive-height 32-bit DIB through one
+            // persistent DrawDib handle, including scaling and clipping.
+            if (!dream_draw_) return false;
+            const int output_width=bounds.right-bounds.left, output_height=bounds.bottom-bounds.top;
+            if(output_width<=0 || output_height<=0)return false;
+            int source_width=dream_width_, source_height=dream_height_;
+            if(!dream_stretch_) {
+                if(static_cast<int64_t>(source_width)*output_height>
+                   static_cast<int64_t>(source_height)*output_width)
+                    source_width=std::max(1,static_cast<int>(static_cast<int64_t>(source_height)*output_width/output_height));
+                else
+                    source_height=std::max(1,static_cast<int>(static_cast<int64_t>(source_width)*output_height/output_width));
+            }
+            return DrawDibDraw(dream_draw_, dc, bounds.left, bounds.top,
+                output_width, output_height,
+                &information.bmiHeader, const_cast<uint32_t*>(dream_bits_),
+                (dream_width_-source_width)/2, (dream_height_-source_height)/2,
+                source_width, source_height, DDF_BACKGROUNDPAL) != FALSE;
         }
+        return false;
     }
 
     void PaintSpectrum(HDC dc, const RECT& bounds) {
@@ -1163,11 +1364,30 @@ private:
         // DC first and only then alpha-blended the cover bitmap. At the visual
         // worker cadence that exposed a real background-only intermediate
         // frame, especially while the layered parent was being refreshed.
-        // Compose the complete Type 4 frame in the persistent DIB and publish
-        // it with one final blit. WIC/GDI+ return premultiplied pixels; IPicture is
-        // still the fallback, but neither path can now be observed half drawn.
+        // Compose at the actual destination size. Plugin main/list/shade views
+        // can have a different aspect ratio from the native analysis surface;
+        // stretching an already fitted cover with that surface distorts it.
+        // Keep the complete frame buffered so no background-only intermediate
+        // frame is visible. Only the skin backing may be stretched.
         if (!RestoreBackground()) return;
-        const RECT frame{0, 0, width_, height_};
+        const SIZE size{bounds.right - bounds.left, bounds.bottom - bounds.top};
+        if (!cover_frame_ || !cover_frame_->previous ||
+            cover_frame_->size.cx < size.cx || cover_frame_->size.cy < size.cy) {
+            // Retain capacity for alternating main/list paints instead of
+            // allocating GDI objects on every frame. Configure releases it.
+            const SIZE capacity{std::max(size.cx, cover_frame_ ? cover_frame_->size.cx : 0L),
+                                std::max(size.cy, cover_frame_ ? cover_frame_->size.cy : 0L)};
+            cover_frame_ = std::make_unique<CoverFrame>(capacity);
+        }
+        if (!cover_frame_->previous) return;
+        const HDC frame_dc = cover_frame_->dc;
+        const RECT frame{0, 0, size.cx, size.cy};
+        SetStretchBltMode(frame_dc, COLORONCOLOR);
+        StretchBlt(frame_dc, 0, 0, size.cx, size.cy,
+                   surface_dc_, 0, 0, width_, height_, SRCCOPY);
+        const auto present = [&] {
+            BitBlt(dc, bounds.left, bounds.top, size.cx, size.cy, frame_dc, 0, 0, SRCCOPY);
+        };
         if (cover_payload_present_) {
             if (cover_bitmap_) {
                 const int source_width = cover_bitmap_size_.cx;
@@ -1183,11 +1403,11 @@ private:
                     static_cast<int>(source_height * scale));
                 const int x = frame.left + (available_width - width) / 2;
                 const int y = frame.top + (available_height - height) / 2;
-                const HDC source = CreateCompatibleDC(surface_dc_);
+                const HDC source = CreateCompatibleDC(frame_dc);
                 if (source) {
                     const HGDIOBJ old = SelectObject(source, cover_bitmap_);
                     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-                    AlphaBlend(surface_dc_, x, y, width, height, source, 0, 0,
+                    AlphaBlend(frame_dc, x, y, width, height, source, 0, 0,
                                source_width, source_height, blend);
                     SelectObject(source, old);
                     DeleteDC(source);
@@ -1198,11 +1418,11 @@ private:
                 cover_->get_Width(&himetric_width);
                 cover_->get_Height(&himetric_height);
                 const int source_width = MulDiv(
-                    himetric_width, GetDeviceCaps(surface_dc_, LOGPIXELSX), 2540);
+                    himetric_width, GetDeviceCaps(frame_dc, LOGPIXELSX), 2540);
                 const int source_height = MulDiv(
-                    himetric_height, GetDeviceCaps(surface_dc_, LOGPIXELSY), 2540);
+                    himetric_height, GetDeviceCaps(frame_dc, LOGPIXELSY), 2540);
                 if (source_width <= 0 || source_height <= 0) {
-                    BlitSurface(dc, bounds);
+                    present();
                     return;
                 }
                 const int available_width = frame.right - frame.left;
@@ -1216,19 +1436,19 @@ private:
                     static_cast<int>(source_height * scale));
                 const int x = frame.left + (available_width - width) / 2;
                 const int y = frame.top + (available_height - height) / 2;
-                cover_->Render(surface_dc_, x, y, width, height, 0, himetric_height,
+                cover_->Render(frame_dc, x, y, width, height, 0, himetric_height,
                                himetric_width, -himetric_height, nullptr);
             }
         } else if (!fallback_.empty()) {
             const LOGFONTW description = settings_.font_valid
                 ? settings_.font : DefaultVisualFont();
             const HFONT font = CreateFontIndirectW(&description);
-            const HGDIOBJ old_font = font ? SelectObject(surface_dc_, font)
+            const HGDIOBJ old_font = font ? SelectObject(frame_dc, font)
                                           : nullptr;
-            SetBkMode(surface_dc_, TRANSPARENT);
-            SetTextColor(surface_dc_, settings_.text_color);
+            SetBkMode(frame_dc, TRANSPARENT);
+            SetTextColor(frame_dc, settings_.text_color);
             RECT measured{};
-            DrawTextW(surface_dc_, fallback_.c_str(), -1, &measured,
+            DrawTextW(frame_dc, fallback_.c_str(), -1, &measured,
                       DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
             const int width = std::min<int>(measured.right - measured.left,
                                             frame.right - frame.left);
@@ -1239,25 +1459,16 @@ private:
                 frame.top + ((frame.bottom - frame.top) - height) / 2,
                 frame.left + ((frame.right - frame.left) + width) / 2,
                 frame.top + ((frame.bottom - frame.top) + height) / 2};
-            DrawTextW(surface_dc_, fallback_.c_str(), -1, &text_bounds,
+            DrawTextW(frame_dc, fallback_.c_str(), -1, &text_bounds,
                       DT_SINGLELINE | DT_NOPREFIX);
-            const int output_width = bounds.right - bounds.left;
-            const int output_height = bounds.bottom - bounds.top;
-            fallback_bounds_ = {
-                bounds.left + MulDiv(text_bounds.left, output_width,
-                                     std::max(1, width_)),
-                bounds.top + MulDiv(text_bounds.top, output_height,
-                                    std::max(1, height_)),
-                bounds.left + MulDiv(text_bounds.right, output_width,
-                                     std::max(1, width_)),
-                bounds.top + MulDiv(text_bounds.bottom, output_height,
-                                    std::max(1, height_))};
+            fallback_bounds_ = text_bounds;
+            OffsetRect(&fallback_bounds_, bounds.left, bounds.top);
             if (font) {
-                SelectObject(surface_dc_, old_font);
+                SelectObject(frame_dc, old_font);
                 DeleteObject(font);
             }
         }
-        BlitSurface(dc, bounds);
+        present();
     }
 
     void BlitSurface(HDC dc, const RECT& bounds) const {
@@ -1269,56 +1480,62 @@ private:
     }
 
     void LoadCover() {
-        album_frame_dirty_ = true;
-        if (cover_bitmap_) {
-            DeleteObject(cover_bitmap_);
-            cover_bitmap_ = nullptr;
-            cover_bitmap_size_ = {};
-        }
-        if (cover_) {
-            cover_->Release();
-            cover_ = nullptr;
-        }
-        cover_payload_present_ = false;
-        fallback_bounds_ = {};
-        if (source_.empty()) {
-            LoadAlbumFallback();
-            return;
-        }
+        HBITMAP next_bitmap{};
+        SIZE next_size{};
+        IPicture* next_picture{};
+        bool next_payload{};
         // CPlayerWnd_Run obtains the byte blob from the active reader's
         // embedded-picture metadata and decodes exactly that blob. Shell
         // thumbnails may silently substitute Folder.jpg or generic artwork,
         // which the original never treats as a track cover.
-        try {
+        try { if (!source_.empty()) {
             if (thumbnail_interface_) {
                 // FUN_004AD83E asks ISoundThumbnail slot 6 for index zero;
                 // it neither searches for picture type 3 nor falls through to
                 // another parser when the reader owns this capability.
-                cover_payload_present_ = !thumbnail_.empty();
+                next_payload = !thumbnail_.empty();
                 const auto decoded = DecodeCoverImage(thumbnail_);
-                cover_bitmap_ = decoded.bitmap;
-                cover_bitmap_size_ = decoded.size;
-                if (!cover_bitmap_)
-                    cover_ = DecodePictureWithOle(thumbnail_);
+                next_bitmap = decoded.bitmap;
+                next_size = decoded.size;
+                if (!next_bitmap)
+                    next_picture = DecodePictureWithOle(thumbnail_);
             } else {
                 bool picture_declared{};
                 auto bytes = ReadEmbeddedPicture(source_, &picture_declared);
-                cover_payload_present_ = !bytes.empty();
+                next_payload = !bytes.empty();
                 const auto decoded = DecodeCoverImage(bytes);
-                cover_bitmap_ = decoded.bitmap;
-                cover_bitmap_size_ = decoded.size;
-                if (!cover_bitmap_) cover_ = DecodePictureWithOle(bytes);
+                next_bitmap = decoded.bitmap;
+                next_size = decoded.size;
+                if (!next_bitmap) next_picture = DecodePictureWithOle(bytes);
             }
-        } catch (const std::exception&) {
-            cover_ = nullptr;
+        }} catch (const std::exception&) {}
+        if (!next_bitmap && !next_picture && !osu_background_.empty()) {
+            const auto decoded = DecodeCoverImage(ReadCoverImageFile(osu_background_));
+            next_bitmap = decoded.bitmap;
+            next_size = decoded.size;
+            next_payload |= next_bitmap != nullptr;
         }
-        LoadAlbumFallback();
+        LoadAlbumFallback(next_bitmap, next_size, next_picture);
+        // Keep the displayed bitmap alive through all I/O and decoding. The
+        // render lock publishes only the completed cover/fallback/background.
+        std::swap(cover_bitmap_, next_bitmap);
+        std::swap(cover_bitmap_size_, next_size);
+        std::swap(cover_, next_picture);
+        cover_payload_present_ = next_payload;
+        fallback_bounds_ = {};
+        album_frame_dirty_ = true;
+        if (next_bitmap) DeleteObject(next_bitmap);
+        if (next_picture) next_picture->Release();
     }
 
     void LoadAlbumFallback() {
+        LoadAlbumFallback(cover_bitmap_, cover_bitmap_size_, cover_);
+    }
+
+    void LoadAlbumFallback(HBITMAP& bitmap, SIZE& size, IPicture*& picture) {
         // A corrupt/unsupported embedded picture is also a missing cover.
         // No shell thumbnail/Folder.jpg/network lookup is introduced here.
-        if (!album_background_mode_ || cover_bitmap_ || cover_ ||
+        if (!album_background_mode_ || bitmap || picture ||
             album_settings_.album_fallback_image.empty()) return;
         try {
             auto path = std::filesystem::path(album_settings_.album_fallback_image);
@@ -1330,16 +1547,20 @@ private:
             input.seekg(0);
             if (!ReadExact(input, bytes.data(), bytes.size())) return;
             const auto decoded = DecodeCoverImage(bytes);
-            cover_bitmap_ = decoded.bitmap;
-            cover_bitmap_size_ = decoded.size;
-            if (!cover_bitmap_) cover_ = DecodePictureWithOle(bytes);
+            bitmap = decoded.bitmap;
+            size = decoded.size;
+            if (!bitmap) picture = DecodePictureWithOle(bytes);
         } catch (const std::exception&) {
             // Keep the opaque configured background when the path is missing
             // or cannot be read; never retain the preceding track's cover.
         }
     }
 
+    ttpcomm::client::ModuleReference module_reference_;
     HMODULE module_{};
+    PlayerVisualEffect player_effect_;
+    OsuVisualClient osu_visual_;
+    COLORREF player_effect_color_{RGB(0, 255, 0)};
     DreamCreate create_{};
     DreamResize resize_{};
     DreamProcess process_{};
@@ -1350,10 +1571,16 @@ private:
     HBITMAP surface_bitmap_{};
     HGDIOBJ surface_old_bitmap_{};
     uint32_t* surface_bits_{};
+    std::unique_ptr<CoverFrame> cover_frame_;
+    std::recursive_mutex content_mutex_;
+    std::unique_ptr<CoverFrame> content_frame_;
+    bool content_frame_in_use_{};
     void* dream_{};
+    HDRAWDIB dream_draw_{};
     const uint32_t* dream_bits_{};
     int dream_width_{};
     int dream_height_{};
+    bool dream_stretch_{true};
     settings::VisualSettings settings_{};
     int width_{};
     int height_{};
@@ -1367,6 +1594,7 @@ private:
     mutable std::recursive_mutex mutex_;
     // CVisualCtrl+0x94c: one persistent 0xC00-byte analysis work block.
     std::array<int16_t, kAnalysisSamples * 3> analysis_work_{};
+    std::array<int16_t,kAnalysisSamples> skin_pcm_left_{},skin_pcm_right_{};
     std::vector<uint32_t> background_pixels_;
     // FUN_00456A11 updates four packed signed 16-bit values per column:
     // bar, fall counter, peak and previous peak.  Keeping integral state is
@@ -1377,9 +1605,11 @@ private:
     std::vector<int16_t> previous_peaks_;
     std::vector<unsigned char> scope_;
     bool have_dynamic_frame_{};
+    uint64_t spectrum_generation_{},spectrum_revision_{};
     std::filesystem::path source_;
     std::wstring fallback_;
     bool thumbnail_interface_{};
+    std::filesystem::path osu_background_;
     std::vector<unsigned char> thumbnail_;
     bool cover_payload_present_{};
     HBITMAP cover_bitmap_{};
@@ -1392,6 +1622,7 @@ void PlayerWindow::SetTtpCommModule(HMODULE module) noexcept {
     ttpcomm_module_ = module;
     audio_->SetTtpCommModule(module);
     if (visual_runtime_) visual_runtime_->SetModule(module);
+    if (plugin_content_runtime_) plugin_content_runtime_->SetModule(module);
 }
 
 LRESULT CALLBACK PlayerWindow::VisualWindowProc(HWND window, UINT message,
@@ -1404,11 +1635,55 @@ LRESULT CALLBACK PlayerWindow::VisualWindowProc(HWND window, UINT message,
         });
 }
 
+bool PlayerWindow::ConsumeFullScreenDoubleClickRelease(UINT message) const noexcept {
+    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK ||
+        message == WM_NCLBUTTONDOWN || message == WM_NCLBUTTONDBLCLK) {
+        // A new press must work even if the previous release went to another
+        // application. Do not use a timeout: holding the second press is valid.
+        fullscreen_double_click_release_pending_ = false;
+    } else if (message == WM_LBUTTONUP || message == WM_NCLBUTTONUP) {
+        return std::exchange(fullscreen_double_click_release_pending_, false);
+    }
+    return false;
+}
+
 LRESULT PlayerWindow::HandleVisualMessage(
     UINT message, WPARAM wparam, LPARAM lparam) {
+    if (ConsumeFullScreenDoubleClickRelease(message)) return 0;
     switch (message) {
+    case WM_NCHITTEST:
+        if (skin_ && !external_skin_ && !fullscreen_visual_detached_) {
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ScreenToClient(window_, &point);
+            const auto playback = audio_->State();
+            const skin::SkinLayers layers(PlayerSkinLayers(ActiveSkinElements(),
+                playback == audio::PlaybackState::playing || playback == audio::PlaybackState::opening,
+                settings_.player.play_mode, CurrentLedText(), CurrentSkinIcon(), MainSkinButtonBounds(L"play"), BrowserAvailable()),
+                skin_->TransparentColor());
+            if (const auto* hit = layers.Hit(point); hit && hit->element->name != L"visual")
+                return HTTRANSPARENT;
+        }
+        return HTCLIENT;
     case WM_ERASEBKGND:
         return 1;
+    case WM_DESTROY:
+        CancelFullScreenExit();
+        ResetFullScreenLyricFade();
+        if(visual_runtime_)visual_runtime_->ReleaseOsu();
+        break;
+    case WM_TIMER:
+        if(wparam==kOsuLyricFadeTimer) {
+            UpdateFullScreenLyricFade();
+            return 0;
+        }
+        if(wparam==kOsuExitTimer) {
+            if(fullscreen_osu_exit_pending_) {
+                if(!visual_runtime_ || visual_runtime_->OsuExitComplete())LeaveFullScreen();
+                else InvalidateRect(visual_window_,nullptr,FALSE);
+            }
+            return 0;
+        }
+        break;
     case WM_PRINTCLIENT:
         if (wparam) PaintVisualControl(reinterpret_cast<HDC>(wparam));
         return 0;
@@ -1417,15 +1692,31 @@ LRESULT PlayerWindow::HandleVisualMessage(
         const HDC dc = BeginPaint(visual_window_, &paint);
         PaintVisualControl(dc);
         EndPaint(visual_window_, &paint);
+        // WM_TIMER is lower priority than WM_PAINT. Continuous software
+        // rendering can otherwise starve lyric fading on slower machines.
+        // Present the lyric frame too, before the next visual invalidation.
+        if(fullscreen_lyric_transition_timer_) {
+            UpdateFullScreenLyricFade();
+            if(lyric_control_)UpdateWindow(lyric_control_);
+        }
         return 0;
     }
     case WM_LBUTTONUP: {
         // FUN_00457EF5 dispatches every WM_LBUTTONUP through WM_COMMAND; it
         // does not require a preceding pressed-state transition.
         POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-        InvokeVisualAction(point);
+        if (settings_.fullscreen.single_click_visual)
+            InvokeVisualAction(point);
         return 0;
     }
+    case WM_LBUTTONDBLCLK:
+        // A double-click contains an initial button-up. Giving single-click
+        // priority avoids changing the effect and toggling fullscreen in one
+        // gesture. When only double-click is enabled neither button-up acts.
+        if (!settings_.fullscreen.single_click_visual &&
+            settings_.fullscreen.double_click_fullscreen)
+            SetFullScreenMode(fullscreen_mode_ == 0 ? 2 : 0, visual_window_);
+        return 0;
     case WM_KEYDOWN:
         if (fullscreen_mode_ != 0 && wparam == VK_ESCAPE) {
             SetFullScreenMode(0);
@@ -1452,7 +1743,7 @@ LRESULT PlayerWindow::HandleVisualMessage(
         // FUN_0045813C claims the message only over the no-cover prompt. At
         // every other point the ordinary class/parent cursor path remains in
         // charge; forcing IDC_ARROW here is observably different.
-        if (VisualFallbackHit(point)) {
+        if (settings_.fullscreen.single_click_visual && VisualFallbackHit(point)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -1467,18 +1758,64 @@ LRESULT PlayerWindow::HandleVisualMessage(
 void PlayerWindow::StartVisualWorker() {
     if (visual_worker_.joinable() || !window_) return;
     visual_worker_ = std::jthread([this](std::stop_token stop) {
+        struct TimerResolution {
+            bool active{};
+            void Set(bool enabled) {
+                if(enabled && !active)active=timeBeginPeriod(1)==TIMERR_NOERROR;
+                else if(!enabled && active){timeEndPeriod(1);active=false;}
+            }
+            ~TimerResolution(){Set(false);}
+        } resolution;
+        auto deadline=std::chrono::steady_clock::now();
         for (;;) {
-            const auto interval = std::chrono::milliseconds(
-                std::max(1U, visual_interval_ms_.load(
-                    std::memory_order_relaxed)));
+            const unsigned period=visual_interval_ns_.load(std::memory_order_relaxed);
+            const bool legacy_wait=visual_legacy_wait_.load(std::memory_order_relaxed);
+            const auto interval=std::chrono::nanoseconds(std::max(1U,period));
+            const bool precise=visual_high_resolution_.load(std::memory_order_relaxed) &&
+                visual_worker_enabled_.load(std::memory_order_acquire);
+            resolution.Set(precise);
+            // A deadline includes time spent on audio/scene work. Fractional
+            // 240 Hz periods must not become integer 4 ms (250 Hz) or sleep
+            // for another complete interval after each processed frame.
+            if(legacy_wait) {
+                // Dream follows 0045F12D: its frame-count-based evolution
+                // includes render time plus a complete post-frame wait.
+                deadline=std::chrono::steady_clock::now()+interval;
+            } else {
+                deadline+=interval;
+                deadline=std::max(deadline,std::chrono::steady_clock::now());
+            }
             std::unique_lock lock(visual_worker_mutex_);
-            visual_worker_condition_.wait_for(
-                lock, stop, interval, [] { return false; });
+            visual_worker_condition_.wait_until(lock,stop,deadline,[&] {
+                return visual_interval_ns_.load(std::memory_order_relaxed)!=period ||
+                    visual_legacy_wait_.load(std::memory_order_relaxed)!=legacy_wait;
+            });
             const auto audio = audio_;
             lock.unlock();
             if (stop.stop_requested()) return;
-            if (visual_worker_enabled_.load(std::memory_order_acquire) &&
-                audio->State() == audio::PlaybackState::playing) {
+            if(visual_interval_ns_.load(std::memory_order_relaxed)!=period ||
+               visual_legacy_wait_.load(std::memory_order_relaxed)!=legacy_wait) {
+                deadline=std::chrono::steady_clock::now();continue;
+            }
+            const HWND content_window=content_visual_window_.load(std::memory_order_acquire);
+            const bool content_enabled=plugin_content_visual_enabled_.load(std::memory_order_acquire) &&
+                content_window && IsWindowVisible(content_window);
+            if (visual_worker_enabled_.load(std::memory_order_acquire) || content_enabled) {
+                const bool playing=audio->State()==audio::PlaybackState::playing;
+                const bool primary_osu=visual_runtime_ && visual_runtime_->IsOsu();
+                const bool content_osu=content_enabled && plugin_content_runtime_ && plugin_content_runtime_->IsOsu();
+                if(!playing && !primary_osu && !content_osu)continue;
+                const auto samples=audio->Visualization();
+                audio::ExtendedVisualizationSamples extended;
+                audio::PlaybackClockSnapshot clock;
+                float volume=1;
+                if(primary_osu || content_osu){extended=audio->ExtendedVisualization();clock=audio->ClockSnapshot();volume=audio->Volume();}
+                if(content_enabled && plugin_content_runtime_) {
+                    if(content_osu)plugin_content_runtime_->UpdateOsu(extended,clock,content_window,volume);
+                    else if(playing)plugin_content_runtime_->Update(samples);
+                    InvalidateRect(content_window,nullptr,FALSE);
+                }
+                if(!visual_worker_enabled_.load(std::memory_order_acquire)) continue;
                 // CPlayerWnd::Run invokes FUN_00457B11 on this worker.  It
                 // updates under the visual object's critical section, then
                 // obtains the child DC and paints immediately; no UI-thread
@@ -1487,7 +1824,21 @@ void PlayerWindow::StartVisualWorker() {
                 const auto runtime = visual_runtime_;
                 const HWND visual = visual_window_;
                 if (!runtime || !visual || !IsWindow(visual)) continue;
-                runtime->Update(audio->Visualization());
+                if(primary_osu)runtime->UpdateOsu(extended,clock,visual,volume);
+                else if(playing)runtime->Update(samples);
+                if(visual_plugin_embedded_.load(std::memory_order_acquire)) {
+                    // A provider paints into its own bounded surfaces. Never
+                    // obtain the fallback skin child's DC in this mode.
+                    InvalidateRect(window_,nullptr,FALSE);
+                    if(playlist_window_) InvalidateRect(playlist_window_,nullptr,FALSE);
+                    continue;
+                }
+                if(primary_osu) {
+                    // GPU lifetime and rendering stay on the window thread.
+                    // The DLL's scene still advances independently of WM_PAINT.
+                    if(IsWindowVisible(visual))InvalidateRect(visual,nullptr,FALSE);
+                    continue;
+                }
                 const HDC dc = GetDC(visual);
                 if (dc) {
                     RECT client{};
@@ -1528,92 +1879,161 @@ void PlayerWindow::ApplySkinVisualSettings() {
         settings_.visual.font = *source.font;
         settings_.visual.font_valid = true;
     }
-    settings_.visual.type = std::clamp(settings_.visual.type, 0, 4);
+    settings_.visual.type = AvailableVisualType(settings_.visual.type);
 }
 
 void PlayerWindow::UpdateVisualWindowLayout() {
     if (!window_) return;
+    settings_.visual.type=AvailableVisualType(settings_.visual.type,fullscreen_mode_!=0);
+    settings_.lyric.window_visual_type=AvailableVisualType(settings_.lyric.window_visual_type);
+    settings_.fullscreen.visual_type=AvailableVisualType(settings_.fullscreen.visual_type,true);
+    plugin_content_visual_type_=-1;
+    // Painting the currently visible content surface re-enables its worker.
+    // Clear it during ownership/layout transitions (including fullscreen).
+    plugin_content_visual_enabled_.store(false,std::memory_order_release);
+    if(const HWND content=content_visual_window_.load(std::memory_order_acquire))InvalidateRect(content,nullptr,FALSE);
+    const bool plugin_embedded=external_skin_ && !fullscreen_visual_detached_;
+    visual_plugin_embedded_.store(plugin_embedded,std::memory_order_release);
+    if(plugin_embedded && visual_window_) ShowWindow(visual_window_,SW_HIDE);
     if (!visual_runtime_) {
         visual_runtime_ = std::make_shared<VisualRuntime>();
         visual_runtime_->SetModule(ttpcomm_module_);
     }
+    // Initialize before StartVisualWorker. Both shared pointers then remain
+    // stable for its lifetime; each renderer locks its own frame state.
+    if(!plugin_content_runtime_) {
+        plugin_content_runtime_=std::make_shared<VisualRuntime>();
+        plugin_content_runtime_->SetModule(ttpcomm_module_);
+    }
+    visual_runtime_->SetPlayerEffectColor(fullscreen_visual_detached_
+        ? settings_.lyric.fullscreen_highlight_color : settings_.lyric.highlight_color);
     if (fullscreen_visual_detached_) {
         RECT client{};
         GetClientRect(visual_window_, &client);
         const int width = std::max<LONG>(0, client.right - client.left);
         const int height = std::max<LONG>(0, client.bottom - client.top);
-        if (fullscreen_mode_ == 3 && settings_.visual.type == 4) {
+        if (settings_.visual.type == 4) {
             std::filesystem::path source;
             audio::AudioMetadata metadata;
+            const bool ready = VisualArtworkSource(source, metadata);
             const auto state = audio_->State();
-            if (state == audio::PlaybackState::playing || state == audio::PlaybackState::paused) {
-                if (const auto* track = PlaybackTrackForUi()) source = track->path;
-                metadata = audio_->Metadata();
-            }
+            const bool waiting = VisualArtworkPending() || state == audio::PlaybackState::playing ||
+                state == audio::PlaybackState::paused;
             visual_runtime_->ConfigureAlbum(settings_.visual, {width, height}, settings_.fullscreen,
-                settings_.lyric.fullscreen_background_color, source, metadata);
+                settings_.lyric.fullscreen_background_color, source, metadata, ready || !waiting);
         } else {
-            visual_runtime_->Configure(settings_.visual, {width, height}, true);
+            if(IsOsuVisualType(settings_.visual.type))
+                visual_runtime_->SetOsuFallbackImage(settings_.fullscreen.album_fallback_image);
+            visual_runtime_->Configure(settings_.visual, {width, height}, true, {}, nullptr, false,
+                                       &settings_.fullscreen);
         }
-        const UINT interval = settings_.visual.frames_per_second > 0
-            ? std::max(1, 1000 / settings_.visual.frames_per_second) : 50;
-        visual_interval_ms_.store(interval, std::memory_order_relaxed);
+        const auto interval=VisualFrameIntervalNs(settings_.visual,&settings_.fullscreen);
+        visual_legacy_wait_.store(settings_.visual.type==1,std::memory_order_relaxed);
+        visual_interval_ns_.store(interval,std::memory_order_relaxed);
+        visual_high_resolution_.store((settings_.visual.type==1 || IsOsuVisualType(settings_.visual.type)) && interval<20000000,
+                                      std::memory_order_relaxed);
         visual_worker_enabled_.store(settings_.visual.type != 0,
                                      std::memory_order_release);
         visual_worker_condition_.notify_all();
+        UpdateFullScreenLyricFade();
         InvalidateRect(visual_window_, nullptr, FALSE);
         return;
     }
     const auto* element = FindActiveSkinElement(L"visual");
-    if (!visual_window_ || !element ||
-        element->bounds.right <= element->bounds.left ||
-        element->bounds.bottom <= element->bounds.top) {
+    RECT analysis_bounds=element?element->bounds:RECT{};
+    if(plugin_embedded && IsRectEmpty(&analysis_bounds)) GetClientRect(window_,&analysis_bounds);
+    if (!visual_window_ || IsRectEmpty(&analysis_bounds)) {
         if (visual_window_) ShowWindow(visual_window_, SW_HIDE);
         visual_worker_enabled_.store(false, std::memory_order_release);
+        // A skin without an ordinary visual element still ends fullscreen.
+        // Do not leave the detached renderer's images/worker alive until exit.
+        visual_runtime_->Configure(settings_.visual, {}, false);
         return;
     }
-    const int width = element->bounds.right - element->bounds.left;
-    const int height = element->bounds.bottom - element->bounds.top;
-    SetWindowPos(visual_window_, nullptr, element->bounds.left,
-                 element->bounds.top, width, height,
-                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    const int width = analysis_bounds.right - analysis_bounds.left;
+    const int height = analysis_bounds.bottom - analysis_bounds.top;
+    SetWindowPos(visual_window_, nullptr, analysis_bounds.left,
+                 analysis_bounds.top, width, height,
+                 SWP_NOACTIVATE | SWP_NOZORDER | (plugin_embedded?SWP_HIDEWINDOW:SWP_SHOWWINDOW));
+    // 00467B9B creates VisualCtrl without WS_CLIPSIBLINGS. Its worker's
+    // GetDC frame may overpaint earlier siblings, even though those siblings
+    // remain the mouse targets. Keep the full paint rectangle and resolve
+    // overlapping input separately in WM_NCHITTEST.
+    SetWindowRgn(visual_window_, nullptr, TRUE);
     const auto background = ActiveSkinBackground();
     visual_runtime_->Configure(settings_.visual, {width, height}, false,
-                               background, &element->bounds);
-    const UINT interval = settings_.visual.frames_per_second > 0
-        ? std::max(1, 1000 / settings_.visual.frames_per_second) : 50;
-    visual_interval_ms_.store(interval, std::memory_order_relaxed);
+                               plugin_embedded?skin::SkinImage{}:background, &analysis_bounds);
+    visual_legacy_wait_.store(settings_.visual.type==1,std::memory_order_relaxed);
+    visual_interval_ns_.store(VisualFrameIntervalNs(settings_.visual),std::memory_order_relaxed);
+    visual_high_resolution_.store(false,std::memory_order_relaxed);
     visual_worker_enabled_.store(settings_.visual.type != 0,
                                  std::memory_order_release);
     visual_worker_condition_.notify_all();
     InvalidateRect(visual_window_, nullptr, FALSE);
+    if(plugin_embedded) {
+        InvalidateRect(window_,nullptr,FALSE);
+        if(playlist_window_) InvalidateRect(playlist_window_,nullptr,FALSE);
+    }
+}
+
+bool PlayerWindow::VisualArtworkPending() const {
+    const auto state = audio_->State();
+    if (state == audio::PlaybackState::failed) return pending_failed_advance_;
+    return visual_track_change_in_progress_ || pending_wave_track_change_ || pending_natural_play_ ||
+        network_open_pending_ || !random_navigation_requests_.empty() ||
+        state == audio::PlaybackState::opening ||
+        (state == audio::PlaybackState::stopped && playback_was_active_);
+}
+
+bool PlayerWindow::VisualArtworkSource(std::filesystem::path& source, audio::AudioMetadata& metadata) const {
+    const auto state = audio_->State();
+    if (network_open_pending_ || (state != audio::PlaybackState::playing && state != audio::PlaybackState::paused))
+        return false;
+    // The selected row can already name the next track while the decoder is
+    // still fading out. Use its opened identity and a matching engine snapshot.
+    const auto* track = OpenedTrack();
+    if (!track) return false;
+    const auto snapshot = audio_->CurrentMetadata(track->path, track->subtrack);
+    if (!snapshot) return false;
+    source = track->path;
+    metadata = *snapshot;
+    MergeOsuLibraryArtwork(*track, metadata);
+    return true;
 }
 
 void PlayerWindow::UpdateVisualFrame() {
     if (!visual_runtime_ || !visual_window_) return;
     const auto state = audio_->State();
     if (state == audio::PlaybackState::playing ||
-        (state == audio::PlaybackState::paused && fullscreen_mode_ == 3 &&
-         settings_.visual.type == 4)) {
+        (state == audio::PlaybackState::paused && ((fullscreen_visual_detached_ &&
+         settings_.visual.type == 4) || IsOsuVisualType(settings_.visual.type)))) {
         std::filesystem::path source;
-        if (const auto* track = PlaybackTrackForUi()) source = track->path;
-        visual_runtime_->SetSource(source, ResourceText(0x821b),
-                                   audio_->Metadata());
+        if (settings_.visual.type == 4 || IsOsuVisualType(settings_.visual.type)) {
+            audio::AudioMetadata metadata;
+            if (VisualArtworkSource(source, metadata))
+                visual_runtime_->SetSource(source, ResourceText(0x821b), metadata);
+        } else {
+            if (const auto* track = PlaybackTrackForUi()) source = track->path;
+            visual_runtime_->SetSource(source, ResourceText(0x821b), audio_->Metadata());
+        }
         // Dynamic modes are advanced exclusively by CPlayerWnd::Run's
         // worker cadence.  UI commands only publish cover/source state and
         // request a repaint; updating here would add an extra decay/blur
         // step whenever a skin or visual type changes.
     } else if (state == audio::PlaybackState::stopped ||
                state == audio::PlaybackState::failed) {
+        const bool retain_cover = VisualArtworkPending();
+        if(plugin_content_runtime_) plugin_content_runtime_->ClearPlayback(retain_cover);
         // CPlayerWnd's stop/failure paths call FUN_00457BCF before the next
         // paint.  That routine clears both animated state and the decoded
         // picture; retaining the previous track's cover after Stop is not an
         // original behavior.
-        visual_runtime_->ClearPlayback();
+        visual_runtime_->ClearPlayback(retain_cover);
         // FUN_00457BCF calls FUN_00457600 before invalidating: clear the
         // visible child synchronously instead of waiting for a later UI
         // WM_PAINT (the render worker has already stopped at this point).
-        const HDC dc = GetDC(visual_window_);
+        const HDC dc = IsOsuVisualType(settings_.visual.type) || (retain_cover && settings_.visual.type == 4) ||
+            (external_skin_ && !fullscreen_visual_detached_) ? nullptr : GetDC(visual_window_);
         if (dc) {
             RECT client{};
             GetClientRect(visual_window_, &client);
@@ -1624,18 +2044,168 @@ void PlayerWindow::UpdateVisualFrame() {
         }
     }
     InvalidateRect(visual_window_, nullptr, FALSE);
+    if(external_skin_ && !fullscreen_visual_detached_) {
+        InvalidateRect(window_,nullptr,FALSE);
+        if(playlist_window_) InvalidateRect(playlist_window_,nullptr,FALSE);
+        if(external_skin_->Handles(lyric_window_)) InvalidateRect(lyric_window_,nullptr,FALSE);
+    }
+    if(const HWND content=content_visual_window_.load(std::memory_order_acquire))InvalidateRect(content,nullptr,FALSE);
+}
+
+BOOL WINAPI PlayerWindow::QuerySkinPluginSpectrum(void* context,TtpSkinSpectrumFrame* frame) {
+    if(!context || !frame || frame->size<TTP_SKIN_SPECTRUM_V1_SIZE) return FALSE;
+    try {
+        auto& self=*static_cast<PlayerWindow*>(context);
+        if(!self.visual_runtime_) return FALSE;
+        const auto capacity=frame->size;
+        TtpSkinSpectrumFrame next{};next.size=std::min<uint32_t>(capacity,sizeof(next));
+        self.visual_runtime_->SpectrumFrame(next);
+        next.playback=static_cast<uint32_t>(self.audio_->State());
+        if(next.playback!=2 && next.playback!=3) next.count=next.sample_count=0;
+        std::memcpy(frame,&next,next.size);
+        return TRUE;
+    } catch(...) {return FALSE;}
+}
+
+BOOL WINAPI PlayerWindow::PaintSkinPluginVisual(void* context,HDC dc,const RECT* bounds,
+                                                const TtpSkinVisualColors* colors) {
+    if(!context || !dc || !bounds) return FALSE;
+    try {
+        auto& self=*static_cast<PlayerWindow*>(context);
+        if(!self.visual_runtime_ || self.settings_.visual.type==0) return FALSE;
+        // This callback belongs to the ordinary provider canvas, even while
+        // the shared visual control is detached for fullscreen rendering.
+        if(self.visual_runtime_->IsOsu()) return FALSE;
+        const int saved=SaveDC(dc);
+        struct RestoreClip {HDC dc;int saved;~RestoreClip(){if(saved) RestoreDC(dc,saved);}} restore{dc,saved};
+        IntersectClipRect(dc,bounds->left,bounds->top,bounds->right,bounds->bottom);
+        const HWND target=WindowFromDC(dc);
+        // A legacy provider may supply a detached memory DC with no canvas
+        // owner/offset. Keep its pointer centered instead of using a hidden
+        // fallback HWND or guessing the window to which it will be blitted.
+        self.visual_runtime_->SetOsuViewport(target,*bounds);
+        self.visual_runtime_->Paint(dc,*bounds,colors,false);
+        return TRUE;
+    } catch(...) {return FALSE;}
+}
+
+void PlayerWindow::SkinPluginContentRects(const RECT& bounds,uint32_t mode,uint32_t visual_type,
+                                          RECT& visual,RECT& lyric,bool& overlay) const {
+    visual_type=static_cast<uint32_t>(AvailableVisualType(static_cast<int>(visual_type)));
+    visual=lyric=bounds;overlay=false;
+    if(mode==TTP_SKIN_CONTENT_COMBINED) {
+        const size_t profile=settings_.fullscreen.visual_type?visual_type:0;
+        const int fraction=std::clamp(settings_.fullscreen.lyric_size[profile],0,10);
+        lyric.top+=(10-fraction)*(bounds.bottom-bounds.top)/10;
+        overlay=settings_.fullscreen.position_relation[profile]==1;
+        if(!overlay) visual.bottom=lyric.top;
+    }
+    if(mode==TTP_SKIN_CONTENT_VISUAL) SetRectEmpty(&lyric);
+    if(mode==TTP_SKIN_CONTENT_LYRICS) SetRectEmpty(&visual);
+}
+
+BOOL WINAPI PlayerWindow::PaintSkinPluginContent(void* context,HDC dc,const RECT* bounds,
+                                                uint32_t mode,uint32_t visual_type) {
+    if(!context || !dc || !bounds || IsRectEmpty(bounds) || mode<1 || mode>3 || visual_type>settings::kMaximumVisualType)
+        return FALSE;
+    try {
+        auto& self=*static_cast<PlayerWindow*>(context);
+        if (!self.plugin_content_runtime_) {
+            self.plugin_content_runtime_=std::make_shared<VisualRuntime>();
+            self.plugin_content_runtime_->SetModule(self.ttpcomm_module_);
+        }
+        return self.plugin_content_runtime_->PaintContentFrame(dc,*bounds,[&](HDC dc)->BOOL {
+            visual_type=static_cast<uint32_t>(AvailableVisualType(static_cast<int>(visual_type)));
+            const int saved=SaveDC(dc);
+            if(!saved) return FALSE;
+            struct Restore {HDC dc;int saved;~Restore(){RestoreDC(dc,saved);}} restore{dc,saved};
+            IntersectClipRect(dc,bounds->left,bounds->top,bounds->right,bounds->bottom);
+            FillRect(dc,bounds,static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            const bool combined=mode==TTP_SKIN_CONTENT_COMBINED;
+            RECT visual{},lyric{};
+            bool overlay=false;
+            self.SkinPluginContentRects(*bounds,mode,visual_type,visual,lyric,overlay);
+            const bool have_visual=!self.lyric_editor_ && mode!=TTP_SKIN_CONTENT_LYRICS && !IsRectEmpty(&visual) && visual_type!=0;
+            HWND content_window=self.lyric_editor_?self.lyric_window_:self.lyric_control_;
+            if(self.external_skin_) {
+                TtpSkinContent main{sizeof(main),self.window_};
+                if(self.external_skin_->ContentState(main) && !IsRectEmpty(&main.bounds))content_window=self.window_;
+                else if(self.external_skin_->Handles(self.lyric_window_))content_window=self.lyric_window_;
+            }
+            self.content_visual_window_.store(content_window,std::memory_order_release);
+            self.plugin_content_visual_enabled_.store(have_visual && !self.fullscreen_mode_,std::memory_order_release);
+            if(have_visual && self.plugin_content_runtime_) {
+                auto settings=self.settings_.visual;
+                settings.type=static_cast<int>(visual_type);
+                const SIZE size{visual.right-visual.left,visual.bottom-visual.top};
+                std::filesystem::path source;
+                audio::AudioMetadata metadata;
+                const auto playback=self.audio_->State();
+                bool source_ready = false;
+                if (visual_type == 4 || IsOsuVisualType(visual_type)) source_ready = self.VisualArtworkSource(source, metadata);
+                else if(playback==audio::PlaybackState::playing || playback==audio::PlaybackState::paused) {
+                    if(const auto* track=self.PlaybackTrackForUi()) source=track->path;
+                    metadata=self.audio_->Metadata();
+                }
+                auto& runtime=*self.plugin_content_runtime_;
+                runtime.SetPlayerEffectColor(self.settings_.lyric.highlight_color);
+                if(self.plugin_content_visual_type_!=settings.type || self.plugin_content_size_.cx!=size.cx ||
+                   self.plugin_content_size_.cy!=size.cy || self.plugin_content_combined_!=combined) {
+                    // Reconfigure only at a mode/geometry/settings boundary. Doing
+                    // this on every paint would reset spectrum decay and Goom.
+                    if(visual_type==4 && combined)
+                        runtime.ConfigureAlbum(settings,size,self.settings_.fullscreen,
+                            self.settings_.lyric.fullscreen_background_color,source,metadata,
+                            source_ready || (!self.VisualArtworkPending() &&
+                                playback!=audio::PlaybackState::playing && playback!=audio::PlaybackState::paused));
+                    else runtime.Configure(settings,size,true);
+                    self.plugin_content_visual_type_=settings.type;
+                    self.plugin_content_size_=size;self.plugin_content_combined_=combined;
+                }
+                if((playback==audio::PlaybackState::playing || playback==audio::PlaybackState::paused) &&
+                    (visual_type != 4 || source_ready))
+                    runtime.SetSource(source,self.ResourceText(0x821b),metadata);
+                // Providers own clipping and overlay composition. A swap chain
+                // would bypass their HDC and overwrite neighbouring content.
+                RECT pointer_visual=visual;
+                if(self.external_skin_) {
+                    TtpSkinContent canvas{sizeof(canvas),content_window};
+                    if(self.external_skin_->ContentState(canvas) && !IsRectEmpty(&canvas.bounds)) {
+                        const RECT source_canvas=*bounds;
+                        const RECT target=canvas.bounds;
+                        pointer_visual={
+                            target.left+MulDiv(visual.left-source_canvas.left,target.right-target.left,source_canvas.right-source_canvas.left),
+                            target.top+MulDiv(visual.top-source_canvas.top,target.bottom-target.top,source_canvas.bottom-source_canvas.top),
+                            target.left+MulDiv(visual.right-source_canvas.left,target.right-target.left,source_canvas.right-source_canvas.left),
+                            target.top+MulDiv(visual.bottom-source_canvas.top,target.bottom-target.top,source_canvas.bottom-source_canvas.top)};
+                    }
+                }
+                runtime.SetOsuViewport(content_window,pointer_visual);
+                runtime.Paint(dc,visual,nullptr,false);
+            }
+            // RichEdit owns these pixels while editing. Do not keep an animated
+            // lyric frame underneath it that can flash during a child repaint.
+            if(!self.lyric_editor_ && mode!=TTP_SKIN_CONTENT_VISUAL && !IsRectEmpty(&lyric))
+                self.PaintLyricControl(self.lyric_control_,dc,false,&lyric,overlay);
+            return TRUE;
+        });
+    } catch(...) {return FALSE;}
 }
 
 void PlayerWindow::PaintVisualControl(HDC dc) const {
     if (!dc || !visual_window_) return;
+    if(external_skin_ && !fullscreen_visual_detached_) return;
     RECT client{};
     GetClientRect(visual_window_, &client);
+    if (visual_runtime_) {
+        // Every renderer owns its complete frame and no-frame background.
+        // Never publish a background-only image before that completed frame,
+        // or clear outside the renderer lock while the worker is painting.
+        visual_runtime_->Paint(dc, client);
+        return;
+    }
     if (fullscreen_visual_detached_) {
-        // Album backgrounds already publish a complete composited frame.
-        // Erasing the visible DC first would reintroduce cover flicker.
-        if (!visual_runtime_ || fullscreen_mode_ != 3 || settings_.visual.type != 4)
-            FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        if (visual_runtime_) visual_runtime_->Paint(dc, client);
+        FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         return;
     }
     const auto* element = FindActiveSkinElement(L"visual");
@@ -1643,31 +2213,39 @@ void PlayerWindow::PaintVisualControl(HDC dc) const {
     if (background && element) {
         // Use the already-composited backing, including PNG alpha. Do not
         // reinterpret its DIB compatibility view as an opaque drawing source.
-        if (visual_runtime_) visual_runtime_->PaintBackgroundOnly(dc, client);
-        else {
-            FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-            background.Draw(dc, 0, 0, client.right, client.bottom,
-                            element->bounds.left, element->bounds.top,
-                            client.right, client.bottom);
-        }
+        FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        background.Draw(dc, 0, 0, client.right, client.bottom,
+                        element->bounds.left, element->bounds.top,
+                        client.right, client.bottom);
     }
-    if (visual_runtime_) visual_runtime_->Paint(dc, client);
+}
+
+int PlayerWindow::WindowedVisualType() const {
+    // Fullscreen types 7 and 8 must never leak into an ordinary skin or persisted
+    // Visual/Type. Keep the pre-fullscreen effect for returning/restarting.
+    return AvailableVisualType(IsOsuVisualType(settings_.visual.type) && fullscreen_mode_!=0
+        ? fullscreen_saved_visual_type_:settings_.visual.type);
 }
 
 void PlayerWindow::SetVisualType(int type) {
-    if (fullscreen_mode_ == 1 && type >= 1 && type <= 4) {
+    CancelFullScreenExit();
+    type=AvailableVisualType(type,fullscreen_mode_!=0);
+    if (fullscreen_mode_ == 1 && type >= 1 && type <= settings::kMaximumVisualType) {
         // Choosing an effect in the fullscreen lyric menu must display it,
         // not change a hidden visual or clamp album art back to dream.
         // Publish the requested type before layout/render reconfiguration;
         // this is an in-session mode change, preserving monitor/restore state.
-        settings_.visual.type = type;
-        SetFullScreenMode(3, lyric_control_);
+        SetFullScreenMode(3, lyric_control_,type);
         return;
     }
     settings_.visual.type = fullscreen_mode_ != 0
-        ? ((type == 0 || (type == 4 && fullscreen_mode_ != 3)) ? 1
-            : std::clamp(type, 1, fullscreen_mode_ == 3 ? 4 : 3))
-        : std::clamp(type, 0, 4);
+        ? (type == 0 ? 1
+            : std::clamp(type, 1, settings::kMaximumVisualType))
+        : std::clamp(type, 0, settings::kMaximumVisualType);
+    if(fullscreen_mode_!=0) {
+        settings_.fullscreen.last_visual_effect=settings_.visual.type;
+        window_state_saved_=false;
+    }
     if (fullscreen_mode_ == 3) UpdateFullScreenLayout();
     UpdateVisualWindowLayout();
     UpdateVisualFrame();
@@ -1687,6 +2265,7 @@ void PlayerWindow::InvokeVisualAction(POINT point) {
 
 void PlayerWindow::DetachVisualWindow(const RECT& target) {
     if (!visual_window_ || !IsWindow(visual_window_)) return;
+    if(visual_runtime_)visual_runtime_->DetachOsu();
     if (!fullscreen_visual_detached_) {
         fullscreen_visual_saved_exstyle_ =
             GetWindowLongPtrW(visual_window_, GWL_EXSTYLE);
@@ -1709,6 +2288,7 @@ void PlayerWindow::DetachVisualWindow(const RECT& target) {
         fullscreen_visual_detached_ = true;
     }
     const RECT window_target = WindowRectForClientTarget(visual_window_, target);
+    SetWindowRgn(visual_window_, nullptr, FALSE);
     SetWindowPos(visual_window_, HWND_TOPMOST,
         window_target.left, window_target.top,
         window_target.right - window_target.left,
@@ -1718,7 +2298,9 @@ void PlayerWindow::DetachVisualWindow(const RECT& target) {
 }
 
 void PlayerWindow::RestoreVisualWindow() {
+    ResetFullScreenLyricFade();
     if (!fullscreen_visual_detached_ || !visual_window_) return;
+    if(visual_runtime_)visual_runtime_->DetachOsu();
     MarkShellFullscreen(visual_window_, false);
     // FUN_0046786F first restores the saved desktop rectangle while the
     // control is still detached, then reparents it.  Its exact
@@ -1793,13 +2375,17 @@ void PlayerWindow::DetachLyricControl(const RECT& target,
 }
 
 void PlayerWindow::RestoreLyricControl() {
+    ResetFullScreenLyricFade();
     DestroyFullScreenLyricInput();
     if (!fullscreen_lyric_detached_ || !lyric_control_) return;
     MarkShellFullscreen(lyric_control_, false);
     // FUN_0044ABFC reverses POPUP/CHILD before invoking the generic restore.
     LONG_PTR style = GetWindowLongPtrW(lyric_control_, GWL_STYLE);
     style &= ~static_cast<LONG_PTR>(WS_POPUP);
-    style |= WS_CHILD | WS_VISIBLE;
+    const bool plugin_content=external_skin_ && external_skin_->Handles(lyric_window_);
+    style |= WS_CHILD;
+    if(plugin_content) style &= ~static_cast<LONG_PTR>(WS_VISIBLE);
+    else style |= WS_VISIBLE;
     SetWindowLongPtrW(lyric_control_, GWL_STYLE, style);
 
     SetWindowPos(lyric_control_, nullptr,
@@ -1807,7 +2393,7 @@ void PlayerWindow::RestoreLyricControl() {
         fullscreen_lyric_saved_rect_.top,
         fullscreen_lyric_saved_rect_.right - fullscreen_lyric_saved_rect_.left,
         fullscreen_lyric_saved_rect_.bottom - fullscreen_lyric_saved_rect_.top,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | (plugin_content?SWP_HIDEWINDOW:SWP_SHOWWINDOW));
     SetRectEmpty(&fullscreen_lyric_saved_rect_);
     SetParent(lyric_control_, fullscreen_lyric_parent_);
     if (fullscreen_lyric_was_empty_) {
@@ -1820,8 +2406,8 @@ void PlayerWindow::RestoreLyricControl() {
     fullscreen_lyric_detached_ = false;
     fullscreen_lyric_was_empty_ = false;
     fullscreen_lyric_parent_ = nullptr;
-    RebuildLyricFont(false);
     LayoutLyricControls();
+    RebuildLyricFont(false);
     UpdateLyricScrollTimer();
 }
 
@@ -1883,7 +2469,7 @@ void PlayerWindow::PopulateFullScreenMonitorMenu(HMENU menu) {
 bool PlayerWindow::HandleFullScreenCommand(UINT command, HWND origin) {
     if (command >= kCmdFullscreenToggle && command <= kCmdFullscreenAll) {
         if (command == kCmdFullscreenToggle)
-            SetFullScreenMode(fullscreen_mode_ == 0 ? 3 : 0, origin);
+            SetFullScreenMode(fullscreen_mode_ == 0 ? settings_.fullscreen.last_mode : 0, origin);
         else if (command == kCmdFullscreenExit)
             SetFullScreenMode(0);
         else
@@ -1936,7 +2522,7 @@ void PlayerWindow::UpdateFullScreenLayout() {
 
     int profile = settings_.fullscreen.visual_type != 0
         ? settings_.visual.type : 0;
-    profile = std::clamp(profile, 0, 4);
+    profile = std::clamp(profile, 0, settings::kMaximumVisualType);
     const int lyric_tenths = std::clamp(
         settings_.fullscreen.lyric_size[static_cast<size_t>(profile)], 0, 10);
     const int relation = std::clamp(
@@ -1960,12 +2546,27 @@ void PlayerWindow::UpdateFullScreenLayout() {
     DetachLyricControl(lyric, HWND_TOPMOST);
 }
 
-void PlayerWindow::SetFullScreenMode(int mode, HWND origin) {
+void PlayerWindow::SetFullScreenMode(int mode, HWND origin, int visual_type_override) {
     mode = std::clamp(mode, 0, 3);
     if (mode == 0) {
+        if(fullscreen_osu_exit_pending_)return;
+        // Explicit exit waits for the optional visual departure. Dialogs,
+        // shutdown and deactivation still use immediate LeaveFullScreen().
+        if(fullscreen_mode_!=0 && fullscreen_visual_detached_ && IsOsuVisualType(settings_.visual.type) &&
+           (settings_.visual.type==8?settings_.visual.osu_lazer_outro:settings_.visual.osu_outro) &&
+           visual_window_ && IsWindowVisible(visual_window_) &&
+           visual_runtime_ && visual_runtime_->BeginOsuExit()) {
+            if(SetTimer(visual_window_,kOsuExitTimer,16,nullptr)) {
+                fullscreen_osu_exit_pending_=true;
+                UpdateFullScreenLyricFade();
+                InvalidateRect(visual_window_,nullptr,FALSE);
+                return;
+            }
+        }
         LeaveFullScreen();
         return;
     }
+    CancelFullScreenExit();
     const bool entering = fullscreen_mode_ == 0;
     if (entering &&
         audio_->State() != audio::PlaybackState::playing) return;
@@ -1975,24 +2576,34 @@ void PlayerWindow::SetFullScreenMode(int mode, HWND origin) {
         const auto monitor = FullScreenMonitorInfo(origin && IsWindow(origin) ? origin : window_);
         fullscreen_monitor_device_ = monitor.szDevice;
         fullscreen_monitor_rect_ = monitor.rcMonitor;
-        fullscreen_saved_visual_type_ = settings_.visual.type;
+        fullscreen_saved_visual_type_ = AvailableVisualType(settings_.visual.type);
         fullscreen_saved_lyric_transparent_ =
             settings_.lyric.fullscreen_transparent;
         fullscreen_main_was_iconic_ = IsIconic(window_) != FALSE;
         fullscreen_main_was_visible_ = IsWindowVisible(window_) != FALSE;
-        fullscreen_lyric_window_was_visible_ =
-            lyric_window_ && IsWindowVisible(lyric_window_);
-        fullscreen_desktop_lyric_was_visible_ =
-            desktop_lyric_mode_ && desktop_lyrics_.Visible();
-        if (fullscreen_desktop_lyric_was_visible_)
+        if (desktop_lyric_mode_ && desktop_lyrics_.Visible())
             desktop_lyrics_.Show(false);
         if (lyric_editor_) LeaveLyricEditor(true);
         if (lyric_window_) ShowWindow(lyric_window_, SW_HIDE);
     }
-    if ((mode == 2 || mode == 3) &&
-        (settings_.visual.type == 0 || (mode == 2 && settings_.visual.type == 4)))
-        settings_.visual.type = 1;
+    if(mode==2 || mode==3) {
+        const bool explicit_type=visual_type_override>=0 &&
+            visual_type_override<=settings::kMaximumVisualType;
+        // FullScreen/VisualType selects the layout profile being edited; it
+        // is not the effect to play. Keep the last full-screen effect apart
+        // from Visual/Type, which can be restored/clamped on leaving a star-ring effect.
+        int requested=explicit_type?visual_type_override:
+            (settings_.fullscreen.last_visual_effect>0?
+                settings_.fullscreen.last_visual_effect:settings_.visual.type);
+        requested=std::clamp(requested,1,settings::kMaximumVisualType);
+        settings_.fullscreen.last_visual_effect=requested;
+        window_state_saved_=false;
+        settings_.visual.type=AvailableVisualType(requested,true);
+        // A missing optional DLL may fall back temporarily, without erasing
+        // the remembered preference. Album backgrounds work in both modes.
+    }
     fullscreen_mode_ = mode;
+    settings_.fullscreen.last_mode = mode;
     if (entering) {
         // FUN_0046228D hides/minimizes CPlayerWnd before either child obtains
         // its non-empty saved full-screen rectangle.  Thus the synchronous
@@ -2014,9 +2625,71 @@ void PlayerWindow::SetFullScreenMode(int mode, HWND origin) {
         RegisterHotKey(window_, kFullscreenEscapeHotkey, 0, VK_ESCAPE);
 }
 
+void PlayerWindow::CancelFullScreenExit() {
+    if(!fullscreen_osu_exit_pending_)return;
+    fullscreen_osu_exit_pending_=false;
+    if(visual_window_)KillTimer(visual_window_,kOsuExitTimer);
+    if(visual_runtime_)visual_runtime_->CancelOsuTransition();
+    UpdateFullScreenLyricFade();
+}
+
+void PlayerWindow::ResetFullScreenLyricFade() {
+    if(visual_window_)KillTimer(visual_window_,kOsuLyricFadeTimer);
+    fullscreen_lyric_transition_timer_=false;
+    const bool changed=fullscreen_lyric_transition_alpha_!=255;
+    fullscreen_lyric_transition_alpha_=fullscreen_lyric_transition_from_=
+        fullscreen_lyric_transition_target_=255;
+    fullscreen_lyric_transition_start_={};
+    if(changed && lyric_control_)InvalidateRect(lyric_control_,nullptr,FALSE);
+}
+
+void PlayerWindow::UpdateFullScreenLyricFade() {
+    if(fullscreen_mode_!=3 || !fullscreen_visual_detached_ || !fullscreen_lyric_detached_ ||
+       !IsOsuVisualType(settings_.visual.type) || !visual_runtime_ || !visual_window_ || !lyric_control_) {
+        ResetFullScreenLyricFade();
+        return;
+    }
+    const auto now=std::chrono::steady_clock::now();
+    constexpr double duration_ms=200;
+    const BYTE before=fullscreen_lyric_transition_alpha_;
+    if(fullscreen_lyric_transition_alpha_!=fullscreen_lyric_transition_target_) {
+        const double progress=std::clamp(std::chrono::duration<double,std::milli>(
+            now-fullscreen_lyric_transition_start_).count()/duration_ms,0.,1.);
+        // Smooth endpoints; retarget from the current opacity on interruption.
+        const double eased=progress*progress*(3-2*progress);
+        const int desired=static_cast<int>(std::lround(
+            fullscreen_lyric_transition_from_+
+            (fullscreen_lyric_transition_target_-fullscreen_lyric_transition_from_)*eased));
+        // A cold software-rendered frame can block the UI for longer than the
+        // fade (notably on XP). Retain visible intermediate steps after that
+        // hitch instead of jumping straight from hidden to fully opaque.
+        const int current=fullscreen_lyric_transition_alpha_;
+        fullscreen_lyric_transition_alpha_=static_cast<BYTE>(std::clamp(desired,current-64,current+64));
+    }
+    const bool active=visual_runtime_->OsuTransitionActive();
+    const BYTE target=active?0:255;
+    if(target!=fullscreen_lyric_transition_target_) {
+        fullscreen_lyric_transition_from_=fullscreen_lyric_transition_alpha_;
+        fullscreen_lyric_transition_target_=target;
+        fullscreen_lyric_transition_start_=now;
+    }
+    const bool ticking=active || fullscreen_lyric_transition_alpha_!=target;
+    if(ticking && !fullscreen_lyric_transition_timer_)
+        fullscreen_lyric_transition_timer_=SetTimer(visual_window_,kOsuLyricFadeTimer,16,nullptr)!=0;
+    else if(!ticking && fullscreen_lyric_transition_timer_) {
+        KillTimer(visual_window_,kOsuLyricFadeTimer);
+        fullscreen_lyric_transition_timer_=false;
+    }
+    // Independent of playback/scrolling: stopped and paused intros still fade.
+    if(before!=fullscreen_lyric_transition_alpha_)InvalidateRect(lyric_control_,nullptr,FALSE);
+}
+
 void PlayerWindow::LeaveFullScreen() {
+    CancelFullScreenExit();
+    ResetFullScreenLyricFade();
     if (fullscreen_mode_ == 0 && !fullscreen_visual_detached_ &&
         !fullscreen_lyric_detached_) return;
+    if(IsOsuVisualType(settings_.visual.type))settings_.visual.type=WindowedVisualType();
     fullscreen_mode_ = 0;
     // FUN_0046228D restores the two detached controls before publishing the
     // saved FullScreen/TransparentFS value or showing ordinary windows.
@@ -2024,16 +2697,14 @@ void PlayerWindow::LeaveFullScreen() {
     RestoreLyricControl();
     settings_.lyric.fullscreen_transparent =
         fullscreen_saved_lyric_transparent_;
-    if (lyric_window_) {
-        if (desktop_lyric_mode_) {
-            ShowWindow(lyric_window_, SW_HIDE);
-            desktop_lyrics_.Show(fullscreen_desktop_lyric_was_visible_);
-        } else {
-            ShowWindow(lyric_window_, fullscreen_lyric_window_was_visible_
-                ? SW_SHOWNOACTIVATE : SW_HIDE);
-        }
+    if(plugin_content_fullscreen_saved_type_>=0) {
+        settings_.visual.type=plugin_content_fullscreen_saved_type_;
+        plugin_content_fullscreen_saved_type_=-1;
     }
-    fullscreen_desktop_lyric_was_visible_ = false;
+    // Lyrics can finish loading while the fullscreen hosts are detached.
+    // Keep ActiveLyricVisible as the current intent rather than copying the
+    // entry-time HWND snapshot back over the new track's visibility.
+    if (lyric_window_) ShowWindow(lyric_window_, SW_HIDE);
     fullscreen_lyric_desktop_mode_ = false;
     UpdateVisualWindowLayout();
     UpdateVisualFrame();
@@ -2048,19 +2719,30 @@ void PlayerWindow::LeaveFullScreen() {
             ShowWindow(window_, SW_HIDE);
         }
     }
+    SynchronizeLyricVisibility();
+    QueueLyricVisibilitySync(); // settle any subsequent native owner restore
     ApplySkinWindowTopMost();
     // The original keeps the hotkey registered through the complete restore
     // sequence and removes it only after the main window is back in place.
     UnregisterHotKey(window_, kFullscreenEscapeHotkey);
 }
 
-void PlayerWindow::ShowVisualContextMenu(POINT screen_point) {
-    if (context_menu_open_ || !visual_window_ ||
-        !IsWindowEnabled(window_)) return;
+void PlayerWindow::PrepareFullscreenMenuState(HMENU menu, int mode) const {
+    const bool may_enter =
+        audio_->State() == audio::PlaybackState::playing;
+    EnableCommand(menu, kCmdFullscreenLyrics, may_enter);
+    EnableCommand(menu, kCmdFullscreenVisual, may_enter);
+    EnableCommand(menu, kCmdFullscreenAll, may_enter);
+    CheckCommand(menu, kCmdFullscreenLyrics, mode == 1);
+    CheckCommand(menu, kCmdFullscreenVisual, mode == 2);
+    CheckCommand(menu, kCmdFullscreenAll, mode == 3);
+}
+
+HMENU PlayerWindow::CreateVisualContextMenu(bool detached,int mode,int type) {
     const HMODULE resources = ResourceModule();
     HMENU popup = DetachFirstPopup(
         i18n::LoadMenu(resources, MAKEINTRESOURCEW(kMenuVisual)));
-    if (!popup) return;
+    if (!popup) return nullptr;
     HMENU fullscreen = DetachFirstPopup(
         i18n::LoadMenu(resources, MAKEINTRESOURCEW(kMenuFullscreen)));
     if (fullscreen) {
@@ -2070,21 +2752,14 @@ void PlayerWindow::ShowVisualContextMenu(POINT screen_point) {
         if (!SetMenuItemInfoW(popup, kMenuFullscreen, FALSE, &information))
             DestroyMenu(fullscreen);
     }
-    const bool may_enter =
-        audio_->State() == audio::PlaybackState::playing;
-    EnableCommand(popup, kCmdFullscreenLyrics, may_enter);
-    EnableCommand(popup, kCmdFullscreenVisual, may_enter);
-    EnableCommand(popup, kCmdFullscreenAll, may_enter);
-    CheckCommand(popup, kCmdFullscreenLyrics, fullscreen_mode_ == 1);
-    CheckCommand(popup, kCmdFullscreenVisual, fullscreen_mode_ == 2);
-    CheckCommand(popup, kCmdFullscreenAll, fullscreen_mode_ == 3);
+    PrepareFullscreenMenuState(popup, mode);
 
-    if (fullscreen_visual_detached_) {
+    if (detached) {
         // FUN_00458020 owns the detached-window path.  Its positional and
         // command deletions produce the compact seven-item menu and it uses
         // the saved main window directly as TrackPopupMenu's command owner.
         DeleteMenu(popup, 3, MF_BYPOSITION);
-        if (fullscreen_mode_ == 3) {
+        if (mode == 2 || mode == 3) {
             const auto label = FullScreenMenuText(IDS_FULLSCREEN_ALBUM);
             ModifyMenuW(popup, kCmdVisualCover, MF_BYCOMMAND | MF_STRING,
                         kCmdVisualCover, label.c_str());
@@ -2095,17 +2770,13 @@ void PlayerWindow::ShowVisualContextMenu(POINT screen_point) {
         DeleteMenu(popup, kCmdVisualOptions, MF_BYCOMMAND);
         const int last = GetMenuItemCount(popup) - 1;
         if (last >= 0) DeleteMenu(popup, last, MF_BYPOSITION);
+        AppendPlayerVisualMenuItems(popup,true);
         PopulateFullScreenMonitorMenu(popup);
+        MoveMenuCommandToBottom(popup,kCmdFullscreenToggle);
         CheckMenuItem(popup,
-            static_cast<UINT>(kCmdVisualFirst + settings_.visual.type),
+            static_cast<UINT>(kCmdVisualFirst + type),
             MF_BYCOMMAND | MF_CHECKED);
-        context_menu_open_ = true;
-        TrackPlayerPopupMenu(popup, TPM_RIGHTBUTTON, screen_point.x, screen_point.y,
-                       0, window_, nullptr);
-        DestroyMenu(popup);
-        context_menu_open_ = false;
-        PostMessageW(window_, WM_NULL, 0, 0);
-        return;
+        return popup;
     }
 
     // Resource 145 also contains the full-screen host's direct "exit full
@@ -2122,16 +2793,23 @@ void PlayerWindow::ShowVisualContextMenu(POINT screen_point) {
     // presents the complete ten-item menu (None/Cover/Options included).
     // Keep the complete resource menu here; the compact seven-item variant is
     // selected by the full-screen host, not merely by right-clicking Visual.
+    AppendPlayerVisualMenuItems(popup);
     CheckMenuItem(popup,
-        static_cast<UINT>(kCmdVisualFirst + settings_.visual.type),
+        static_cast<UINT>(kCmdVisualFirst + type),
         MF_BYCOMMAND | MF_CHECKED);
+    return popup;
+}
 
+void PlayerWindow::ShowVisualContextMenu(POINT screen_point) {
+    if (context_menu_open_ || !visual_window_ || !IsWindowEnabled(window_)) return;
+    const bool detached=fullscreen_visual_detached_;
+    const HMENU popup=CreateVisualContextMenu(detached,fullscreen_mode_,settings_.visual.type);
+    if(!popup) return;
     context_menu_open_ = true;
-    SetForegroundWindow(window_);
-    BeginPopupMenuStyle(popup, true);
+    if(!detached) {SetForegroundWindow(window_);BeginPopupMenuStyle(popup, true);}
     TrackPlayerPopupMenu(popup, TPM_RIGHTBUTTON, screen_point.x, screen_point.y,
                    0, window_, nullptr);
-    EndPopupMenuStyle();
+    if(!detached) EndPopupMenuStyle();
     DestroyMenu(popup);
     context_menu_open_ = false;
     PostMessageW(window_, WM_NULL, 0, 0);

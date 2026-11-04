@@ -2,11 +2,13 @@
 #include "ttplayer/lyrics/lrc_parser.h"
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
+#include <windows.h>
 
 namespace ttplayer::lyrics {
 struct LocalSearchRoot { std::filesystem::path path; bool recursive{}; };
@@ -19,6 +21,7 @@ struct LocalSearchRequest {
     std::vector<LocalSearchRoot> roots;
     bool partial{}, all_matches{};
     std::filesystem::path associated;
+    HMODULE archive_module{};
 };
 struct LocalSearchResult {
     std::vector<std::filesystem::path> matches;
@@ -26,7 +29,7 @@ struct LocalSearchResult {
     Lyrics lyric;
 };
 // 00444CCD (all matches), 00444F71/0043BC7C (best match). Workers never
-// retain a window, player, plugin, or caller-owned reference.
+// retain no window or caller-owned reference. Archive workers hold a DLL lease.
 struct LocalSearchJob {
     std::atomic_bool canceled{};
     std::mutex mutex;
@@ -34,4 +37,6 @@ struct LocalSearchJob {
 };
 std::shared_ptr<LocalSearchJob> SearchLocalLyricsAsync(LocalSearchRequest request);
 LocalSearchResult SearchLocalLyrics(const LocalSearchRequest& request, const std::atomic_bool& canceled);
+Lyrics LoadLocalLyric(const std::filesystem::path& path, HMODULE archive_module,
+                     const std::function<bool()>& canceled = {});
 } // namespace ttplayer::lyrics

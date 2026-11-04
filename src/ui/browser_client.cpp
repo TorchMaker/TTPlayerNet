@@ -1,0 +1,300 @@
+#include "ttplayer/ui/browser_client.h"
+#include "ttplayer/audio/http_stream.h"
+#include <filesystem>
+#include <cstring>
+#include <new>
+#include <string>
+
+namespace ttplayer::ui {
+struct BrowserClient::ResolverState {
+    std::mutex mutex;
+    std::atomic<bool> stopping{};
+    void* instance{};
+    decltype(ttp_browser_api::resolve_source) resolve{};
+    decltype(ttp_browser_api::resolve_source_ex) resolve_ex{};
+};
+namespace {
+constexpr HRESULT kUnavailable = HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+std::filesystem::path BrowserModulePath() {
+    std::wstring path(32768, L'\0');
+    const DWORD count = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!count || count >= path.size()) return {};
+    path.resize(count);
+    return std::filesystem::path(path).parent_path() / L"ttpbrowser.dll";
+}
+}
+
+BrowserClient::BrowserClient() {
+    try {
+        const auto path = BrowserModulePath();
+        if (path.empty() || !path.is_absolute()) return;
+        // An absolute filename prevents loading an unrelated DLL from CWD/PATH.
+        module_ = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!module_) return;
+        const auto get = reinterpret_cast<ttp_browser_get_api_fn>(
+            GetProcAddress(module_, "ttp_browser_get_api"));
+        const auto* supplied = get ? get(TTP_BROWSER_ABI_VERSION) : nullptr;
+        if (!supplied || supplied->size < TTP_BROWSER_API_V1_SIZE ||
+            supplied->version != TTP_BROWSER_ABI_VERSION || !supplied->create ||
+            !supplied->destroy || !supplied->configure || !supplied->set_skin ||
+            !supplied->show || !supplied->window || !supplied->translate_message ||
+            !supplied->get_state || !supplied->enqueue || !supplied->prefetch ||
+            !supplied->external_dispatch) {
+            FreeLibrary(module_); module_ = nullptr; return;
+        }
+        std::memcpy(&api_,supplied,TTP_BROWSER_API_V1_SIZE);
+        if(supplied->size>=offsetof(ttp_browser_api,resolve_source)+sizeof(supplied->resolve_source))
+            api_.resolve_source=supplied->resolve_source;
+        if(supplied->size>=offsetof(ttp_browser_api,resolve_source_ex)+sizeof(supplied->resolve_source_ex))
+            api_.resolve_source_ex=supplied->resolve_source_ex;
+        if(supplied->size>=offsetof(ttp_browser_api,create_settings_page)+sizeof(supplied->create_settings_page))
+            api_.create_settings_page=supplied->create_settings_page;
+        if(supplied->size>=offsetof(ttp_browser_api,commit_settings_page)+sizeof(supplied->commit_settings_page))
+            api_.commit_settings_page=supplied->commit_settings_page;
+    } catch (...) {
+        if (module_) FreeLibrary(module_);
+        module_ = nullptr; api_ = {};
+    }
+}
+BrowserClient::~BrowserClient() {
+    Shutdown();
+    if (module_) FreeLibrary(module_);
+}
+void BrowserClient::Snapshot(const audio::PlaybackOptions& value) {
+    auto snapshot = value;
+    snapshot.network_canceled = {};
+    snapshot.archive_opened = {};
+    snapshot.archive_session.reset();
+    std::lock_guard lock(options_mutex_);
+    options_ = std::move(snapshot);
+}
+HRESULT BrowserClient::Create(const ttp_browser_host& host, const ttp_browser_config& config,
+                              const audio::PlaybackOptions& options) {
+    if (!Available()) return kUnavailable;
+    if (instance_) return Configure(config, options);
+    if (host.size < TTP_BROWSER_HOST_V1_SIZE || host.version != TTP_BROWSER_ABI_VERSION)
+        return E_INVALIDARG;
+    Snapshot(options);
+    callbacks_ = {};
+    std::memcpy(&callbacks_, &host, TTP_BROWSER_HOST_V1_SIZE);
+    if (host.size >= offsetof(ttp_browser_host, adjust_window_rect) + sizeof(host.adjust_window_rect))
+        callbacks_.adjust_window_rect = host.adjust_window_rect;
+    if (host.size >= offsetof(ttp_browser_host, resolve_associated_lyric) + sizeof(host.resolve_associated_lyric))
+        callbacks_.resolve_associated_lyric = host.resolve_associated_lyric;
+    if(host.size>=offsetof(ttp_browser_host,open_media_settings)+sizeof(host.open_media_settings))
+        callbacks_.open_media_settings=host.open_media_settings;
+    if(host.size>=offsetof(ttp_browser_host,set_window_visible)+sizeof(host.set_window_visible))
+        callbacks_.set_window_visible=host.set_window_visible;
+    if(host.size>=offsetof(ttp_browser_host,track_popup_menu)+sizeof(host.track_popup_menu))
+        callbacks_.track_popup_menu=host.track_popup_menu;
+    if(host.size>=offsetof(ttp_browser_host,open_options)+sizeof(host.open_options))
+        callbacks_.open_options=host.open_options;
+    if(host.size>=offsetof(ttp_browser_host,get_download_page)+sizeof(host.get_download_page))
+        callbacks_.get_download_page=host.get_download_page;
+    if(host.size>=offsetof(ttp_browser_host,recognize_page_download)+sizeof(host.recognize_page_download))
+        callbacks_.recognize_page_download=host.recognize_page_download;
+    callbacks_.media_source_version=api_.resolve_source_ex?2:api_.resolve_source?1:0;
+    if(host.size>=offsetof(ttp_browser_host,get_page_script)+sizeof(host.get_page_script))callbacks_.get_page_script=host.get_page_script;
+    if(host.size>=offsetof(ttp_browser_host,recognize_page_audio)+sizeof(host.recognize_page_audio))callbacks_.recognize_page_audio=host.recognize_page_audio;
+    callbacks_.size = sizeof(callbacks_);
+    ui_thread_ = GetCurrentThreadId(); ui_enabled_ = true;
+    stopping_->store(false, std::memory_order_release);
+    auto bridge = callbacks_;
+    bridge.context = this;
+    bridge.submit_tracks = Submit; bridge.query_info = Query;
+    bridge.open_stream = OpenStream; bridge.state_changed = Changed; bridge.setup_pack = Setup;
+    bridge.adjust_window_rect = callbacks_.adjust_window_rect ? AdjustWindowRect : nullptr;
+    bridge.resolve_associated_lyric = callbacks_.resolve_associated_lyric ? ResolveAssociatedLyric : nullptr;
+    bridge.open_media_settings=callbacks_.open_media_settings?OpenMediaSettings:nullptr;
+    bridge.set_window_visible=callbacks_.set_window_visible?SetWindowVisible:nullptr;
+    bridge.track_popup_menu=callbacks_.track_popup_menu?TrackPopupMenu:nullptr;
+    bridge.open_options=callbacks_.open_options?OpenOptions:nullptr;
+    bridge.get_download_page=callbacks_.get_download_page?GetDownloadPage:nullptr;
+    bridge.recognize_page_download=callbacks_.recognize_page_download?RecognizePageDownload:nullptr;
+    bridge.get_page_script=callbacks_.get_page_script?GetPageScript:nullptr;
+    bridge.recognize_page_audio=callbacks_.recognize_page_audio?RecognizePageAudio:nullptr;
+    const HRESULT result = api_.create(&bridge, &config, &instance_);
+    if (FAILED(result)) {
+        ui_enabled_ = false;
+        if (instance_) api_.destroy(instance_);
+        instance_ = nullptr; callbacks_ = {};
+    } else if(api_.resolve_source) {
+        resolver_=std::make_shared<ResolverState>();resolver_->instance=instance_;resolver_->resolve=api_.resolve_source;resolver_->resolve_ex=api_.resolve_source_ex;
+        audio::SetPersonalMediaResolverEx([state=resolver_](const std::wstring& source,
+            const std::function<bool()>& canceled,audio::ResolvedMediaSource& resolved) -> HRESULT {
+            if(state->stopping)return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            std::lock_guard lock(state->mutex);
+            if(state->stopping||!state->instance)return RPC_E_DISCONNECTED;
+            struct Cancellation {ResolverState* state;const std::function<bool()>* callback;
+                static BOOL WINAPI Check(void* p) {const auto& c=*static_cast<Cancellation*>(p);
+                    return c.state->stopping || (*c.callback && (*c.callback)());}
+            } cancellation{state.get(),&canceled};
+            BSTR result{},auth{};const auto hr=state->resolve_ex?state->resolve_ex(state->instance,source.c_str(),Cancellation::Check,&cancellation,&result,&auth):state->resolve(state->instance,source.c_str(),Cancellation::Check,&cancellation,&result);
+            if(SUCCEEDED(hr)&&result){resolved.url=result;resolved.authorization=auth?auth:L"";}SysFreeString(result);SysFreeString(auth);return hr;
+        });
+    }
+    return result;
+}
+HRESULT BrowserClient::Configure(const ttp_browser_config& config,
+                                 const audio::PlaybackOptions& options) {
+    Snapshot(options);
+    return instance_ ? api_.configure(instance_, &config) : kUnavailable;
+}
+HRESULT BrowserClient::SetSkin(const ttp_browser_skin& skin) {
+    return instance_ ? api_.set_skin(instance_, &skin) : kUnavailable;
+}
+HRESULT BrowserClient::Show(uint32_t view) { return instance_ ? api_.show(instance_, view) : kUnavailable; }
+HWND BrowserClient::Window() const noexcept { return instance_ ? api_.window(instance_) : nullptr; }
+bool BrowserClient::Translate(MSG& message) const noexcept {
+    return instance_ && api_.translate_message(instance_, &message) != FALSE;
+}
+bool BrowserClient::State(ttp_browser_state& state) const noexcept {
+    state.size = sizeof(state);
+    return instance_ && SUCCEEDED(api_.get_state(instance_, &state));
+}
+HRESULT BrowserClient::Enqueue(const ttp_browser_track& track, uint64_t* task_id) {
+    uint64_t ignored{};
+    return instance_ ? api_.enqueue(instance_, &track, task_id ? task_id : &ignored) : kUnavailable;
+}
+HRESULT BrowserClient::Prefetch(const wchar_t* url) {
+    return instance_ ? api_.prefetch(instance_, url ? url : L"") : kUnavailable;
+}
+HRESULT BrowserClient::CreateSettingsPage(HWND parent,HWND* page){if(page)*page=nullptr;return instance_&&api_.create_settings_page?api_.create_settings_page(instance_,parent,page):E_NOTIMPL;}
+HRESULT BrowserClient::CommitSettingsPage(){return instance_&&api_.commit_settings_page?api_.commit_settings_page(instance_):S_OK;}
+HRESULT WINAPI BrowserClient::OpenMediaSettings(void* p){auto& self=*static_cast<BrowserClient*>(p);if(!self.UiCallbacksAllowed()||!self.callbacks_.open_media_settings)return RPC_E_DISCONNECTED;try{return self.callbacks_.open_media_settings(self.callbacks_.context);}catch(...){return E_FAIL;}}
+void BrowserClient::Shutdown() noexcept {
+    // UI closures must stop before destroy can pump messages or join workers.
+    DisableUiCallbacks();
+    stopping_->store(true, std::memory_order_release);
+    if(resolver_) {
+        resolver_->stopping=true;audio::SetPersonalMediaResolver({});
+        // Wait for the bounded resolver request before freeing its DLL instance.
+        std::lock_guard lock(resolver_->mutex);resolver_->instance=nullptr;
+    }
+    if (instance_) api_.destroy(instance_);
+    instance_ = nullptr;
+    resolver_.reset();
+}
+void BrowserClient::DisableUiCallbacks() noexcept {
+    ui_enabled_ = false; callbacks_ = {};
+}
+bool BrowserClient::UiCallbacksAllowed() const noexcept {
+    return ui_enabled_ && GetCurrentThreadId() == ui_thread_ && callbacks_.context;
+}
+HRESULT WINAPI BrowserClient::Submit(void* context, const ttp_browser_track* tracks,
+                                    uint32_t count, int a, int b, int c) {
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.submit_tracks) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.submit_tracks(self.callbacks_.context, tracks, count, a, b, c); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; } catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::Query(void* context, uint32_t kind, uint32_t selector, BSTR* output) {
+    if (!output) return E_POINTER;
+    *output = nullptr;
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.query_info) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.query_info(self.callbacks_.context, kind, selector, output); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; } catch (...) { return E_FAIL; }
+}
+void WINAPI BrowserClient::Changed(void* context, const ttp_browser_state* state) {
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.state_changed) return;
+    try { self.callbacks_.state_changed(self.callbacks_.context, state); } catch (...) {}
+}
+HRESULT WINAPI BrowserClient::Setup(void* context, const wchar_t* a, const wchar_t* b, const wchar_t* c) {
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.setup_pack) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.setup_pack(self.callbacks_.context, a, b, c); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; } catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::SetWindowVisible(void* context, HWND window, BOOL visible) {
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.set_window_visible) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.set_window_visible(self.callbacks_.context, window, visible); }
+    catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::TrackPopupMenu(void* context, HWND window, HMENU menu, POINT point, UINT* command) {
+    if (!command) return E_POINTER;
+    *command = 0;
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.track_popup_menu) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.track_popup_menu(self.callbacks_.context, window, menu, point, command); }
+    catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::OpenOptions(void* context) {
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.open_options) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.open_options(self.callbacks_.context); }
+    catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::GetDownloadPage(void* context,BSTR* name,BSTR* url) {
+    if(!name||!url)return E_POINTER;*name=nullptr;*url=nullptr;
+    auto& self=*static_cast<BrowserClient*>(context);
+    if(!self.UiCallbacksAllowed()||!self.callbacks_.get_download_page)return RPC_E_DISCONNECTED;
+    try{return self.callbacks_.get_download_page(self.callbacks_.context,name,url);}catch(...){return E_FAIL;}
+}
+HRESULT WINAPI BrowserClient::RecognizePageDownload(void* context,const wchar_t* page,const wchar_t* url,BSTR* filename) {
+    if(!filename)return E_POINTER;*filename=nullptr;
+    auto& self=*static_cast<BrowserClient*>(context);
+    if(!self.UiCallbacksAllowed()||!self.callbacks_.recognize_page_download)return RPC_E_DISCONNECTED;
+    try{return self.callbacks_.recognize_page_download(self.callbacks_.context,page,url,filename);}catch(...){return E_FAIL;}
+}
+HRESULT WINAPI BrowserClient::AdjustWindowRect(void* context, HWND window, uint32_t hit, RECT* bounds) {
+    if (!bounds) return E_POINTER;
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.adjust_window_rect) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.adjust_window_rect(self.callbacks_.context, window, hit, bounds); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; } catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::GetPageScript(void* context,BSTR* script) {
+    if(!script)return E_POINTER;*script=nullptr;auto& self=*static_cast<BrowserClient*>(context);
+    if(!self.UiCallbacksAllowed()||!self.callbacks_.get_page_script)return RPC_E_DISCONNECTED;
+    try{return self.callbacks_.get_page_script(self.callbacks_.context,script);}catch(...){return E_FAIL;}
+}
+HRESULT WINAPI BrowserClient::RecognizePageAudio(void* context,const wchar_t* page,const wchar_t* url) {
+    auto& self=*static_cast<BrowserClient*>(context);
+    if(!self.UiCallbacksAllowed()||!self.callbacks_.recognize_page_audio)return RPC_E_DISCONNECTED;
+    try{return self.callbacks_.recognize_page_audio(self.callbacks_.context,page,url);}catch(...){return E_FAIL;}
+}
+HRESULT WINAPI BrowserClient::ResolveAssociatedLyric(void* context, const wchar_t* path, BSTR* output) {
+    if (!output) return E_POINTER;
+    *output = nullptr;
+    if (!context) return E_INVALIDARG;
+    auto& self = *static_cast<BrowserClient*>(context);
+    if (!self.UiCallbacksAllowed() || !self.callbacks_.resolve_associated_lyric) return RPC_E_DISCONNECTED;
+    try { return self.callbacks_.resolve_associated_lyric(self.callbacks_.context, path, output); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; } catch (...) { return E_FAIL; }
+}
+HRESULT WINAPI BrowserClient::OpenStream(void* context, const wchar_t* url, HANDLE cancel,
+                                        IStream** output, BOOL* can_persist) {
+    if (!output || !can_persist) return E_POINTER;
+    *output = nullptr; *can_persist = FALSE;
+    if (!context || !url || !*url) return E_INVALIDARG;
+    auto& self = *static_cast<BrowserClient*>(context);
+    try {
+        audio::PlaybackOptions options;
+        { std::lock_guard lock(self.options_mutex_); options = self.options_; }
+        std::shared_ptr<void> cancellation;
+        if (cancel) {
+            HANDLE duplicate{};
+            if (!DuplicateHandle(GetCurrentProcess(), cancel, GetCurrentProcess(), &duplicate,
+                                 SYNCHRONIZE, FALSE, 0)) return HRESULT_FROM_WIN32(GetLastError());
+            cancellation.reset(duplicate, [](void* value) { CloseHandle(static_cast<HANDLE>(value)); });
+        }
+        const auto stopping = self.stopping_;
+        options.network_canceled = [stopping, cancellation] {
+            return stopping->load(std::memory_order_acquire) ||
+                (cancellation && WaitForSingleObject(static_cast<HANDLE>(cancellation.get()), 0) != WAIT_TIMEOUT);
+        };
+        if (options.network_canceled()) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        audio::HttpAudioStream* stream{};
+        const HRESULT result = audio::OpenHttpAudioStream(url, options, &stream, audio::HttpStreamUse::background);
+        if (FAILED(result)) return result;
+        if (!stream) return E_UNEXPECTED;
+        *can_persist = stream->CanPersist() ? TRUE : FALSE;
+        *output = stream; // Transfers the initial COM reference to the DLL.
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+      catch (...) { return E_FAIL; }
+}
+}

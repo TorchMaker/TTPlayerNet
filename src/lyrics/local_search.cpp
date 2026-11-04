@@ -1,6 +1,7 @@
 #include "ttplayer/lyrics/local_search.h"
 #include "ttplayer/lyrics/association.h"
 #include "ttplayer/lyrics/online_search.h"
+#include "ttplayer/audio/archive_member.h"
 #include <algorithm>
 #include <functional>
 #include <set>
@@ -24,6 +25,14 @@ SearchResult SplitName(const std::wstring& name) {
 }
 }
 
+Lyrics LoadLocalLyric(const std::filesystem::path& path, HMODULE module,
+                     const std::function<bool()>& canceled) {
+    audio::ArchiveMemberPath member;
+    if (!audio::ParseArchiveMemberPath(path.native(), member)) return LoadLrc(path);
+    const auto bytes = audio::ReadArchiveMember(member, module, canceled);
+    return DecodeLrcBytes(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+}
+
 std::vector<LocalSearchRoot> LocalSearchRoots(const std::filesystem::path& media,
     const std::filesystem::path& runtime, const std::filesystem::path& download,
     const std::vector<std::wstring>& configured) {
@@ -34,6 +43,13 @@ std::vector<LocalSearchRoot> LocalSearchRoots(const std::filesystem::path& media
         if (recursive) value.erase(value.begin());
         std::filesystem::path path;
         if (value == L"<Sound Folder>") {
+            audio::ArchiveMemberPath member;
+            if (audio::ParseArchiveMemberPath(media.native(), member)) {
+                auto folder = std::filesystem::path(member.member).parent_path();
+                result.push_back({audio::MakeArchiveMemberPath(member.archive,
+                    folder.empty() ? L"." : folder.native()), recursive});
+                continue;
+            }
             if (media.native().find(L"://") == std::wstring::npos) path = media.parent_path();
         } else if (value == L"<Lyrics Download Folder>") path = download;
         else path = value;
@@ -47,7 +63,7 @@ LocalSearchResult SearchLocalLyrics(const LocalSearchRequest& request, const std
     auto load = [&](const std::filesystem::path& path) {
         if (canceled || path.empty()) return false;
         try {
-            auto lyric = LoadLrc(path);
+            auto lyric = LoadLocalLyric(path, request.archive_module, [&]{ return canceled.load(); });
             if (lyric.lines.empty()) return false;
             result.loaded_path = path; result.lyric = std::move(lyric); return true;
         } catch (...) { return false; }
@@ -57,7 +73,9 @@ LocalSearchResult SearchLocalLyrics(const LocalSearchRequest& request, const std
     std::set<std::filesystem::path, PathLess> seen;
     int best{};
     std::filesystem::path best_path;
-    const auto file_title = request.media.stem().wstring();
+    audio::ArchiveMemberPath media_member;
+    const auto file_title = audio::ParseArchiveMemberPath(request.media.native(), media_member)
+        ? std::filesystem::path(media_member.member).stem().wstring() : request.media.stem().wstring();
     const auto exact_name = request.artist.empty() ? file_title : request.artist + L" - " + request.title;
     const auto accept = [&](const std::filesystem::path& path, int score) {
         if (score < (request.partial ? 1 : 4)) return;
@@ -98,14 +116,66 @@ LocalSearchResult SearchLocalLyrics(const LocalSearchRequest& request, const std
         }
         for (const auto& path : subdirectories) scan(path, depth + 1, recursive);
     };
-    for (const auto& root : request.roots) scan(root.path, 1, root.recursive);
+    for (const auto& root : request.roots) {
+        if (canceled || (!request.all_matches && best == 9)) break;
+        audio::ArchiveMemberPath archive_root;
+        if (!audio::ParseArchiveMemberPath(root.path.native(), archive_root)) {
+            scan(root.path, 1, root.recursive); continue;
+        }
+        try {
+            auto folder = std::filesystem::path(archive_root.member).lexically_normal().native();
+            if (folder == L".") folder.clear();
+            if (!folder.empty() && folder.back() != L'\\') folder += L'\\';
+            const auto names = audio::ListArchiveMembers(archive_root.archive, request.archive_module,
+                [&]{ return canceled.load(); });
+            std::function<void(std::wstring,unsigned)> scan_archive;
+            scan_archive = [&](std::wstring prefix, unsigned depth) {
+                if (canceled || (!request.all_matches && best == 9)) return;
+                if (!request.all_matches) for (const auto& [name, score] :
+                    {std::pair{exact_name,9}, std::pair{file_title,4}}) {
+                    if (name.empty() || name.find_first_of(L"<>:\"/\\|?*") != name.npos) continue;
+                    for (const auto* extension : {L".lrc", L".txt"}) {
+                        const auto wanted = prefix + name + extension;
+                        const auto found = std::find_if(names.begin(), names.end(), [&](const auto& n){return !_wcsicmp(n.c_str(),wanted.c_str());});
+                        if (found != names.end()) { accept(audio::MakeArchiveMemberPath(archive_root.archive,*found),score); break; }
+                    }
+                    if (best == 9) return;
+                }
+                std::set<std::wstring> visited;
+                std::vector<std::wstring> subdirectories;
+                for (const auto& name : names) {
+                    if (canceled) return;
+                    if (name.size() <= prefix.size() || _wcsnicmp(name.c_str(),prefix.c_str(),prefix.size())) continue;
+                    const auto slash = name.find(L'\\',prefix.size());
+                    if (slash != name.npos) {
+                        auto sub = name.substr(0,slash+1);
+                        if (root.recursive && depth < 4 && visited.insert(sub).second) subdirectories.push_back(std::move(sub));
+                        continue;
+                    }
+                    const std::filesystem::path file(name);
+                    const auto extension = file.extension().native();
+                    if (_wcsicmp(extension.c_str(),L".lrc") && _wcsicmp(extension.c_str(),L".txt")) continue;
+                    accept(audio::MakeArchiveMemberPath(archive_root.archive,name),
+                        ScoreLyricMatch(SplitName(file.stem().native()),request.artist,request.title,file_title,request.partial));
+                    if (!request.all_matches && best == 9) return;
+                }
+                for (const auto& sub : subdirectories) scan_archive(sub,depth+1);
+            };
+            scan_archive(folder,1);
+        } catch (...) { /* A missing/canceled archive must not prevent other configured roots. */ }
+    }
     if (!request.all_matches && best >= 4) load(best_path);
     return result;
 }
 
 std::shared_ptr<LocalSearchJob> SearchLocalLyricsAsync(LocalSearchRequest request) {
     auto job = std::make_shared<LocalSearchJob>();
-    std::thread([job, request = std::move(request)] {
+    if (!request.archive_module) request.archive_module=GetModuleHandleW(L"ttpcomm.dll");
+    HMODULE retained{};
+    if (request.archive_module && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(request.archive_module), &retained)) { job->result=LocalSearchResult{}; return job; }
+    auto lease = std::shared_ptr<void>(retained, [](void* module){ if(module) FreeLibrary(static_cast<HMODULE>(module)); });
+    std::thread([job, lease = std::move(lease), request = std::move(request)] {
         LocalSearchResult result;
         try { result = SearchLocalLyrics(request, job->canceled); } catch (...) {}
         std::lock_guard lock(job->mutex);

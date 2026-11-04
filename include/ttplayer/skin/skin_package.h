@@ -14,6 +14,8 @@ struct SkinEntry {
     uint32_t size{};
     uint32_t local_header_offset{};
     uint16_t compression{};
+    uint16_t flags{};
+    std::wstring decoded_name;
 };
 class SkinPackage {
 public:
@@ -26,6 +28,12 @@ public:
     // blocks the UI in Shell.Application/Compressed Folders.
     void ExtractTo(const std::filesystem::path& directory,
                    HMODULE ttpcomm) const;
+    // Materialize one referenced asset, checking its bytes even if the cache
+    // already contains a file of the same length. Missing entries return false.
+    bool ExtractEntryTo(const std::filesystem::path& directory,
+                        std::string_view name, HMODULE ttpcomm) const;
+    bool ExtractEntryTo(const std::filesystem::path& directory,
+                        std::wstring_view name, HMODULE ttpcomm) const;
     [[nodiscard]] const std::vector<SkinEntry>& Entries() const noexcept { return entries_; }
     [[nodiscard]] bool Has(std::string_view name) const;
     [[nodiscard]] std::vector<unsigned char> ReadEntry(
@@ -34,6 +42,8 @@ public:
     [[nodiscard]] size_t ByteSize() const noexcept { return data_.size(); }
     [[nodiscard]] uint64_t Fingerprint() const noexcept;
 private:
+    [[nodiscard]] std::vector<unsigned char> ReadEntry(
+        const SkinEntry& entry, HMODULE ttpcomm) const;
     static SkinPackage Parse(std::vector<unsigned char> data,
                              std::filesystem::path path = {});
     std::filesystem::path path_;

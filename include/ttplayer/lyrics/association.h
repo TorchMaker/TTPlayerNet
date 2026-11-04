@@ -1,11 +1,15 @@
 #pragma once
 
+#include "ttplayer/core/save_result.h"
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
 
 namespace ttplayer::lyrics {
+
+// Both distribution names share the rebuild's saved lyric associations.
+std::filesystem::path AssociationStorePath(std::filesystem::path executable);
 
 // 00411C72/0041B553: a CPlayItem identity, not its title or server result ID.
 struct SongKey {
@@ -27,9 +31,14 @@ public:
     bool Load(const std::filesystem::path& file);
     // 00453AF6: UTF-8 BOM, media|subtrack|lyric, CRLF; dirty-only writes.
     bool Save();
+    // Keep the destination and failure for the player's retryable close path.
+    [[nodiscard]] SaveResult SaveChecked();
     std::optional<std::filesystem::path> Find(const SongKey& song) const;
     bool Set(const SongKey& song, const std::filesystem::path& lyric);
     bool Erase(const SongKey& song);
+    // 004868E7 -> 004AF8A4: move all subtrack keys, including NoLyric.
+    bool RetargetSource(const std::filesystem::path& before,
+                        const std::filesystem::path& after);
     const Entries& All() const noexcept { return entries_; }
     bool Loaded() const noexcept { return !file_.empty(); }
     bool Dirty() const noexcept { return dirty_; }
