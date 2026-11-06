@@ -105,6 +105,8 @@ public:
     // LoadMusicFreeSourcesOnStartup），否则音乐窗里一个可用音源都没有。
     void RestoreStartupMusicBrowserWindow();
     [[nodiscard]] bool PreTranslateMessage(const MSG& message) const;
+    // 幂等。由启动消息补建三个辅助窗口；用户更早输入时消息过滤器也会调用。
+    void CreateStartupAuxWindows();
     [[nodiscard]] HWND Handle() const noexcept { return window_; }
 
 private:
@@ -1054,6 +1056,7 @@ private:
     };
     std::optional<SkinWindowFadeState> skin_window_fade_;
     bool suppress_skin_window_activation_fade_{};
+    bool startup_aux_windows_created_{};
     bool startup_skin_window_fade_pending_{};
     bool close_after_skin_window_fade_{};
     bool close_waiting_for_audio_fade_{};

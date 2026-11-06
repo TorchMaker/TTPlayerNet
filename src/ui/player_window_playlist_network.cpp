@@ -193,7 +193,10 @@ bool PlayerWindow::StartOnlineTrackDownload(const playlist::Track& track) {
     const HWND notify = window_;
     // 分离线程 + 共享负载：不用 join，也就没有「joinable 的 std::thread 析构」
     // 这种必须 detach 否则 terminate 的坑；结果通过消息回到 UI 线程。
-    std::thread([job, notify, url_hint, platform, song_id] {
+    // 条目里保存的完整音源对象（含插件私有字段）按值捕获进工作线程，
+    // 重新解析直链时原样回传给插件 / 洛雪音源。
+    const auto source_raw = musicfree::RestoreSourceRaw(track.metadata);
+    std::thread([job, notify, url_hint, platform, song_id, source_raw] {
         std::wstring resolved = url_hint;
         std::wstring error;
         // 已经存下来的 path 就是解析结果；不像 http 地址时（例如从旧配置恢复的
@@ -202,7 +205,7 @@ bool PlayerWindow::StartOnlineTrackDownload(const playlist::Track& track) {
             std::string reason;
             try {
                 resolved = core::Utf8ToWide(
-                    musicfree::ResolvePlayUrl(platform, song_id, &reason));
+                    musicfree::ResolvePlayUrl(platform, song_id, &reason, &source_raw));
             } catch (const std::exception&) {
                 resolved.clear();
             }
@@ -433,8 +436,9 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
         g_download_job = job;
     }
 
+    const auto source_raw = musicfree::RestoreSourceRaw(track.metadata);
     std::thread([job, notify, url_hint, platform, song_id,
-                 playlist_index, row] {
+                 playlist_index, row, source_raw] {
         std::wstring resolved = url_hint;
         std::wstring error;
         // path 是 http 地址时，按「音源平台 + 歌曲 id」重新解析（等价于 MusicFree
@@ -442,7 +446,7 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
         // 但这里只会在线条目（http）走到这，所以一律重新解析更稳。
         std::string reason;
         resolved = core::Utf8ToWide(
-            musicfree::ResolvePlayUrl(platform, song_id, &reason));
+            musicfree::ResolvePlayUrl(platform, song_id, &reason, &source_raw));
         if (resolved.empty()) {
             error = reason.empty() ? L"无法解析播放地址"
                                    : core::Utf8ToWide(reason);

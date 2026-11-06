@@ -117,4 +117,104 @@ struct PluginMeta {
     bool can_sheet = false;
 };
 
+// ---- 音源更新检查（复刻 MusicFree 的 updatePlugin / installPluginFromUrl）----
+//
+// 原版语义（src/core/pluginManager/index.ts）：
+//  * 每个插件记住下载地址 srcUrl，更新 = 重新下载（Cache-Control: no-cache）；
+//  * 内容哈希与本地相同 → "插件已安装"（视为已是最新）；
+//  * 本地版本 > 远端版本 → 拒绝安装（防降级，compare-versions 比较）；
+//  * 否则替换旧文件并重新挂载。
+
+// 复刻 compare-versions 的比较：按 '.'/'-'/'+' 分段，纯数字段按数值比较
+// （缺段按 0，前导 v/V 忽略），非数字段按字典序。返回 <0 / 0 / >0。
+inline int CompareSourceVersions(std::string_view lhs, std::string_view rhs) {
+    if (!lhs.empty() && (lhs.front() == 'v' || lhs.front() == 'V'))
+        lhs.remove_prefix(1);
+    if (!rhs.empty() && (rhs.front() == 'v' || rhs.front() == 'V'))
+        rhs.remove_prefix(1);
+    auto next = [](std::string_view s, std::size_t& pos) {
+        if (pos >= s.size()) return std::string_view();
+        const std::size_t start = pos;
+        while (pos < s.size() && s[pos] != '.' && s[pos] != '-' && s[pos] != '+')
+            ++pos;
+        const std::string_view part = s.substr(start, pos - start);
+        if (pos < s.size()) ++pos;  // 跳过分隔符
+        return part;
+    };
+    std::size_t pa = 0, pb = 0;
+    for (;;) {
+        if (pa >= lhs.size() && pb >= rhs.size()) return 0;
+        const std::string_view a = next(lhs, pa);
+        const std::string_view b = next(rhs, pb);
+        // 空段视为数字 0（"1.0" vs "1.0.1" 的缺段）
+        const bool numa = a.empty() ||
+            a.find_first_not_of("0123456789") == std::string_view::npos;
+        const bool numb = b.empty() ||
+            b.find_first_not_of("0123456789") == std::string_view::npos;
+        int cmp = 0;
+        if (numa && numb) {
+            // 段长可能超过 long long：去前导零后先比长度再比字典序
+            const std::size_t za = a.find_first_not_of('0');
+            const std::size_t zb = b.find_first_not_of('0');
+            const std::string_view ca =
+                za == std::string_view::npos ? std::string_view() : a.substr(za);
+            const std::string_view cb =
+                zb == std::string_view::npos ? std::string_view() : b.substr(zb);
+            if (ca.size() != cb.size()) cmp = ca.size() < cb.size() ? -1 : 1;
+            else if (const int r = ca.compare(cb)) cmp = r < 0 ? -1 : 1;
+        } else if (numa != numb) {
+            cmp = numa ? -1 : 1;  // 数字段 < 非数字段
+        } else {
+            const int r = a.compare(b);
+            cmp = r < 0 ? -1 : (r > 0 ? 1 : 0);
+        }
+        if (cmp != 0) return cmp;
+    }
+}
+
+// 单个音源的更新检查结果。
+struct SourceUpdateInfo {
+    std::string protocol;      // "MusicFree" / "洛雪音源" / "REST 音源" / "Listen1"
+    std::string name;          // 插件/音源名
+    std::string url;           // 更新源 URL（本地导入没有 URL）
+    std::string old_version;
+    std::string new_version;
+    std::string status;        // updated / latest / downgrade / no_url / failed
+    std::string detail;        // 失败原因 / 提示
+};
+
+struct SourceUpdateReport {
+    int checked = 0;
+    int updated = 0;
+    int latest = 0;
+    int failed = 0;
+    std::vector<SourceUpdateInfo> items;
+    std::vector<std::string> errors;
+
+    // UTF-8 多行摘要，导入窗的结果框直接显示。
+    std::string Summary() const {
+        std::string out = "检查更新完成：可更新音源 " + std::to_string(checked) +
+                          " 个，已更新 " + std::to_string(updated) +
+                          "，已是最新 " + std::to_string(latest) +
+                          "，失败 " + std::to_string(failed);
+        for (const auto& it : items) {
+            out += "\r\n- [" + it.protocol + "] " + it.name;
+            if (it.status == "updated") {
+                out += "：已更新 " + it.old_version + " -> " + it.new_version;
+            } else if (it.status == "latest") {
+                out += "：已是最新";
+            } else if (it.status == "downgrade") {
+                out += "：远端版本(" + it.new_version + ")较旧，已拒绝更新";
+            } else if (it.status == "no_url") {
+                out += "：本地导入，没有更新源";
+            } else {
+                out += "：失败";
+                if (!it.detail.empty()) out += "：" + it.detail;
+            }
+        }
+        for (const auto& e : errors) out += "\r\n- " + e;
+        return out;
+    }
+};
+
 } // namespace ttplayer::musicfree

@@ -1,4 +1,5 @@
 #include "ttplayer/app/application.h"
+#include "ttplayer/app/startup_trace.h"
 #include "ttplayer/app/file_info_worker.h"
 #include "ttplayer/app/runtime.h"
 #include "ttplayer/app/single_instance.h"
@@ -46,6 +47,7 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     // ttpcomm startup import for static TLS, so Windows loads that dependency
     // before this entry point; do not replace it with LoadLibrary-only loading.
     const OptionalI18nRuntime i18n_runtime;
+    TT_STARTUP_TRACE("i18n_ready");
 
     // Retain EXE-local dependency paths and omit the original exact-version
     // gate. ABI-compatible revisions are accepted; consumers check exports.
@@ -55,6 +57,7 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
                     i18n::Literal(L"TTPlayer"), MB_OK | MB_ICONERROR);
         return -1;
     }
+    TT_STARTUP_TRACE("ttpcomm_ready");
 
     // CSingleInstanceIpc_Initialize is a static-runtime predecessor of the
     // recovered wWinMain. Its observable branch is reproduced here.
@@ -72,6 +75,7 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         return 1;
     }
     single_instance.PublishProcess();
+    TT_STARTUP_TRACE("single_instance_ready");
 
     // Main-instance initialization order from 004C0E8F.
     const DWORD tls_index = TlsAlloc();
@@ -96,10 +100,19 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         return -1;
     }
 
+    TT_STARTUP_TRACE("ttpres_ready");
     if (ttpcomm.Api().srand48) ttpcomm.Api().srand48(GetTickCount());
     ttplayer::app::SoundLibraryRuntime sound_library;
     const auto addin_path = ttplayer::app::FindRuntimePath(L"AddIn");
-    const HRESULT sound_result = sound_library.Initialize(addin_path);
+    // AddIn 音效库要逐个 LoadLibrary + 枚举接口，DLL 越多越慢（实测 40~457ms），
+    // 而主窗口创建、皮肤解析与首帧绘制完全不依赖它，多数启动也不会立刻播放。
+    // 这里只登记目录，真正的加载由会话在窗口显示后的空闲时段触发；用户第一次
+    // 操作前会兜底同步加载（见 application.cpp 的 PlayerFilter）。
+    sound_library.SetDirectory(addin_path);
+    // 无窗口的自检与文件关联注册分支需要确定性结果，保持启动即完整加载。
+    const bool sound_needed_now = command_line.smoke_test ||
+        command_line.HasSwitch(L"reg") || command_line.HasSwitch(L"unreg");
+    const HRESULT sound_result = sound_needed_now ? sound_library.EnsureLoaded() : S_OK;
     if (FAILED(sound_result)) {
         // DAT_005474FC remains a live application-title string after
         // CPlayerApp_ShutdownResources in 004C0E8F.  Preserve its resource
@@ -116,11 +129,15 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     // 004B58AD (WH_CALLWNDPROC + WH_CBT) precedes CoolSB ordinal 200.
     ttplayer::app::ThreadMessageHooksRuntime message_hooks;
     message_hooks.Install();
+    TT_STARTUP_TRACE(sound_needed_now ? "sound_library_ready"
+                                     : "sound_library_deferred");
     if (ttpcomm.Api().coolsb_init_app) ttpcomm.Api().coolsb_init_app();
+    TT_STARTUP_TRACE("session_start");
     const int result = ttplayer::app::TTPlayer_RunApplicationSession(
         instance, show_command, single_instance, resources.Module(),
         ttpcomm.Api().module,
-        sound_library.Manager());
+        sound_library.Manager(),
+        [&sound_library] { static_cast<void>(sound_library.EnsureLoaded()); });
 
     // Exact reverse-order teardown from 004C0E8F.
     single_instance.Shutdown();
@@ -136,6 +153,8 @@ int TTPlayer_wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show_command) {
+    TT_STARTUP_TRACE_RESET();
+    TT_STARTUP_TRACE("wWinMain_enter");
     // Original AddIns use pre-ATL-8 heap window thunks. Keep DEP enabled,
     // but let Windows emulate those thunks, rather than declaring the whole
     // legacy plugin graph NX-compatible. Paired with /NXCOMPAT:NO in CMake;

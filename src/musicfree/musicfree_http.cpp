@@ -24,6 +24,12 @@
 
 namespace ttplayer::musicfree {
 
+// WINHTTP_DISABLE_CACHE (0x00000001) 在较低 _WIN32_WINNT 目标下未在 winhttp.h 声明，
+// 这里自行补充，保证关缓存特性在所有目标版本都能编译。
+#ifndef WINHTTP_DISABLE_CACHE
+#define WINHTTP_DISABLE_CACHE 0x00000001
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -142,7 +148,8 @@ std::wstring EncodeNonAsciiForUrl(const std::wstring& url) {
 HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
                              const std::vector<std::uint8_t>& post_body,
                              const std::map<std::string, std::string>& req_headers,
-                             const NetworkConfig& cfg) {
+                             const NetworkConfig& cfg,
+                             const std::wstring& verb_override = {}) {
     HttpResponse resp;
     // 必须在 ParseUrl 之前编码：WinHttpCrackUrl 会把非 ASCII 降级为 '?'。
     UrlParts parts = ParseUrl(EncodeNonAsciiForUrl(url));
@@ -159,6 +166,17 @@ HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
     hSession.h = WinHttpOpen(L"TTPlayerMusicFree/0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession.h) throw std::runtime_error("WinHttpOpen 失败");
+
+    // MusicFree 插件会并发请求大量相似 API 端点。WinHTTP 默认把 GET 响应写入
+    // 系统磁盘缓存（INetCache）。当多个来源的会话并发、或重放相同 URL 时，缓存
+    // 文件已存在会让 WinHttpSendRequest 返回 ERROR_ALREADY_EXISTS (183)，表现
+    // 为「插件调用被拒绝 / axios 请求失败」。这些请求都是即时的、无需缓存，
+    // 直接关闭磁盘缓存特性，从根上消除这个冲突。
+    {
+        DWORD disable_features = WINHTTP_DISABLE_CACHE;
+        WinHttpSetOption(hSession.h, WINHTTP_OPTION_DISABLE_FEATURE,
+                         &disable_features, sizeof(disable_features));
+    }
 
     if (!cfg.proxy.empty()) {
         // NetworkConfig::proxy 已是 std::wstring，无需再转换。
@@ -179,7 +197,8 @@ HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
     if (!hConnect.h) throw std::runtime_error("WinHttpConnect 失败");
 
     DWORD flags = (parts.scheme == L"https") ? WINHTTP_FLAG_SECURE : 0;
-    LPCWSTR verb = is_post ? L"POST" : L"GET";
+    LPCWSTR verb = !verb_override.empty() ? verb_override.c_str()
+                                          : (is_post ? L"POST" : L"GET");
     hRequest.h = WinHttpOpenRequest(hConnect.h, verb, parts.path.c_str(), nullptr,
                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hRequest.h) throw std::runtime_error("WinHttpOpenRequest 失败 (错误码 " +
@@ -192,24 +211,75 @@ HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
     WinHttpSetOption(hRequest.h, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
                      sizeof(redirect_policy));
 
-    // 请求头
+    // 请求头。安全网：按小写头名去重，先出现者优先（与 axios 的覆盖顺序一致）。
+    // 携带同一条头的两种大小写会让 WinHttpSendRequest 直接返回 183（见 MergeHeaders
+    // 处注释），此去重保护 axios/fetch/洛雪/REST 之外将来新增的所有调用方。
     std::wstring headerBlob;
-    for (const auto& kv : req_headers) {
-        headerBlob += ToWide(kv.first) + L": " + ToWide(kv.second) + L"\r\n";
+    {
+        std::map<std::string, bool> seen;
+        for (const auto& kv : req_headers) {
+            std::string name = kv.first;
+            for (auto& c : name) c = (char)::tolower((unsigned char)c);
+            if (!seen.emplace(name, true).second) continue;
+            headerBlob += ToWide(name) + L": " + ToWide(kv.second) + L"\r\n";
+        }
     }
     if (!headerBlob.empty())
         WinHttpAddRequestHeaders(hRequest.h, headerBlob.c_str(), (DWORD)headerBlob.size(),
                                  WINHTTP_ADDREQ_FLAG_ADD);
 
+    // 发送前快照：WinHttpSendRequest 可能在网络往返前就抛 183（与请求头/URL 相关），
+    // 常规 TraceHttpRequest 走不到，这里无条件把本次请求的方法/URL/头/体落到日志，
+    // 便于定位 SendRequest 阶段的失败根因。
+    {
+        wchar_t flag[8]{};
+        if (GetEnvironmentVariableW(L"TTPLAYER_MF_TRACE", flag, 8)) {
+            wchar_t temp[MAX_PATH]{};
+            DWORD tlen = GetTempPathW(MAX_PATH, temp);
+            if (tlen) {
+                std::wstring path = std::wstring(temp, tlen) + L"ttplayer_mf_http.log";
+                FILE* file = _wfopen(path.c_str(), L"ab");
+                if (file) {
+                    std::string body_str(post_body.begin(), post_body.end());
+                    std::fprintf(file, "====\nATTEMPT verb=%s url=%s body_bytes=%zu\n",
+                                 ToUtf8(std::wstring(verb)).c_str(),
+                                 ToUtf8(url).c_str(), post_body.size());
+                    for (const auto& kv : req_headers)
+                        std::fprintf(file, "  hdr %s: %s\n", kv.first.c_str(), kv.second.c_str());
+                    std::fprintf(file, "  body=%s\n", body_str.c_str());
+                    std::fclose(file);
+                }
+            }
+        }
+    }
+
+    // 发送请求。采用「先声明总长度、再 WinHttpWriteData 分写」的规范模式，
+    // 而不是把请求体内联进 WinHttpSendRequest(lpOptional)。原因：WinHTTP 5.1 在
+    // 部分 HTTPS 端点上，内联请求体路径会误报 ERROR_ALREADY_EXISTS(183)（缓存
+    // 子系统在发送阶段被触发），改用 WINHTTP_NO_REQUEST_DATA + WinHttpWriteData
+    // 路径可规避该误报，且是微软文档推荐的“有请求体”写法。
+    DWORD gle = 0;
+    auto fail_reason = [&](const char* stage) {
+        gle = GetLastError();
+        return std::string(stage) + " 失败 (错误码 " + std::to_string(gle) + ") "
+               "url=" + ToUtf8(url) + " verb=" + ToUtf8(std::wstring(verb)) +
+               " body_bytes=" + std::to_string(post_body.size());
+    };
+
     if (!WinHttpSendRequest(hRequest.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            const_cast<LPVOID>(static_cast<LPCVOID>(post_body.data())),
-                            (DWORD)post_body.size(), (DWORD)post_body.size(), 0))
-        throw std::runtime_error("WinHttpSendRequest 失败 (错误码 " +
-                                 std::to_string(GetLastError()) + ")");
+                            WINHTTP_NO_REQUEST_DATA, 0,
+                            (DWORD)post_body.size(), 0))
+        throw std::runtime_error(fail_reason("WinHttpSendRequest"));
+
+    if (!post_body.empty()) {
+        DWORD written = 0;
+        if (!WinHttpWriteData(hRequest.h, post_body.data(),
+                              (DWORD)post_body.size(), &written))
+            throw std::runtime_error(fail_reason("WinHttpWriteData"));
+    }
 
     if (!WinHttpReceiveResponse(hRequest.h, nullptr))
-        throw std::runtime_error("WinHttpReceiveResponse 失败 (错误码 " +
-                                 std::to_string(GetLastError()) + ")");
+        throw std::runtime_error(fail_reason("WinHttpReceiveResponse"));
 
     // 状态码
     DWORD s = 0, sLen = sizeof(s);
@@ -273,6 +343,11 @@ std::string ContentType(const std::map<std::string, std::vector<std::string>>& h
 }
 
 // 把 config.headers（JS 对象）合并进 req_headers。
+// 与 axios 对齐：HTTP 头名不区分大小写（RFC 7230），axios 会把 'Content-Type'
+// 与 'content-type' 视为同一条头相互覆盖。这里统一转小写入 map —— 否则插件传
+// 'Content-Type'、我们兜底再补 'content-type'，请求里出现重复头，WinHTTP 在
+// WinHttpSendRequest 阶段直接报 ERROR_ALREADY_EXISTS(183)（真机二分实验证实：
+// QQ musicu.fcg 带重复对即 183，去重后 200）。
 std::map<std::string, std::string> MergeHeaders(JSContext* ctx, JSValueConst config) {
     std::map<std::string, std::string> out;
     if (JS_IsObject(config)) {
@@ -284,9 +359,11 @@ std::map<std::string, std::string> MergeHeaders(JSContext* ctx, JSValueConst con
                 for (uint32_t i = 0; i < count; ++i) {
                     const char* k = JS_AtomToCString(ctx, props[i].atom);
                     if (!k) continue;
+                    std::string key = k;
+                    for (auto& c : key) c = (char)::tolower((unsigned char)c);
                     JSValue v = JS_GetProperty(ctx, hdrs, props[i].atom);
                     const char* cv = JS_ToCString(ctx, v);
-                    if (cv) out[k] = cv;
+                    if (cv) out[key] = cv;
                     if (cv) JS_FreeCString(ctx, cv);
                     JS_FreeValue(ctx, v);
                     JS_FreeCString(ctx, k);
@@ -792,6 +869,21 @@ JSValue CreateCheerioShim(JSContext* ctx) {
 
 JSValue CreateFetchGlobal(JSContext* ctx) {
     return JS_NewCFunction(ctx, &FetchCall, "fetch", 2);
+}
+
+HttpExchange PerformHttpRequest(
+    const std::string& url, const std::string& method,
+    const std::map<std::string, std::string>& headers,
+    const std::vector<std::uint8_t>& body, const NetworkConfig& cfg) {
+    const std::wstring verb = ToWide(method.empty() ? std::string("GET") : method);
+    const bool is_post = verb != L"GET" && verb != L"HEAD";
+    HttpResponse r = WinHttpBlocking(ToWide(url), is_post, body, headers, cfg, verb);
+    HttpExchange out;
+    out.status = r.status;
+    out.status_text = r.status_text;
+    out.headers = std::move(r.headers);
+    out.body = std::move(r.body);
+    return out;
 }
 
 std::string DownloadText(const std::string& url, const NetworkConfig& cfg) {

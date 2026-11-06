@@ -1,9 +1,11 @@
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/skin/skin_frame.h"
 #include "ttplayer/settings/settings.h"
+#include "ttplayer/app/startup_trace.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <comdef.h>
 #include <cstring>
 #include <cwctype>
@@ -320,11 +322,27 @@ LegacySkin& LegacySkin::operator=(LegacySkin&& other) noexcept {
     return *this;
 }
 
+namespace {
+double& BitmapLoadTotalMs() { static double value = 0.0; return value; }
+int& BitmapLoadCalls() { static int value = 0; return value; }
+} // namespace
+
 SkinImage LegacySkin::LoadBitmap(const std::filesystem::path& path) {
     auto key = path.lexically_normal().wstring();
     std::transform(key.begin(), key.end(), key.begin(), towlower);
     if (const auto found = bitmaps_.find(key); found != bitmaps_.end()) return found->second;
+    const bool timing = ttplayer::app::startup_trace::Enabled();
+    LARGE_INTEGER begin{}, end{};
+    if (timing) QueryPerformanceCounter(&begin);
     const auto bitmap = SkinImage::Load(path);
+    if (timing) {
+        QueryPerformanceCounter(&end);
+        const auto& frequency = ttplayer::app::startup_trace::Frequency();
+        if (frequency.QuadPart)
+            BitmapLoadTotalMs() += static_cast<double>(end.QuadPart - begin.QuadPart) *
+                1000.0 / static_cast<double>(frequency.QuadPart);
+        ++BitmapLoadCalls();
+    }
     if (!bitmap) return nullptr;
     bitmaps_.emplace(key, bitmap);
     return bitmap;
@@ -731,6 +749,7 @@ void LoadVisualSettings(const std::filesystem::path& directory,
 
 LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                             const settings::Settings* current) {
+    TT_STARTUP_TRACE("skin_load_begin");
     ComScope com;
     if (FAILED(com.result) && com.result != RPC_E_CHANGED_MODE) throw std::runtime_error("COM init failed");
     IXMLDOMDocument* document{};
@@ -741,6 +760,7 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
     document->put_async(VARIANT_FALSE);
     VARIANT_BOOL loaded{};
     auto xml = DecodeLegacyXml(directory / L"Skin.xml");
+    TT_STARTUP_TRACE("skin_xml_decoded");
     // The original streaming XML reader stops at </skin>. Several published
     // packages append an old coordinate line after the root element (for
     // example ironger-BlueArmorPlayer); MSXML rejects that otherwise valid
@@ -784,6 +804,8 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
         throw std::runtime_error("invalid Skin.xml: " + detail);
     }
 
+    TT_STARTUP_TRACE("skin_xml_parsed");
+
     LegacySkin skin;
     // 0048E635 / 0048EA53 seed package descriptors from the current settings
     // before parsing sparse XML. Standalone loads start with DLL defaults.
@@ -816,6 +838,7 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
         throw std::runtime_error("player_window missing from Skin.xml");
     }
     const auto background_name = Attribute(player, L"image");
+    TT_STARTUP_TRACE("skin_bitmap_begin");
     skin.background_ = skin.LoadBitmap(directory / background_name);
     if (!skin.background_) {
         player->Release();
@@ -1383,6 +1406,12 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
     // and stores its sparse descriptor at skin-object offset +0x498.
     LoadVisualSettings(directory, skin.visual_);
     document->Release();
+    char bitmap_label[128];
+    std::snprintf(bitmap_label, sizeof(bitmap_label),
+                  "skin_bitmap_total_ms=%.2f_calls=%d",
+                  BitmapLoadTotalMs(), BitmapLoadCalls());
+    TT_STARTUP_TRACE(bitmap_label);
+    TT_STARTUP_TRACE("skin_load_end");
     return skin;
 }
 

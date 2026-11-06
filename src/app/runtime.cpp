@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <iterator>
 #include <string_view>
+#include <utility>
 
 namespace ttplayer::app {
 namespace {
@@ -201,16 +202,29 @@ bool ResourceRuntime::Initialize() {
 }
 void ResourceRuntime::Shutdown() { if (module_) { FreeLibrary(module_); module_ = nullptr; } }
 
-HRESULT SoundLibraryRuntime::Initialize(const std::filesystem::path& addin_directory) {
+void SoundLibraryRuntime::SetDirectory(std::filesystem::path addin_directory) {
+    directory_ = std::move(addin_directory);
+}
+
+HRESULT SoundLibraryRuntime::EnsureLoaded() {
+    if (loaded_) return S_OK;
+    // 先置位：即使某个 AddIn 加载失败也不要在每次用户输入时反复重扫目录。
+    loaded_ = true;
     try {
-        return manager_.Load(addin_directory);
+        return manager_.Load(directory_);
     } catch (const std::exception&) {
         manager_.Shutdown();
         return E_FAIL;
     }
 }
+
+HRESULT SoundLibraryRuntime::Initialize(const std::filesystem::path& addin_directory) {
+    SetDirectory(addin_directory);
+    loaded_ = false;
+    return EnsureLoaded();
+}
 SoundLibraryRuntime::~SoundLibraryRuntime() { Shutdown(); }
-void SoundLibraryRuntime::Shutdown() { manager_.Shutdown(); }
+void SoundLibraryRuntime::Shutdown() { loaded_ = false; manager_.Shutdown(); }
 
 ThreadMessageHooksRuntime::~ThreadMessageHooksRuntime() { Shutdown(); }
 

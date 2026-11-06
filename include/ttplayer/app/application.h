@@ -4,6 +4,7 @@
 #include "ttplayer/plugins/plugin_manager.h"
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,9 +29,12 @@ struct ParsedCommandLine {
 };
 
 ParsedCommandLine ParseCommandLine();
-int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
-                                   SingleInstanceIpc& single_instance,
-                                   HMODULE resource_module,
-                                   HMODULE ttpcomm_module,
-                                   const plugins::PluginManager& sound_library);
+// ensure_sound_library：窗口显示后由会话触发的 AddIn 音效库懒加载回调。
+// 空回调表示调用方已经同步加载完成（自检 / 注册分支）。
+int TTPlayer_RunApplicationSession(
+    HINSTANCE instance, int show_command,
+    SingleInstanceIpc& single_instance,
+    HMODULE resource_module, HMODULE ttpcomm_module,
+    const plugins::PluginManager& sound_library,
+    const std::function<void()>& ensure_sound_library = {});
 } // namespace ttplayer::app

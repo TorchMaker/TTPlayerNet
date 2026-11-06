@@ -12,6 +12,7 @@
 // 与 MusicFree 一致：导入是"手动"的——用户粘贴 URL 或选择本地 JSON，
 // 本管理器只消费用户提供的来源，不内置任何音源。
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,9 @@ public:
         std::string source_name;
         int plugins_total = 0;
         int plugins_ok = 0;
+        int plugins_skipped = 0;   // 内容/URL 已存在而跳过的重复插件
+        bool duplicated = false;   // 整个来源已导入过，没有新增
+        std::string message;       // 去重 / 更新提示
         std::vector<std::string> errors;
     };
     ImportReport ImportFromUrl(std::string_view url);
@@ -73,11 +77,32 @@ public:
     // 按 platform 名取插件（未找到返回 nullptr）。
     MusicFreePlugin* FindPlugin(std::string_view platform);
 
-    // 卸载某个已导入音源（按注册表/插件名）。
+    // 卸载某个已导入音源（按注册表/插件名，整批删除）。
     bool RemoveSource(std::string_view name);
+
+    // 按 ListPlugins() 的索引卸载**单个插件实例**：同时清掉它的缓存文件、
+    // 内存实例与持久化记录。列表里重复的同源插件会一起清理（它们共用同一个
+    // 缓存文件，留着会在下次启动时被 LoadCached 重新挂载）。
+    // 索引越界返回 false。
+    bool RemovePluginAt(std::size_t index);
+
+    // 按 ListPlugins() 的下标一次删除多行（导入窗口的复选批量删除）。
+    // 共用同一缓存文件的重复实例会一并清掉，索引漂移在这里统一处理，
+    // 并且只在最后 Persist() 一次。返回实际移除的插件实例数。
+    std::size_t RemovePluginsAt(const std::vector<std::size_t>& indices);
+
+    // 返回某个插件的详细信息（UTF-8 多行文本），供导入窗口的「查看」使用。
+    // 索引越界返回空串。
+    std::string DescribePlugin(std::size_t index) const;
 
     // 启动时为每个缓存的插件 JS 自动重建挂载。
     void LoadCached();
+
+    // 检查并应用更新（复刻 MusicFree 的 updatePlugin：对每个有来源 URL 的插件
+    // 带 Cache-Control: no-cache 重新下载；内容哈希相同 → 已是最新；本地版本
+    // 更新 → 拒绝降级；否则原地替换缓存 JS 并重挂载）。本地导入（无 URL）的
+    // 插件记为 no_url 跳过。会写回 imported.json。
+    SourceUpdateReport CheckForUpdates();
 
     const std::vector<ImportedSource>& Imported() const { return imported_; }
 
@@ -85,6 +110,15 @@ private:
     ImportReport ImportRegistryJson(const nlohmann::json& registry,
                                     std::string_view registry_url,
                                     const std::filesystem::path& base);
+    // plugins_ / plugin_files_ / plugin_hashes_ 必须**始终等长**：挂载一个插件
+    // 就登记它的缓存路径与内容哈希，删除时三个数组同一个下标一起移除。
+    // 导入窗口的列表顺序就是 ListPlugins() 的顺序，因此右键/按钮可以直接把
+    // 下标交给 RemovePluginAt / RemovePluginsAt。
+    void ErasePluginAt(std::size_t index);
+    // 导入去重：内容哈希、缓存文件、插件 URL 任一命中即视为同一个音源。
+    bool HasContentHash(std::string_view hash) const;
+    bool HasPluginFile(const std::filesystem::path& fp) const;
+    bool HasPluginUrl(std::string_view url) const;
     void Persist();
 
     std::filesystem::path cache_dir_;
@@ -95,6 +129,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<ImportedSource> imported_;
     std::vector<std::unique_ptr<MusicFreePlugin>> plugins_;
+    std::vector<std::filesystem::path> plugin_files_;  // 与 plugins_ 一一对应
+    std::vector<std::string> plugin_hashes_;          // 与 plugins_ 一一对应
 };
 
 } // namespace ttplayer::musicfree

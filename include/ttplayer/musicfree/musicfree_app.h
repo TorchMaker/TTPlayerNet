@@ -9,7 +9,10 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "ttplayer/musicfree/musicfree_types.h"
 
@@ -26,8 +29,47 @@ MusicFreeSourceManager* AppMusicFreeManager();
 // 若 exe 同级存在 musicfree/libs 且缓存目录尚未填充，则把内置 JS 依赖库复制过去。
 void EnsureMusicFreeLibsDeployed();
 
-// 启动时重建已导入音源（调用于播放器初始化阶段）。
+// 启动时重建已导入音源（同步版本，仅供自检/内部使用）。
 void LoadMusicFreeSourcesOnStartup();
+
+// ---- 启动加速：把音源重建移出窗口显示的关键路径 ----
+//
+// LoadCached() 会为每个缓存插件新建一个 QuickJS runtime 并 eval 插件脚本；
+// 20 个插件实测约 1.9s，若放在主窗口创建之后、消息循环之前，窗口虽然已经
+// ShowWindow 却要等这段同步工作结束才能响应，表现为「启动很慢才显示窗口」。
+// 现在由后台线程完成，主线程创建完窗口立即进入消息循环。
+//
+// notify_hwnd / notify_msg：后台完成后 PostMessage 通知主线程做依赖音源的
+// 延后工作（恢复音乐窗、恢复播放）。均可为空。
+void StartMusicFreeSourcesLoading(void* notify_hwnd, unsigned notify_msg);
+
+// 等待后台重建完成。所有需要完整音源列表的入口（搜索、解析、导入窗、
+// 音乐窗）都会调用它；已完成时是零开销的原子判断，未完成时才阻塞。
+// 未调用 StartMusicFreeSourcesLoading（如工具进程）时会同步加载一次。
+void WaitForMusicFreeSources();
+
+// 消息循环退出后回收后台线程。会请求取消尚未完成的挂载，最多再等当前
+// 这一个插件（约 0.3s）。必须在主线程结束前调用。
+void FinishMusicFreeSourcesLoading();
+
+// 供 LoadCached() 在插件之间检查取消请求；进程正在退出时提前收工。
+bool ShouldStopMusicFreeLoading();
+
+// ---- 音源自动更新（复刻 MusicFree 的插件更新机制）----
+
+// 检查并应用全部音源更新：MusicFree 插件走 MusicFreeSourceManager，
+// 洛雪 / REST / Listen1 走 SourceProtocolRegistry，返回合并报告。
+// 复刻原版语义：重下载（no-cache）→ 哈希相同视为已最新 → 版本比较拒绝降级
+// → 原地替换并重挂载。供导入窗「检查更新」按钮调用。
+SourceUpdateReport CheckAllSourceUpdates();
+
+// 启动自动检查：开关开启且距上次检查 ≥ 24 小时才真正执行，否则立即返回。
+// 在启动后台线程里调用（StartMusicFreeSourcesLoading 的收尾段）。
+void MaybeAutoUpdateSources();
+
+// 「启动时自动检查音源更新」开关（持久化到 <exe>/musicfree/update_state.json）。
+bool AutoUpdateSourcesEnabled();
+void SetAutoUpdateSourcesEnabled(bool enabled);
 
 // 在线搜索：由已导入音源逐一搜索并汇总。
 // platform 为空时使用全部已挂载插件。
@@ -39,6 +81,10 @@ struct OnlineSearchHit {
     std::string album;
     std::string artwork;
     std::int64_t duration_ms = 0;
+    // 音源返回的完整对象（咪咕的 contentId / copyrightId、洛雪的 quality 等
+    // 私有字段都在这里）。解析播放地址时原样回传，别只用 id/platform 重建 ——
+    // 那正是「插件调用被拒绝」的根因。入列时会一并落进播放列表元数据袋。
+    nlohmann::json raw;
 };
 
 std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
@@ -60,8 +106,11 @@ std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
 
 // 解析播放地址（用于把在线曲目交给音频引擎）。
 // 返回空串表示失败；error 非空时写入失败原因（音乐窗会把它显示出来）。
+// raw 为搜索结果/播放列表条目里保存的完整音源对象；传入后插件能拿到私有字段，
+// 同时洛雪 / REST 音源可以用 title/artist/album 等元数据做兜底解析。
 std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
-                           std::string* error = nullptr);
+                           std::string* error = nullptr,
+                           const nlohmann::json* raw = nullptr);
 
 // 解析「完整」播放源（url + 自定义请求头 headers + user_agent），供流式播放使用。
 // 与 ResolvePlayUrl 不同，这里把插件 getMediaSource 返回的请求头一并带出，因为很多
@@ -70,7 +119,14 @@ std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
 // 失败返回 nullopt；error 非空时写入失败原因。
 std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             const std::string& id,
-                                            std::string* error = nullptr);
+                                            std::string* error = nullptr,
+                                            const nlohmann::json* raw = nullptr);
+
+// 从播放列表条目的元数据袋取回音源原始对象。优先读 AddOnlineTrack 写入的
+// "SourceRaw"（完整字段）；旧条目没有该键时，用 Title/Artist/Album/Platform/
+// SongId 拼一个最小对象，保证洛雪音源至少能按歌名+歌手去取直链。
+nlohmann::json RestoreSourceRaw(
+    const std::vector<std::pair<std::string, std::string>>& metadata);
 
 // 把在线曲目的播放地址下载到本地文件（音乐窗的「下载到…」）。
 //   url  : ResolvePlayUrl 解析出来的地址（宽字符，与音乐窗内部一致）。

@@ -11,6 +11,7 @@
 #include "ttplayer/audio/cue_sheet.h"
 #include "ttplayer/audio/online_stream_descriptor.h"
 #include "ttplayer/app/product.h"
+#include "ttplayer/app/startup_trace.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/musicfree/musicfree_browser_window.h"
@@ -47,6 +48,10 @@
 #include <utility>
 
 namespace ttplayer::ui {
+// 启动期间只创建主窗口。歌词/均衡器/播放列表三个顶层窗在首帧绘制、启动
+// 淡入结束后由这条消息补建，避免 WM_CREATE 里的 480ms 拖慢窗口出现。
+constexpr UINT kMsgCreateStartupAuxWindows = WM_APP + 0x52;
+
 namespace detail {
 constexpr int kFadeCompleteNone = 0;
 constexpr int kFadeCompleteHideTarget = 1;
@@ -2003,13 +2008,17 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
                             const std::wstring& selector,
                             const std::filesystem::path& profile, bool restore_profile) {
     if (!package.IsLegacyCompatible()) return false;
+    TT_STARTUP_TRACE("skin_extract_begin");
     package.ExtractTo(cache, ttpcomm_module_);
+    TT_STARTUP_TRACE("skin_extracted");
     auto next = skin::LegacySkin::Load(cache, &settings_);
+    TT_STARTUP_TRACE("skin_parsed");
     if (!next.Valid()) return false;
     const HRGN region = next.CreateWindowRegion();
     RECT bounds{};
     const bool valid_region = region && GetRgnBox(region, &bounds) > NULLREGION;
     if (region) DeleteObject(region);
+    TT_STARTUP_TRACE("skin_region_ready");
     if (!valid_region) return false;
 
     // 004683xx/00464B6C leave mini mode before replacing the package because
@@ -2306,6 +2315,7 @@ void PlayerWindow::ReloadApplicationIcons() {
 }
 
 bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
+    TT_STARTUP_TRACE("window_create_enter");
     instance_ = instance;
     display_title_ = DefaultPlayerTitle();
     ReloadApplicationIcons();
@@ -2391,6 +2401,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
     // 00425DEC superclasses SysListView32. Keep its native window storage
     // and default procedure; a plain painted HWND loses unhandled LVM_* APIs.
     if (!RegisterPlaylistListClass(instance)) return false;
+    TT_STARTUP_TRACE("window_create_classes");
 
     const bool skinned = skin_ && skin_->Valid();
     mini_mode_ = skinned && settings_.player.mini_mode &&
@@ -2427,6 +2438,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         style, create_x, create_y, create_width, create_height,
         nullptr, nullptr, instance, this);
     if (!window_) return false;
+    TT_STARTUP_TRACE("window_create_hwnd");
     if (skinned) {
         const LONG_PTR final_style =
             WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPSIBLINGS;
@@ -2445,6 +2457,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         SetWindowPos(window_, nullptr, left, top, size.cx, size.cy,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         SetWindowRgn(window_, skin_->CreateWindowRegion(mini_mode_), FALSE);
+        TT_STARTUP_TRACE("window_create_region");
         const bool custom_icon = !settings_.general.app_icon_file.empty();
         const HICON small_icon = !custom_icon && skin_->Icon()
             ? skin_->Icon() : window_icon_small_;
@@ -2467,6 +2480,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         }
     }
     ApplyWindowShadow();
+    TT_STARTUP_TRACE("window_create_shadow");
     if (skinned) {
         // CPlayerApp_CreateMainWindow (004C01CD) passes the sentinel 100 to
         // 004685A1 before SW_SHOW.  The comma expression in 004685A1 turns
@@ -2478,6 +2492,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
     suppress_skin_window_activation_fade_ = skinned;
     ShowWindow(window_, SW_SHOW);
     UpdateWindow(window_);
+    TT_STARTUP_TRACE("window_create_first_paint");
     // Visibility commands for owned windows are posted during CPlayerWnd's
     // initialization and are dispatched by the two startup PeekMessage pumps
     // only after the main HWND has been shown.  Preserve that visible order.
@@ -2488,6 +2503,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         ShowWindow(equalizer_window_, SW_SHOW);
     if (!mini_mode_ && settings_.player.playlist_visible && playlist_window_)
         ShowWindow(playlist_window_, SW_SHOW);
+    TT_STARTUP_TRACE("window_create_aux_shown");
     suppress_skin_window_activation_fade_ = false;
     if (skinned) {
         // The following -1 sentinel restores DAT_00547820's configured alpha
@@ -2497,14 +2513,51 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         // message-driven equivalent protected from the SetForegroundWindow /
         // SetActiveWindow calls that immediately follow Create().
         startup_skin_window_fade_pending_ = true;
+        // 启动淡入会按帧对主窗/歌词窗/播放列表/均衡器做 RDW_UPDATENOW 同步
+        // 重绘（最多 255ms），窗口被激活后 opaque_when_active 还会再跑一次
+        // 动画。这两段纯视觉效果把「窗口已出现」到「能响应输入」拖长了约
+        // 0.5s。启动时直接落到配置 alpha：临时关掉淡入开关让
+        // BeginSkinWindowFade 走即时 Finish 分支（仍会正确设置目标 alpha、
+        // 清理 pending 标志、处理启动最小化），随后恢复设置，运行期间的
+        // 窗口淡入效果完全不受影响。
+        const bool saved_fade_windows = settings_.general.fade_windows;
+        settings_.general.fade_windows = false;
         BeginSkinWindowFade(window_, 0, skin_window_alpha_, true,
             settings_.general.startup_minimize
                 ? kFadeCompleteStartupMinimize
                 : kFadeCompleteFinishStartup);
+        settings_.general.fade_windows = saved_fade_windows;
     } else if (settings_.general.startup_minimize) {
         ShowWindow(window_, SW_MINIMIZE);
     }
+    TT_STARTUP_TRACE("window_create_done");
     return true;
+}
+
+void PlayerWindow::CreateStartupAuxWindows() {
+    if (startup_aux_windows_created_) return;
+    startup_aux_windows_created_ = true;
+    TT_STARTUP_TRACE("aux_windows_begin");
+    // 保持原有的 Lyric -> Equalizer -> PlayList 创建顺序（决定重叠时的 z 序）。
+    CreateLyricWindow();
+    TT_STARTUP_TRACE("aux_windows_lyric");
+    CreateEqualizerWindow();
+    TT_STARTUP_TRACE("aux_windows_equalizer");
+    CreatePlaylistWindow();
+    TT_STARTUP_TRACE("aux_windows_playlist");
+    // Create() 里统一施加的阴影/透明度发生在创建这三个 HWND 之前，这里补齐。
+    ApplyWindowShadow();
+    for (const HWND target : {lyric_window_, playlist_window_, equalizer_window_})
+        ApplySkinWindowAlpha(target, rendered_skin_window_alpha_);
+    if (lyric_window_) ApplyActiveLyricWindowState();
+    // 启动时若主窗已最小化，owned 窗口不该单独冒出来。
+    if (!IsIconic(window_)) {
+        if (!mini_mode_ && settings_.player.equalizer_visible && equalizer_window_)
+            ShowWindow(equalizer_window_, SW_SHOWNOACTIVATE);
+        if (!mini_mode_ && settings_.player.playlist_visible && playlist_window_)
+            ShowWindow(playlist_window_, SW_SHOWNOACTIVATE);
+    }
+    TT_STARTUP_TRACE("aux_windows_done");
 }
 
 LRESULT CALLBACK PlayerWindow::WindowProc(HWND window, UINT message,
@@ -2555,6 +2608,10 @@ LRESULT CALLBACK PlayerWindow::PlaybackTipWindowProc(
 }
 
 LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == kMsgCreateStartupAuxWindows) {
+        CreateStartupAuxWindows();
+        return 0;
+    }
     static const UINT taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     static const UINT taskbar_button_created = RegisterWindowMessageW(L"TaskbarButtonCreated");
     if (message == kMsgPlaylistInfoReady)
@@ -2615,6 +2672,7 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         // DefWindowProc must still generate WM_SIZE/WM_MOVE for skin layout.
         break;
     case WM_CREATE:
+        TT_STARTUP_TRACE("wm_create_enter");
         // LoadSkin may have run before this HWND existed and fallen back to
         // the system DPI. Re-derive the scaled skin mirror now that the
         // per-monitor DPI is resolvable, before any control is laid out.
@@ -2626,8 +2684,10 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
                 skin_.emplace(logical_skin_->AtDpi(current_scale_));
             }
         }
+        TT_STARTUP_TRACE("wm_create_dpi_ready");
         audio_->SetDspParentWindow(window_);
         CreateControls();
+        TT_STARTUP_TRACE("wm_create_controls");
         visual_window_ = CreateWindowExW(0, kVisualWindowClass, nullptr,
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 0, 0, window_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kVisualControlId)),
@@ -2635,27 +2695,35 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         UpdateVisualWindowLayout();
         UpdateVisualFrame();
         StartVisualWorker();
+        TT_STARTUP_TRACE("wm_create_visual");
         CreateToolTipWindow();
         UpdateMainToolRects();
+        TT_STARTUP_TRACE("wm_create_tooltip");
         LoadStoredPlaylist();
+        TT_STARTUP_TRACE("wm_create_playlist_loaded");
         // 004C038B loads Music.library during application startup whenever
         // Library/Enabled is set; entering the library view is not required.
         StartMediaLibraryMonitoring(true);
         if (settings_.library.enabled || settings_.library.monitor_directories)
             StartMediaLibraryRefresh();
-        CreateLyricWindow();
-        CreateEqualizerWindow();
-        CreatePlaylistWindow();
+        TT_STARTUP_TRACE("wm_create_library");
+        // 这三个顶层窗启动时不显示（或稍后才需要），创建它们要 480ms 左右。
+        // 排到消息循环里，主窗口就能先完成 ShowWindow/UpdateWindow 首帧。
+        // 各命令入口本来就有 !handle && !CreateXxxWindow() 的按需兜底。
+        PostMessageW(window_, kMsgCreateStartupAuxWindows, 0, 0);
+        TT_STARTUP_TRACE("wm_create_aux_windows");
         // CPlayerWnd::OnCreate (0045FAD8) exposes files through an OLE drop
         // target.  WM_DROPFILES is not enabled on the original top-level
         // window and cannot preserve IDataObject ordering or drop effects.
         RegisterFileDropTarget(window_, FileDropSurface::player);
         UpdateTrayIcon();
         RegisterConfiguredHotKeys();
+        TT_STARTUP_TRACE("wm_create_tray_hotkeys");
         // TTPlayer_wWinMain/CPlayerWnd installs timer 10 with 0xfa (250 ms).
         SetTimer(window_, kUiTimer, kUiRefreshIntervalMs, nullptr);
         UpdateAutoShutdownTimer();
         ResetSkinInfoScroll();
+        TT_STARTUP_TRACE("wm_create_done");
         return 0;
     case WM_ACTIVATE:
         if (!suppress_skin_window_activation_fade_ &&
@@ -6427,8 +6495,11 @@ bool PlayerWindow::PlayCurrent() {
             std::string platform, song_id;
             std::optional<musicfree::MediaSource> src;
             std::string err;
+            const auto source_raw =
+                musicfree::RestoreSourceRaw(requested_track.metadata);
             if (OnlineTrackIdentity(requested_track, &platform, &song_id) &&
-                (src = musicfree::ResolvePlayUrlEx(platform, song_id, &err))) {
+                (src = musicfree::ResolvePlayUrlEx(platform, song_id, &err,
+                                                   &source_raw))) {
                 const bool is_hls = src->url.size() >= 5 &&
                     _stricmp(src->url.c_str() + src->url.size() - 5, ".m3u8") == 0;
                 audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{

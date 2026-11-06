@@ -11,6 +11,7 @@
 // 参与窗口吸附，并随主窗口一起移动。
 
 #include "ttplayer/musicfree/musicfree_browser_window.h"
+#include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/ui/dpi_scale.h"
 
 #include <algorithm>
@@ -892,7 +893,8 @@ void StartResolve(BrowserState* state, OnlineTrackAction action) {
         payload->hit = hit;
         try {
             std::string error;
-            const std::string url = ResolvePlayUrl(hit.platform, hit.id, &error);
+            const std::string url =
+                ResolvePlayUrl(hit.platform, hit.id, &error, &hit.raw);
             payload->url = core::Utf8ToWide(url);
             payload->error = core::Utf8ToWide(error);
         } catch (const std::exception& e) {
@@ -963,7 +965,8 @@ void StartDownload(BrowserState* state) {
         payload->hit = hit;
         try {
             std::string error;
-            const std::string url = ResolvePlayUrl(hit.platform, hit.id, &error);
+            const std::string url =
+                ResolvePlayUrl(hit.platform, hit.id, &error, &hit.raw);
             payload->url = core::Utf8ToWide(url);
             payload->error = core::Utf8ToWide(error);
         } catch (const std::exception& e) {
@@ -1974,6 +1977,7 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
                                              const OnlineSearchHit&,
                                              const std::wstring&)> on_track,
                           const std::wstring& initial_query) {
+    WaitForMusicFreeSources();
     // 已存在则只做前置、刷新音源与宿主，保持单一音乐窗。
     if (g_browser && g_browser->hwnd && IsWindow(g_browser->hwnd)) {
         if (on_track) g_browser->on_track = std::move(on_track);

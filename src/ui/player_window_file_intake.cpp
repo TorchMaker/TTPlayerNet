@@ -1354,6 +1354,11 @@ bool PlayerWindow::AddOnlineTrack(const musicfree::OnlineSearchHit& hit,
     add_entry("Album", hit.album);
     add_entry("Platform", hit.platform);
     add_entry("SongId", hit.id);
+    // 音源私有字段（咪咕 contentId / copyrightId、洛雪 quality、REST 原始
+    // 记录等）随条目持久化；下次从播放列表重新解析直链时 RestoreSourceRaw
+    // 会把它取回来，插件与洛雪音源都能拿到完整对象。
+    if (hit.raw.is_object() && !hit.raw.empty())
+        add_entry("SourceRaw", hit.raw.dump());
 
     // 「播放所选」沿用 OpenPath 的语义：插到表头并立即播放；「添加到列表」对齐
     // 播放列表自己的「添加文件」：追加到表尾，只在播放器空闲时才自动起播。
@@ -1423,7 +1428,8 @@ void PlayerWindow::RunMusicFreeSelfTest(const std::string& query) {
 
     const auto& hit = hits.front();
     std::string error;
-    const std::string url = musicfree::ResolvePlayUrl(hit.platform, hit.id, &error);
+    const std::string url =
+        musicfree::ResolvePlayUrl(hit.platform, hit.id, &error, &hit.raw);
     musicfree::TraceDiagnostic("MF_SELFTEST_RESOLVE",
         "platform=" + hit.platform + "\nid=" + hit.id +
         "\ntitle=" + hit.title + "\nartist=" + hit.artist +

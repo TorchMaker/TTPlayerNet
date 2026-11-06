@@ -19,15 +19,19 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <windowsx.h>
 
+#include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/musicfree/musicfree_frame.h"
 #include "ttplayer/musicfree/musicfree_source_manager.h"
 #include "ttplayer/musicfree/musicfree_theme.h"
+#include "ttplayer/musicfree/source_protocol.h"
+#include "ttplayer/musicfree/source_protocol_registry.h"
 
 namespace ttplayer::musicfree {
 
@@ -42,6 +46,14 @@ const int kIdList = 1004;
 const int kIdRemove = 1005;
 const int kIdClose = 1006;
 const int kIdReport = 1007;
+const int kIdSelectAll = 1008;
+const int kIdCheckUpdate = 1009;
+const int kIdAutoCheck = 1010;
+// 「检查更新」在后台线程跑完后投递回对话框（wParam/lParam = 堆上报告指针）。
+const UINT kMsgUpdateDone = WM_APP + 0x5F;
+// 列表右键菜单命令（用 TPM_RETURNCMD 直接取回，不必绕 WM_COMMAND）。
+const int kCtxView = 2001;
+const int kCtxDelete = 2002;
 
 // 皮肤包没有 <browser_window> 段时的兜底版式（这个窗口本身不缩放，尺寸写死比
 // 跑一遍 WM_SIZE 更省心）。有皮肤时窗口尺寸取背景位图尺寸，内容区取
@@ -60,8 +72,17 @@ struct ChildProbe {
     WNDPROC base = nullptr;
 };
 
+// 列表里的一行要么是一个 MusicFree 插件，要么是一个其它协议音源。
+// 保留「类型 + 在各自容器里的下标」，查看/删除才能精确分派，不会像以前那样
+// 把插件显示名当成导入批次名去查 RemoveSource()。
+struct ListRow {
+    bool protocol = false;
+    std::size_t index = 0;
+};
+
 struct DlgState {
     MusicFreeSourceManager* mgr = nullptr;
+    std::vector<ListRow> rows;
     HWND hwnd = nullptr;
     HWND owner = nullptr;
     // 取当前皮肤（可为空）。音乐窗把自己的 host.skin 原样传进来，于是两个窗口
@@ -75,6 +96,10 @@ struct DlgState {
     HWND button_import_url = nullptr;
     HWND button_import_file = nullptr;
     HWND button_remove = nullptr;
+    HWND button_select_all = nullptr;
+    HWND button_check_update = nullptr;
+    HWND auto_check = nullptr;
+    bool checking = false;  // 更新检查在后台线程进行中（按钮已禁用）
     HFONT ui_font = nullptr;
     HFONT title_font = nullptr;
     HBRUSH panel_brush = nullptr;
@@ -143,27 +168,62 @@ void SetReport(DlgState* s, const std::wstring& text) {
 }
 
 void RefreshList(DlgState* s) {
-    if (!s->list || !s->mgr) return;
+    if (!s->list) return;
     SendMessageW(s->list, LB_RESETCONTENT, 0, 0);
-    auto plugins = s->mgr->ListPlugins();
-    for (const auto& p : plugins) {
-        std::wstring line = L"[插件] " + std::wstring(p.name.begin(), p.name.end());
-        if (!p.version.empty())
-            line += L"  v" + std::wstring(p.version.begin(), p.version.end());
-        line += p.can_search ? L"  搜" : L"";
-        line += p.can_media_source ? L"  播" : L"";
-        line += p.can_lyric ? L"  词" : L"";
-        SendMessageW(s->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    s->rows.clear();
+    if (s->mgr) {
+        const auto plugins = s->mgr->ListPlugins();
+        for (std::size_t i = 0; i < plugins.size(); ++i) {
+            const auto& p = plugins[i];
+            std::wstring line = L"[MusicFree] " + core::Utf8ToWide(p.name);
+            if (!p.version.empty())
+                line += L"  v" + core::Utf8ToWide(p.version);
+            line += p.can_search ? L"  搜" : L"";
+            line += p.can_media_source ? L"  播" : L"";
+            line += p.can_lyric ? L"  词" : L"";
+            SendMessageW(s->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+            s->rows.push_back({false, i});
+        }
+    }
+    auto* registry = AppSourceProtocolRegistry();
+    if (registry) {
+        const auto list = registry->List();
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const auto& p = list[i];
+            std::wstring line = L"[" + std::wstring(ProtocolLabel(p.kind)) +
+                                L"] " + core::Utf8ToWide(p.name);
+            if (!p.version.empty())
+                line += L"  v" + core::Utf8ToWide(p.version);
+            line += p.can_search ? L"  搜" : L"";
+            line += p.can_resolve ? L"  播" : L"";
+            line += p.can_lyric ? L"  词" : L"";
+            SendMessageW(s->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+            s->rows.push_back({true, i});
+        }
     }
 }
 
-std::wstring ImportSummary(const MusicFreeSourceManager::ImportReport& report) {
-    std::wstring info = L"音源：" +
-        std::wstring(report.source_name.begin(), report.source_name.end()) +
-        L"　成功挂载插件：" + std::to_wstring(report.plugins_ok) + L" / " +
-        std::to_wstring(report.plugins_total);
+std::wstring ImportSummary(const ProtocolImportReport& report) {
+    std::wstring info = L"协议：" + std::wstring(ProtocolLabel(report.kind)) +
+        L"\r\n音源：" + core::Utf8ToWide(report.source_name);
+    if (report.duplicated)
+        info += L"\r\n结果：该音源已导入，已跳过重复导入（列表不新增）";
+    else if (report.updated)
+        info += L"\r\n结果：已更新（替换同一 URL 的旧音源，列表不新增）";
+    else if (report.ok)
+        info += L"\r\n结果：导入成功";
+    else
+        info += L"\r\n结果：导入失败";
+    if (report.plugins_total > 0)
+        info += L"\r\n成功挂载插件：" + std::to_wstring(report.plugins_ok) +
+                L" / " + std::to_wstring(report.plugins_total);
+    if (report.plugins_skipped > 0)
+        info += L"\r\n跳过重复插件：" +
+                std::to_wstring(report.plugins_skipped) + L" 个";
+    if (!report.message.empty())
+        info += L"\r\n" + core::Utf8ToWide(report.message);
     for (const auto& e : report.errors)
-        info += L"\r\n- " + std::wstring(e.begin(), e.end());
+        info += L"\r\n- " + core::Utf8ToWide(e);
     return info;
 }
 
@@ -175,9 +235,16 @@ void DoImportUrl(DlgState* s) {
         SetReport(s, L"请先粘贴音源 URL。");
         return;
     }
-    std::string url(wurl.begin(), wurl.end());
-    SetReport(s, L"正在导入…");
-    auto report = s->mgr->ImportFromUrl(url);
+    // 宽字符串逐字节塞进 std::string 会把中文 URL 截成乱码（/W4 也会报
+    // C4244）。走项目统一的 UTF-8 转换，导入窗和插件拿到的是同一个 URL。
+    std::string url = core::WideToUtf8(wurl);
+    auto* registry = AppSourceProtocolRegistry();
+    if (!registry) {
+        SetReport(s, L"音源注册表未初始化。");
+        return;
+    }
+    SetReport(s, L"正在下载并识别音源协议…");
+    auto report = registry->ImportFromUrl(url);
     SetReport(s, ImportSummary(report));
     RefreshList(s);
 }
@@ -189,30 +256,155 @@ void DoImportFile(DlgState* s) {
     ofn.hwndOwner = s->hwnd;
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"JSON/JS 文件\0*.json;*.js\0所有文件\0*.*\0";
+    ofn.lpstrFilter =
+        L"音源文件 (插件/洛雪脚本/REST 配置)\0*.json;*.js;*.lx.js;*.rest.json\0"
+        L"所有文件\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return;
     // path 是 wchar_t 数组，需走项目的宽路径重载，不能用 std::string 构造。
     std::wstring wp(path);
-    SetReport(s, L"正在导入…");
-    auto report = s->mgr->ImportFromFile(std::filesystem::path(wp));
+    auto* registry = AppSourceProtocolRegistry();
+    if (!registry) {
+        SetReport(s, L"音源注册表未初始化。");
+        return;
+    }
+    SetReport(s, L"正在读取并识别音源协议…");
+    auto report = registry->ImportFromFile(std::filesystem::path(wp));
     SetReport(s, ImportSummary(report));
     RefreshList(s);
 }
 
-void DoRemove(DlgState* s) {
-    int idx = (int)SendMessageW(s->list, LB_GETCURSEL, 0, 0);
-    if (idx == LB_ERR) {
-        SetReport(s, L"请先在列表中选择要移除的音源。");
+// 「查看」：把插件的完整信息写进底部结果框（不弹系统 MessageBox，
+// 这样主题着色与多行滚动都还在同一个窗口内）。
+void DoView(DlgState* s, int idx) {
+    if (idx < 0) {
+        SetReport(s, L"请先在列表中选择一个音源。");
         return;
     }
-    auto plugins = s->mgr->ListPlugins();
-    if (idx < 0 || idx >= (int)plugins.size()) return;
-    const std::wstring name(plugins[idx].name.begin(), plugins[idx].name.end());
-    SetReport(s, s->mgr->RemoveSource(plugins[idx].name)
-                     ? L"已移除音源：" + name
-                     : L"移除失败：" + name);
+    if (idx >= static_cast<int>(s->rows.size())) {
+        SetReport(s, L"该音源已不存在，请重新打开窗口。");
+        return;
+    }
+    const ListRow row = s->rows[static_cast<std::size_t>(idx)];
+    std::string info;
+    if (row.protocol) {
+        if (auto* registry = AppSourceProtocolRegistry())
+            info = registry->Describe(row.index);
+    } else if (s->mgr) {
+        info = s->mgr->DescribePlugin(row.index);
+    }
+    SetReport(s, info.empty() ? L"该音源已不存在，请重新打开窗口。"
+                              : core::Utf8ToWide(info));
+}
+
+// 取当前所有选中行的下标。LBS_EXTENDEDSEL 支持 Ctrl / Shift 复选与拖拽框选；
+// 没有显式多选时退回焦点行，保留「点一下再删」的老习惯。
+std::vector<int> SelectedRows(DlgState* s) {
+    std::vector<int> rows;
+    const int count = static_cast<int>(
+        SendMessageW(s->list, LB_GETSELCOUNT, 0, 0));
+    if (count > 0) {
+        rows.resize(static_cast<std::size_t>(count));
+        const int got = static_cast<int>(SendMessageW(
+            s->list, LB_GETSELITEMS, static_cast<WPARAM>(count),
+            reinterpret_cast<LPARAM>(rows.data())));
+        rows.resize(static_cast<std::size_t>(std::max(0, got)));
+        return rows;
+    }
+    const int cur = static_cast<int>(
+        SendMessageW(s->list, LB_GETCURSEL, 0, 0));
+    if (cur >= 0) rows.push_back(cur);
+    return rows;
+}
+
+// 批量删除：先把选中行按类型拆成两组下标，交给各自管理器的批量接口。
+// 索引漂移与「共用同一缓存文件的重复实例」都在管理器内部一次处理完，
+// 持久化也只写一次，删几十个音源和删一个一样快。
+void DoRemoveRows(DlgState* s, const std::vector<int>& rows) {
+    if (rows.empty()) {
+        SetReport(s, L"请先在列表中选择要删除的音源（可按住 Ctrl / Shift 复选）。");
+        return;
+    }
+    std::vector<std::size_t> mf;
+    std::vector<std::size_t> proto;
+    for (const int idx : rows) {
+        if (idx < 0 || idx >= static_cast<int>(s->rows.size())) continue;
+        const ListRow row = s->rows[static_cast<std::size_t>(idx)];
+        (row.protocol ? proto : mf).push_back(row.index);
+    }
+    std::size_t removed_mf = 0;
+    std::size_t removed_proto = 0;
+    if (!mf.empty() && s->mgr)
+        removed_mf = s->mgr->RemovePluginsAt(mf);
+    if (!proto.empty()) {
+        if (auto* registry = AppSourceProtocolRegistry())
+            removed_proto = registry->RemoveMany(proto);
+    }
+    const std::size_t removed = removed_mf + removed_proto;
+    std::wstring text = removed > 0
+        ? L"已删除 " + std::to_wstring(removed) + L" 个音源（选中 " +
+              std::to_wstring(rows.size()) + L" 项；MusicFree " +
+              std::to_wstring(removed_mf) + L" / 其它协议 " +
+              std::to_wstring(removed_proto) + L"）\r\n"
+              L"缓存文件与持久化记录已同步清理。"
+        : L"删除失败：所选音源已不存在，请重新打开窗口。";
+    SetReport(s, text);
     RefreshList(s);
+}
+
+void DoRemoveAt(DlgState* s, int idx) {
+    if (idx < 0) {
+        SetReport(s, L"请先在列表中选择要删除的音源。");
+        return;
+    }
+    DoRemoveRows(s, {idx});
+}
+
+void DoRemove(DlgState* s) {
+    DoRemoveRows(s, SelectedRows(s));
+}
+
+// 「全选 / 取消全选」：一次要清空整个列表时不用逐个点。
+void DoSelectAll(DlgState* s) {
+    const int total = static_cast<int>(
+        SendMessageW(s->list, LB_GETCOUNT, 0, 0));
+    const int selected = static_cast<int>(
+        SendMessageW(s->list, LB_GETSELCOUNT, 0, 0));
+    const bool all = total > 0 && selected == total;
+    SendMessageW(s->list, LB_SETSEL, all ? FALSE : TRUE, -1);
+    SetReport(s, all ? L"已取消全选。"
+                     : L"已全选 " + std::to_wstring(total) +
+                           L" 个音源，点「删除所选」可一次清理。");
+}
+
+// 「检查更新」：在后台线程逐个音源重新下载并比对（复刻 MusicFree 的
+// updatePlugin）。完成后 PostMessage 回 UI 线程刷新列表与结果框 —— 网络往返
+// 绝不能在 UI 线程做，否则整个窗口会卡住好几秒。
+void DoCheckUpdate(DlgState* s) {
+    if (s->checking) {
+        SetReport(s, L"正在检查更新，请稍候…");
+        return;
+    }
+    // 音源列表可能还在启动后台线程里重建；先等它完成，避免两个线程同时
+    // 改 plugins_（CheckForUpdates 内部持锁，但 LoadCached 的挂载阶段不持）。
+    WaitForMusicFreeSources();
+    s->checking = true;
+    if (s->button_check_update) EnableWindow(s->button_check_update, FALSE);
+    SetReport(s, L"正在逐个音源检查更新（重新下载并比对内容）…");
+    const HWND hwnd = s->hwnd;
+    std::thread([hwnd] {
+        SourceUpdateReport report;
+        try {
+            report = CheckAllSourceUpdates();
+        } catch (const std::exception& e) {
+            report.errors.push_back(e.what());
+        }
+        auto* boxed = new SourceUpdateReport(std::move(report));
+        if (!PostMessageW(hwnd, kMsgUpdateDone, 0,
+                          reinterpret_cast<LPARAM>(boxed))) {
+            delete boxed;  // 窗口已关闭：消息无处可去，报告就地丢弃
+        }
+    }).detach();
 }
 
 // 所有子控件都排在**内容区**里：皮肤有效时内容区来自 <browser position>，
@@ -239,21 +431,29 @@ void LayoutChildren(DlgState* s) {
         MoveWindow(s->button_import_url, url_button_x, url_edit_y - 1, button_w, 26,
                    TRUE);
 
-    // 行 2：「选择本地文件…」「移除所选」
+    // 行 2：「选择本地文件…」「全选」「删除所选」「检查更新」
     const int tools_y = url_edit_y + 34;
     if (s->button_import_file)
-        MoveWindow(s->button_import_file, left, tools_y, 140, 26, TRUE);
+        MoveWindow(s->button_import_file, left, tools_y, 132, 26, TRUE);
+    if (s->button_select_all)
+        MoveWindow(s->button_select_all, left + 140, tools_y, 72, 26, TRUE);
     if (s->button_remove)
-        MoveWindow(s->button_remove, left + 148, tools_y, 110, 26, TRUE);
+        MoveWindow(s->button_remove, left + 220, tools_y, 100, 26, TRUE);
+    if (s->button_check_update)
+        MoveWindow(s->button_check_update, left + 328, tools_y, 100, 26, TRUE);
 
     // 行 3：列表（占满剩余高度）+ 底部结果框
     const int list_label_y = tools_y + 38;
     const int list_y = list_label_y + 20;
-    const int report_height = 64;
+    const int report_height = 92;  // 「查看」要显示多行插件详情，留够可视行数
     const int report_y = area.bottom - report_height;
     const int list_height = report_y - 10 - list_y;
     if (s->label_list)
-        MoveWindow(s->label_list, left, list_label_y, width, 16, TRUE);
+        MoveWindow(s->label_list, left, list_label_y,
+                   std::max(120, width - 188), 16, TRUE);
+    // 「启动时自动检查更新」复选框摆在列表标签同一行的右侧。
+    if (s->auto_check)
+        MoveWindow(s->auto_check, right - 180, list_label_y, 180, 16, TRUE);
     if (s->list)
         MoveWindow(s->list, left, list_y, width,
                    list_height > 48 ? list_height : 48, TRUE);
@@ -371,7 +571,7 @@ LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 FillSolidRect(dc, client, kPanel);
                 FillSolidRect(dc, layout.title, kAccent);
-                DrawTextIn(dc, layout.title_text, L"导入 MusicFree 音源",
+                DrawTextIn(dc, layout.title_text, L"导入音源",
                            kOnAccentText, s->title_font,
                            kLabelFormat | DT_END_ELLIPSIS);
                 PaintButton(dc, layout.close, L"✕", s->ui_font,
@@ -439,7 +639,86 @@ LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (id == kIdImportUrl) DoImportUrl(s);
             else if (id == kIdImportFile) DoImportFile(s);
             else if (id == kIdRemove) DoRemove(s);
+            else if (id == kIdSelectAll) DoSelectAll(s);
+            else if (id == kIdCheckUpdate) DoCheckUpdate(s);
+            else if (id == kIdAutoCheck) {
+                const bool on = SendMessageW(s->auto_check, BM_GETCHECK, 0, 0) ==
+                                BST_CHECKED;
+                SetAutoUpdateSourcesEnabled(on);
+                SetReport(s, on ? L"已开启：启动后自动检查音源更新（每 24 小时一次），"
+                                  L"新版本会自动替换本地缓存。"
+                                : L"已关闭启动时自动检查音源更新；仍可随时点"
+                                  L"「检查更新」手动检查。");
+            }
             else if (id == kIdClose) { s->closed = true; DestroyWindow(hwnd); }
+            return 0;
+        }
+        case kMsgUpdateDone: {
+            // 后台检查完成：lParam 指向堆上的报告，展示后即释放。
+            auto* boxed = reinterpret_cast<SourceUpdateReport*>(lParam);
+            if (boxed) {
+                SetReport(s, core::Utf8ToWide(boxed->Summary()));
+                delete boxed;
+            } else {
+                SetReport(s, L"检查更新完成。");
+            }
+            RefreshList(s);
+            s->checking = false;
+            if (s->button_check_update) EnableWindow(s->button_check_update, TRUE);
+            return 0;
+        }
+        case WM_CONTEXTMENU: {
+            // LISTBOX 的默认窗口过程会把右键转发给父窗口，并把控件句柄放进
+            // wParam；其他子控件（输入框等）保持系统默认菜单不动。
+            if (reinterpret_cast<HWND>(wParam) != s->list) break;
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            int idx = -1;
+            if (point.x == -1 && point.y == -1) {
+                // Shift+F10 / 菜单键：没有鼠标坐标，用当前选中项。
+                GetCursorPos(&point);
+                idx = (int)SendMessageW(s->list, LB_GETCURSEL, 0, 0);
+                if (idx < 0) {
+                    SetReport(s, L"请先用左键选中一个音源，再按菜单键。");
+                    return 0;
+                }
+            } else {
+                POINT client = point;
+                ScreenToClient(s->list, &client);
+                const DWORD hit = (DWORD)SendMessageW(
+                    s->list, LB_ITEMFROMPOINT, 0,
+                    MAKELPARAM(client.x, client.y));
+                // HIWORD 为 0 才表示落在某一行上；1 表示点在列表空白处。
+                if (HIWORD(hit) == 0) idx = (int)(short)LOWORD(hit);
+            }
+            if (idx < 0) return 0;
+            // 右键落在已复选的行上：保留整组选择，「删除」一次清掉全部；
+            // 落在未选中的行上：把选择收敛到这一行，避免误删别处选中的音源。
+            const bool hit_selected =
+                SendMessageW(s->list, LB_GETSEL, (WPARAM)idx, 0) > 0;
+            std::vector<int> rows = hit_selected ? SelectedRows(s)
+                                                 : std::vector<int>{};
+            if (rows.empty()) {
+                SendMessageW(s->list, LB_SETSEL, FALSE, -1);
+                SendMessageW(s->list, LB_SETSEL, TRUE, (LPARAM)idx);
+                SendMessageW(s->list, LB_SETCURSEL, (WPARAM)idx, 0);
+                rows.push_back(idx);
+            }
+            HMENU menu = CreatePopupMenu();
+            if (!menu) return 0;
+            AppendMenuW(menu, MF_STRING, kCtxView, L"查看音源详情(&V)");
+            const std::wstring delete_label =
+                rows.size() > 1
+                    ? L"删除所选 " + std::to_wstring(rows.size()) +
+                          L" 个音源(&D)"
+                    : L"删除该音源(&D)";
+            AppendMenuW(menu, MF_STRING, kCtxDelete, delete_label.c_str());
+            const int cmd = TrackPopupMenuEx(
+                menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN |
+                          TPM_RIGHTBUTTON,
+                point.x, point.y, hwnd, nullptr);
+            DestroyMenu(menu);
+            if (cmd == kCtxView) DoView(s, idx);
+            else if (cmd == kCtxDelete) DoRemoveRows(s, rows);
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -533,6 +812,9 @@ LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
                                std::function<const skin::LegacySkin*()> skin) {
     if (!mgr) return;
+    // 启动后的音源重建在后台线程进行；打开列表前确保它已完成，
+    // 否则会显示一份空列表。加载完成后此调用是零开销的原子判断。
+    WaitForMusicFreeSources();
 
     DlgState state;
     state.mgr = mgr;
@@ -609,7 +891,7 @@ void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
     }
 
     HWND hwnd = CreateWindowExW(
-        frame_ex_style, kCls, L"导入 MusicFree 音源", frame_style,
+        frame_ex_style, kCls, L"导入音源", frame_style,
         x, y, outer_width, outer_height,
         owner, nullptr, GetModuleHandleW(nullptr), &state);
     if (!hwnd) { if (owner) EnableWindow(owner, TRUE); return; }
@@ -643,7 +925,7 @@ void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
 
     // 控件：坐标随后由 LayoutChildren 统一给出，这里先给个占位尺寸。
     state.label_url = CreateWindowW(L"STATIC",
-                  L"音源 URL（单个插件 JS，或注册表 JSON 如 yuanli.json）：",
+                  L"音源 URL（MusicFree / 洛雪脚本 / REST 配置 / 注册表 JSON）：",
                   WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, nullptr,
                   nullptr, nullptr);
     state.url_edit = CreateWindowW(L"EDIT", L"",
@@ -655,15 +937,27 @@ void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
     state.button_import_file = CreateWindowW(L"BUTTON", L"选择本地文件…",
                   WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                   0, 0, 10, 10, hwnd, (HMENU)kIdImportFile, nullptr, nullptr);
-    state.button_remove = CreateWindowW(L"BUTTON", L"移除所选",
+    state.button_select_all = CreateWindowW(L"BUTTON", L"全选",
+                  WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                  0, 0, 10, 10, hwnd, (HMENU)kIdSelectAll, nullptr, nullptr);
+    state.button_remove = CreateWindowW(L"BUTTON", L"删除所选",
                   WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                   0, 0, 10, 10, hwnd, (HMENU)kIdRemove, nullptr, nullptr);
-    state.label_list = CreateWindowW(L"STATIC", L"已导入音源 / 插件：",
+    state.button_check_update = CreateWindowW(L"BUTTON", L"检查更新",
+                  WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                  0, 0, 10, 10, hwnd, (HMENU)kIdCheckUpdate, nullptr, nullptr);
+    state.auto_check = CreateWindowW(L"BUTTON", L"启动时自动检查更新",
+                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                  0, 0, 10, 10, hwnd, (HMENU)kIdAutoCheck, nullptr, nullptr);
+    SendMessageW(state.auto_check, BM_SETCHECK,
+                 AutoUpdateSourcesEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+    state.label_list = CreateWindowW(L"STATIC",
+                  L"已导入音源（方括号内为协议；Ctrl / Shift 复选，右键：查看 / 删除）：",
                   WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, nullptr,
                   nullptr, nullptr);
     state.list = CreateWindowW(L"LISTBOX", L"",
                   WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY |
-                      LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                      LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_EXTENDEDSEL,
                   0, 0, 10, 10, hwnd, (HMENU)kIdList, nullptr, nullptr);
     state.report = CreateWindowW(L"EDIT", L"",
                   WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE |
@@ -674,20 +968,26 @@ void ShowMusicFreeImportDialog(HWND owner, MusicFreeSourceManager* mgr,
     // 漏在循环外，而且从没被 LayoutChildren 摆过位置 —— 它们其实一直是不可见的。
     for (HWND control : {state.label_url, state.label_list, state.url_edit,
                          state.button_import_url, state.button_import_file,
-                         state.button_remove, state.list, state.report}) {
+                         state.button_select_all, state.button_remove,
+                         state.button_check_update, state.auto_check,
+                         state.list, state.report}) {
         if (control) SendMessageW(control, WM_SETFONT,
                                   reinterpret_cast<WPARAM>(ui_font), TRUE);
     }
     TrackButton(&state, state.button_import_url);
     TrackButton(&state, state.button_import_file);
+    TrackButton(&state, state.button_select_all);
     TrackButton(&state, state.button_remove);
+    TrackButton(&state, state.button_check_update);
 
     LayoutChildren(&state);
 
     // 控件建好之后才刷新（WM_INITDIALOG 不会到达这里的普通窗口）。
     RefreshList(&state);
-    SetReport(&state, L"粘贴音源 URL 或选择本地文件即可导入；已导入的插件会持久化，"
-                      L"下次启动自动加载。");
+    SetReport(&state, L"粘贴音源 URL 或选择本地文件即可导入；重复音源会自动跳过，"
+                      L"已导入的音源会持久化并在下次启动自动加载。\r\n"
+                      L"列表支持 Ctrl / Shift 复选，可「全选」后一次删除；"
+                      L"右键可查看详情或删除所选。");
 
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);

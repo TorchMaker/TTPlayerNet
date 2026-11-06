@@ -58,7 +58,13 @@ SkinPackage SkinPackage::OpenResource(HMODULE module, const wchar_t* name,
 SkinPackage SkinPackage::Parse(std::vector<unsigned char> data,
                                std::filesystem::path path) {
     if (data.size()<22) throw std::runtime_error("skin is not a ZIP package");
-    size_t eocd=data.size()-22; while (eocd>0 && U32(data.data()+eocd)!=0x06054b50) --eocd;
+    // EOCD 只可能在末尾 22 字节 + 最多 65535 字节 ZIP 注释之内。原来从文件尾
+    // 逐字节回扫整个包，对几 MB 的大皮肤是 O(n) 扫描；限定范围后最多 64KB。
+    constexpr size_t kMaxComment = 65535;
+    const size_t lower_bound = data.size() > 22 + kMaxComment
+        ? data.size() - 22 - kMaxComment : 0;
+    size_t eocd = data.size() - 22;
+    while (eocd > lower_bound && U32(data.data() + eocd) != 0x06054b50) --eocd;
     if (U32(data.data()+eocd)!=0x06054b50) throw std::runtime_error("ZIP directory not found");
     const uint16_t count=U16(data.data()+eocd+10); size_t offset=U32(data.data()+eocd+16);
     SkinPackage skin;
@@ -285,6 +291,38 @@ void SkinPackage::ExtractTo(const std::filesystem::path& directory) const {
 void SkinPackage::ExtractTo(const std::filesystem::path& directory,
                             HMODULE ttpcomm) const {
     std::filesystem::create_directories(directory);
+    // 缓存目录名已包含皮肤包时间戳与内容指纹，因此「该目录解压完整」可以用
+    // 一个标记文件判定。命中时 O(1) 返回，省掉对每个条目做 is_regular_file +
+    // file_size 的逐文件 stat；皮肤包常含上百张位图，启动全量遍历会累积成
+    // 可观的耗时（皮肤资源越多越明显）。
+    uint64_t total_bytes = 0;
+    const SkinEntry* first_file = nullptr;
+    const SkinEntry* last_file = nullptr;
+    for (const auto& entry : entries_) {
+        if (entry.name.empty() || entry.name.back() == '/' ||
+            entry.name.back() == '\\') continue;
+        total_bytes += entry.size;
+        if (!first_file) first_file = &entry;
+        last_file = &entry;
+    }
+    const auto entry_exists = [&](const SkinEntry* entry) {
+        if (!entry) return true;
+        std::error_code error;
+        const auto target = directory / std::filesystem::path(entry->name);
+        return std::filesystem::is_regular_file(target, error) && !error &&
+               std::filesystem::file_size(target, error) == entry->size && !error;
+    };
+    const auto stamp = directory / L".ttp-extracted";
+    {
+        std::ifstream input(stamp);
+        uint64_t count = 0, bytes = 0;
+        if (input >> count >> bytes && count == entries_.size() &&
+            bytes == total_bytes && entry_exists(first_file) &&
+            entry_exists(last_file)) {
+            return;
+        }
+    }
+
     for (const auto& entry : entries_) {
         if (entry.name.empty())
             throw std::runtime_error("empty skin entry path");
@@ -322,5 +360,9 @@ void SkinPackage::ExtractTo(const std::filesystem::path& directory,
             throw std::runtime_error("cannot materialize skin entry");
         }
     }
+    // 只有完整解压成功才写标记；写入失败（只读缓存目录）只是下次重新遍历，
+    // 不影响正确性。
+    std::ofstream marker(stamp, std::ios::trunc);
+    if (marker) marker << entries_.size() << ' ' << total_bytes;
 }
 }

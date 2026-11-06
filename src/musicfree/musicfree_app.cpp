@@ -5,12 +5,20 @@
 
 #include "ttplayer/musicfree/musicfree_app.h"
 
+#include "ttplayer/app/startup_trace.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <ctime>
 #include <cwctype>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
@@ -18,6 +26,8 @@
 #include "ttplayer/musicfree/musicfree_http.h"
 #include "ttplayer/musicfree/musicfree_source_manager.h"
 #include "ttplayer/musicfree/musicfree_plugin.h"
+#include "ttplayer/musicfree/source_protocol.h"
+#include "ttplayer/musicfree/source_protocol_registry.h"
 
 namespace ttplayer::musicfree {
 
@@ -54,8 +64,70 @@ std::wstring Utf8ToWide(const std::string& value) {
     return out;
 }
 
+std::string JsonString(const nlohmann::json& j, const char* key) {
+    if (!j.is_object() || !j.contains(key) || !j[key].is_string()) return {};
+    return j[key].get<std::string>();
+}
+
+// 把「额外保存的 raw」与本次解析的 platform/id 合成插件要的完整对象。
+// 以前 ResolvePlayUrl 只用 id/platform 现造一个两字段对象，咪咕插件的
+// resolveWithFallback 因此拿不到 contentId / copyrightId，最终报
+//「插件调用被拒绝」。这里以 raw 为准，只在缺失时补基础字段。
+nlohmann::json BuildItemRaw(const std::string& platform, const std::string& id,
+                            const nlohmann::json* raw) {
+    nlohmann::json j = raw && raw->is_object() ? *raw
+                                               : nlohmann::json::object();
+    if (!j.contains("id") || j["id"].is_null()) j["id"] = id;
+    if (!j.contains("platform") || j["platform"].is_null())
+        j["platform"] = platform;
+    return j;
+}
+
+// 多协议兜底解析用的统一曲目描述。raw 里的私有字段原样带上，洛雪脚本
+// （songmid / hash / copyrightId）与 REST 模板（{id}）都能取到自己要的值。
+ProtocolTrack BuildProtocolTrack(const std::string& platform,
+                                 const std::string& id,
+                                 const nlohmann::json& j) {
+    ProtocolTrack track;
+    track.platform = platform;
+    track.id = id;
+    track.raw = j;
+    track.title = JsonString(j, "title");
+    if (track.title.empty()) track.title = JsonString(j, "name");
+    track.artist = JsonString(j, "artist");
+    if (track.artist.empty()) track.artist = JsonString(j, "singer");
+    track.album = JsonString(j, "album");
+    track.artwork = JsonString(j, "artwork");
+    if (j.is_object()) {
+        if (j.contains("duration_ms") && j["duration_ms"].is_number())
+            track.duration_ms = j["duration_ms"].get<std::int64_t>();
+        else if (j.contains("duration") && j["duration"].is_number())
+            track.duration_ms = static_cast<std::int64_t>(
+                j["duration"].get<double>() * 1000);
+    }
+    return track;
+}
+
 std::once_flag g_once;
 std::unique_ptr<MusicFreeSourceManager> g_manager;
+
+// 后台音源重建的状态。started/done 受 mutex 保护，worker 只在主线程 join/detach。
+struct AsyncSourcesState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::thread worker;
+    bool started = false;
+    bool done = false;
+    std::atomic<bool> stop{false};
+    ~AsyncSourcesState() {
+        if (worker.joinable()) worker.detach();
+    }
+};
+
+AsyncSourcesState& AsyncSources() {
+    static AsyncSourcesState state;
+    return state;
+}
 
 } // namespace
 
@@ -71,16 +143,119 @@ MusicFreeSourceManager* AppMusicFreeManager() {
 }
 
 void EnsureMusicFreeLibsDeployed() {
+    TT_STARTUP_TRACE("mf_libs_start");
     auto* mgr = AppMusicFreeManager();
     if (!mgr) return;
     const auto dir = ExecutableDir();
     if (dir.empty()) return;
     mgr->InstallBundledLibs(dir / "musicfree" / "libs");
+    TT_STARTUP_TRACE("mf_libs_done");
 }
 
 void LoadMusicFreeSourcesOnStartup() {
+    TT_STARTUP_TRACE("mf_startup_start");
     EnsureMusicFreeLibsDeployed();
+    TT_STARTUP_TRACE("mf_loadcached_start");
     if (auto* mgr = AppMusicFreeManager()) mgr->LoadCached();
+    TT_STARTUP_TRACE("mf_loadcached_done");
+    // 洛雪 / REST / Listen1 音源由注册表单独持久化；依赖库必须先部署完，
+    // LX 适配器挂载时才能从 <exe>/musicfree/libs 取到垫片。
+    if (auto* registry = AppSourceProtocolRegistry()) {
+        registry->SetNetworkConfig(AppMusicFreeManager()
+                                       ? AppMusicFreeManager()->network()
+                                       : NetworkConfig{});
+        TT_STARTUP_TRACE("protocols_load_start");
+        registry->Load();
+        TT_STARTUP_TRACE("protocols_load_done");
+    }
+    TT_STARTUP_TRACE("mf_startup_done");
+}
+
+void StartMusicFreeSourcesLoading(void* notify_hwnd, unsigned notify_msg) {
+    auto& state = AsyncSources();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.started) return;
+        state.started = true;
+    }
+    const HWND hwnd = reinterpret_cast<HWND>(notify_hwnd);
+    const UINT msg = static_cast<UINT>(notify_msg);
+    state.worker = std::thread([hwnd, msg] {
+        auto& s = AsyncSources();
+        {
+            // 可中断的 500ms 让路：先让主窗口独占 CPU 画完首帧。若期间
+            // 用户直接关闭窗口，Finish 会置 stop 并唤醒这里立即收工。
+            std::unique_lock<std::mutex> lock(s.mutex);
+            s.cv.wait_for(lock, std::chrono::milliseconds(500),
+                          [&s] { return s.stop.load(); });
+        }
+        if (s.stop.load()) {
+            TT_STARTUP_TRACE("bg_sources_cancelled");
+            {
+                std::lock_guard<std::mutex> lock(s.mutex);
+                s.done = true;
+            }
+            s.cv.notify_all();
+            return;
+        }
+        // 后台模式：调度优先级与页错误优先级一起降，主线程永远优先。
+        // THREAD_MODE_BACKGROUND_BEGIN 在 Vista+ 可用，失败再退回 IDLE。
+        if (!SetThreadPriority(GetCurrentThread(), 0x00010000))
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        TT_STARTUP_TRACE("bg_sources_start");
+        try {
+            LoadMusicFreeSourcesOnStartup();
+        } catch (...) {
+            // 线程边界不能抛异常；单个音源失败已在 LoadCached/Load 内部消化。
+        }
+        TT_STARTUP_TRACE("bg_sources_done");
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.done = true;
+        }
+        s.cv.notify_all();
+        if (hwnd && msg) PostMessageW(hwnd, msg, 0, 0);
+        // 音源就绪后做一次自动检查更新（复刻 MusicFree 的插件更新机制：
+        // 24 小时间隔 + 开关持久化，全部在后台线程，插件之间可被退出中断）。
+        try {
+            MaybeAutoUpdateSources();
+        } catch (...) {
+            // 更新失败不影响本次会话：缓存里的插件照常可用。
+        }
+    });
+}
+
+void WaitForMusicFreeSources() {
+    auto& state = AsyncSources();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    if (!state.started) {
+        // 没有后台任务（工具进程 / 尚未进入启动流程）时退化为同步加载，
+        // 并登记 done，避免后续入口把 20 个插件重复挂载一遍。
+        state.started = true;
+        lock.unlock();
+        try {
+            LoadMusicFreeSourcesOnStartup();
+        } catch (...) {}
+        lock.lock();
+        state.done = true;
+        state.cv.notify_all();
+        return;
+    }
+    state.cv.wait(lock, [&state] { return state.done; });
+}
+
+void FinishMusicFreeSourcesLoading() {
+    auto& state = AsyncSources();
+    if (!state.worker.joinable()) return;
+    // 请求取消并唤醒让路等待；LoadCached() 也会在插件之间检查该标志，
+    // 因此 join 只需再等当前这一个插件（约 0.3s），不会拖慢关闭。
+    state.stop.store(true);
+    state.cv.notify_all();
+    state.worker.join();
+}
+
+bool ShouldStopMusicFreeLoading() {
+    return AsyncSources().stop.load();
 }
 
 void TraceDiagnostic(const std::string& tag, const std::string& text) {
@@ -97,6 +272,28 @@ void TraceDiagnostic(const std::string& tag, const std::string& text) {
     std::fclose(file);
 }
 
+nlohmann::json RestoreSourceRaw(
+    const std::vector<std::pair<std::string, std::string>>& metadata) {
+    for (const auto& kv : metadata) {
+        if (kv.first != "SourceRaw" || kv.second.empty()) continue;
+        auto j = nlohmann::json::parse(kv.second, nullptr, false);
+        if (!j.is_discarded() && j.is_object()) return j;
+    }
+    // 旧版条目没有 SourceRaw：用元数据袋里已有的字段拼一个最小对象，
+    // 至少让洛雪音源能按「歌名 + 歌手」去找直链。
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& kv : metadata) {
+        if (kv.second.empty()) continue;
+        if (kv.first == "Title") j["title"] = kv.second;
+        else if (kv.first == "Artist") j["artist"] = kv.second;
+        else if (kv.first == "Album") j["album"] = kv.second;
+        else if (kv.first == "Artwork") j["artwork"] = kv.second;
+        else if (kv.first == "Platform") j["platform"] = kv.second;
+        else if (kv.first == "SongId") j["id"] = kv.second;
+    }
+    return j;
+}
+
 std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
                                               const std::string& platform,
                                               int page) {
@@ -108,8 +305,9 @@ std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
                                               int page,
                                               OnlineSearchDiagnostics* diagnostics) {
     std::vector<OnlineSearchHit> out;
+    if (query.empty()) return out;
+    WaitForMusicFreeSources();
     auto* mgr = AppMusicFreeManager();
-    if (!mgr || query.empty()) return out;
 
     auto collect = [&](MusicFreePlugin* plugin) {
         if (!plugin || !plugin->IsMounted() || !plugin->meta().can_search) return;
@@ -127,62 +325,113 @@ std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
             hit.album = item.album;
             hit.artwork = item.artwork;
             hit.duration_ms = item.duration_ms;
+            hit.raw = item.raw;  // 咪咕 contentId / copyrightId 等私有字段
             out.push_back(std::move(hit));
         }
     };
 
-    if (!platform.empty()) {
-        collect(mgr->FindPlugin(platform));
-    } else {
-        for (const auto& meta : mgr->ListPlugins()) collect(mgr->FindPlugin(meta.name));
+    if (mgr) {
+        if (!platform.empty()) {
+            collect(mgr->FindPlugin(platform));
+        } else {
+            for (const auto& meta : mgr->ListPlugins())
+                collect(mgr->FindPlugin(meta.name));
+        }
+    }
+
+    // 声明式 REST 音源也参与「全部音源搜索」。洛雪音源按协议只负责把歌曲
+    // 信息换成直链，不提供搜索，因此不在这里出现；它的价值体现在解析兜底。
+    // 用户明确选中了某个 MusicFree 插件时不再混入其它音源，避免结果串台。
+    auto* registry = AppSourceProtocolRegistry();
+    const bool musicfree_selected = mgr && !platform.empty() &&
+                                    mgr->FindPlugin(platform) != nullptr;
+    if (registry && !musicfree_selected) {
+        if (diagnostics) {
+            for (const auto& info : registry->List())
+                if (info.can_search) ++diagnostics->sources;
+        }
+        const std::size_t before = out.size();
+        for (const auto& track : registry->SearchAll(query, page)) {
+            if (!platform.empty() && track.platform != platform) continue;
+            OnlineSearchHit hit;
+            hit.platform = track.platform;
+            hit.id = track.id;
+            hit.title = track.title;
+            hit.artist = track.artist;
+            hit.album = track.album;
+            hit.artwork = track.artwork;
+            hit.duration_ms = track.duration_ms;
+            hit.raw = track.raw;
+            out.push_back(std::move(hit));
+        }
+        if (diagnostics && out.size() > before) ++diagnostics->sources_with_hits;
     }
     return out;
 }
 
-std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
-                           std::string* error) {
-    auto* mgr = AppMusicFreeManager();
-    if (!mgr) {
-        if (error) *error = "MusicFree 管理器未初始化";
-        return {};
-    }
-    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
-    if (!plugin || !plugin->IsMounted()) {
-        if (error) *error = "找不到音源「" + platform + "」";
-        return {};
-    }
-    MusicItem item;
-    item.id = id;
-    item.platform = platform;
-    item.raw = nlohmann::json::object();
-    item.raw["id"] = id;
-    item.raw["platform"] = platform;
-    auto ms = plugin->GetMediaSource(item, QualityKey::kStandard, error);
-    return ms ? ms->url : std::string{};
-}
-
 std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             const std::string& id,
-                                            std::string* error) {
+                                            std::string* error,
+                                            const nlohmann::json* raw) {
+    WaitForMusicFreeSources();
+    const nlohmann::json item_raw = BuildItemRaw(platform, id, raw);
+    const ProtocolTrack track = BuildProtocolTrack(platform, id, item_raw);
+    std::string primary_error;
+
+    // 第一路：MusicFree 插件。完整 raw 回传后，咪咕/酷狗这类依赖私有字段的
+    // 插件不再因为缺 contentId、hash 而在 resolveWithFallback 里被拒。
     auto* mgr = AppMusicFreeManager();
-    if (!mgr) {
-        if (error) *error = "MusicFree 管理器未初始化";
-        return std::nullopt;
+    MusicFreePlugin* plugin = mgr ? mgr->FindPlugin(platform) : nullptr;
+    if (plugin && plugin->IsMounted()) {
+        MusicItem item;
+        item.id = id;
+        item.platform = platform;
+        item.raw = item_raw;
+        item.title = track.title;
+        item.artist = track.artist;
+        item.album = track.album;
+        item.artwork = track.artwork;
+        item.duration_ms = track.duration_ms;
+        if (auto ms = plugin->GetMediaSource(item, QualityKey::kStandard,
+                                             &primary_error))
+            return *ms;
+    } else {
+        primary_error = "找不到 MusicFree 音源「" + platform + "」";
     }
-    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
-    if (!plugin || !plugin->IsMounted()) {
-        if (error) *error = "找不到音源「" + platform + "」";
-        return std::nullopt;
+
+    // 第二路：其它协议音源。REST 音源本身就可能是曲目的来源平台；洛雪音源
+    // 则在 MusicFree 插件解析失败时按歌名/歌手/私有 id 补一条可用直链。
+    std::string fallback_error;
+    if (auto* registry = AppSourceProtocolRegistry()) {
+        try {
+            ProtocolResolveResult result = registry->ResolveFallback(track);
+            if (result.ok()) {
+                MediaSource ms;
+                ms.url = std::move(result.url);
+                ms.headers = std::move(result.headers);
+                ms.user_agent = std::move(result.user_agent);
+                TraceDiagnostic("PROTOCOL_FALLBACK",
+                    "platform=" + platform + "\nid=" + id +
+                    "\nvia=" + result.via + "\nurl=" + ms.url);
+                return ms;
+            }
+            fallback_error = std::move(result.error);
+        } catch (const std::exception& e) {
+            fallback_error = e.what();
+        }
     }
-    MusicItem item;
-    item.id = id;
-    item.platform = platform;
-    item.raw = nlohmann::json::object();
-    item.raw["id"] = id;
-    item.raw["platform"] = platform;
-    auto ms = plugin->GetMediaSource(item, QualityKey::kStandard, error);
-    if (!ms) return std::nullopt;
-    return *ms;
+
+    if (error) {
+        *error = primary_error.empty() ? "无法解析播放地址" : primary_error;
+        if (!fallback_error.empty()) *error += "；其它协议音源：" + fallback_error;
+    }
+    return std::nullopt;
+}
+
+std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
+                           std::string* error, const nlohmann::json* raw) {
+    const auto ms = ResolvePlayUrlEx(platform, id, error, raw);
+    return ms ? ms->url : std::string{};
 }
 
 bool DownloadTrackFile(const std::wstring& url, const std::filesystem::path& path,
@@ -295,6 +544,90 @@ std::filesystem::path DefaultDownloadDirectory() {
             return candidate;
     }
     return home;
+}
+
+// ---- 音源自动更新（复刻 MusicFree 的插件更新机制）----
+//
+// 状态持久化在 <exe>/musicfree/update_state.json：
+//   { "auto_check": true, "last_check": <unix 秒> }
+// 开关默认开启；间隔 24 小时。检查动作本身在 CheckForUpdates（manager/registry）
+// 里逐音源进行，进程退出时通过 ShouldStopMusicFreeLoading() 提前收工。
+
+namespace {
+
+std::filesystem::path UpdateStatePath() {
+    const auto dir = ExecutableDir();
+    if (dir.empty()) return {};
+    return dir / "musicfree" / "update_state.json";
+}
+
+nlohmann::json LoadUpdateState() {
+    nlohmann::json j = nlohmann::json::object();
+    const auto path = UpdateStatePath();
+    if (!path.empty()) {
+        std::ifstream f(path, std::ios::binary);
+        if (f) {
+            try { f >> j; } catch (...) { j = nlohmann::json::object(); }
+        }
+    }
+    if (!j.is_object()) j = nlohmann::json::object();
+    return j;
+}
+
+void SaveUpdateState(const nlohmann::json& j) {
+    const auto path = UpdateStatePath();
+    if (path.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (f) {
+        try { f << j.dump(2); } catch (...) {}
+    }
+}
+
+void MergeUpdateReport(SourceUpdateReport& total, SourceUpdateReport&& part) {
+    total.checked += part.checked;
+    total.updated += part.updated;
+    total.latest += part.latest;
+    total.failed += part.failed;
+    for (auto& item : part.items) total.items.push_back(std::move(item));
+    for (auto& e : part.errors) total.errors.push_back(std::move(e));
+}
+
+} // namespace
+
+SourceUpdateReport CheckAllSourceUpdates() {
+    SourceUpdateReport total;
+    if (auto* mgr = AppMusicFreeManager())
+        MergeUpdateReport(total, mgr->CheckForUpdates());
+    if (auto* registry = AppSourceProtocolRegistry())
+        MergeUpdateReport(total, registry->CheckForUpdates());
+    return total;
+}
+
+void MaybeAutoUpdateSources() {
+    const nlohmann::json state = LoadUpdateState();
+    if (!state.value("auto_check", true)) return;
+    const long long last = state.value("last_check", 0LL);
+    const long long now = static_cast<long long>(::time(nullptr));
+    if (last > 0 && now - last < 24LL * 3600LL) return;
+    // 无论成功与否都记下时间：网络不可用时不在每次启动都重试拖慢启动，
+    // 用户随时可以在导入窗里手动「检查更新」。
+    try { CheckAllSourceUpdates(); } catch (...) {}
+    nlohmann::json out = LoadUpdateState();
+    out["auto_check"] = state.value("auto_check", true);
+    out["last_check"] = now;
+    SaveUpdateState(out);
+}
+
+bool AutoUpdateSourcesEnabled() {
+    return LoadUpdateState().value("auto_check", true);
+}
+
+void SetAutoUpdateSourcesEnabled(bool enabled) {
+    nlohmann::json j = LoadUpdateState();
+    j["auto_check"] = enabled;
+    SaveUpdateState(j);
 }
 
 } // namespace ttplayer::musicfree
