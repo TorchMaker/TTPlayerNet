@@ -115,6 +115,56 @@ struct PluginMeta {
     bool can_music_info = false;
     bool can_album = false;
     bool can_sheet = false;
+    // 内容浏览能力（复刻 MusicFree IPlugin 的内容方法，洛雪音源协议不提供这些）
+    bool can_top_lists = false;     // getTopLists
+    bool can_sheet_detail = false;  // getTopListDetail / getMusicSheetInfo
+    bool can_recommend = false;     // getRecommendSheetTags / getRecommendSheetsByTag
+};
+
+// 歌单 / 排行榜条目（MusicFree IMusicSheetItem）。封面字段在 MusicFree 里叫
+// coverImg，原样保留 raw，详情调用（getTopListDetail / getMusicSheetInfo）要把
+// raw 原样回传，和搜索结果的 raw 同样不能只重建 id/platform。
+struct MusicSheet {
+    std::string id;
+    std::string platform;
+    std::string title;
+    std::string description;
+    std::string artwork;       // 封面 URL（MusicFree 用 coverImg）
+    std::string work_id;       // 部分音源 getTopListDetail 需要的标识
+    std::int64_t play_count = 0;
+    std::int64_t create_at = 0;
+    std::string group;         // 分组名（排行榜常见），无则空
+    nlohmann::json raw;        // 插件返回完整对象（详情调用要原样回传）
+
+    static MusicSheet FromJson(const nlohmann::json& j);
+};
+
+// 推荐歌单标签（MusicFree getRecommendSheetTags 返回 {id,title} 或字符串）。
+struct SheetTag {
+    std::string id;
+    std::string title;
+    nlohmann::json raw;
+
+    static SheetTag FromJson(const nlohmann::json& j);
+};
+
+// 排行榜 / 推荐歌单 列表（getTopLists / getRecommendSheetsByTag 的返回）。
+struct TopListsResult {
+    std::vector<MusicSheet> items;
+    std::string error;
+};
+
+// 歌单 / 排行榜详情里的曲目（getTopListDetail / getMusicSheetInfo 的返回）。
+struct SheetTracksResult {
+    std::vector<MusicItem> items;
+    bool is_end = true;
+    std::string error;
+};
+
+// 推荐标签列表（getRecommendSheetTags 的返回）。
+struct SheetTagsResult {
+    std::vector<SheetTag> tags;
+    std::string error;
 };
 
 // ---- 音源更新检查（复刻 MusicFree 的 updatePlugin / installPluginFromUrl）----

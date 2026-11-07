@@ -49,9 +49,38 @@ public:
     // 获取歌词。
     std::optional<LyricResult> GetLyric(const MusicItem& item);
 
+    // ---- 内容浏览（复刻 MusicFree IPlugin 的内容方法）----
+    // 洛雪音源协议不提供这类能力；以下全部来自 MusicFree 插件。返回 nullopt 表示
+    // 插件未挂载 / 不支持 / 调用失败（失败时 error 写入 last_error_）。
+
+    // 排行榜列表（getTopLists）。结果可含分组（group），扁平化后每条带 platform。
+    std::optional<TopListsResult> GetTopLists();
+
+    // 排行榜详情：给定歌单原始对象，取它的曲目（getTopListDetail）。
+    std::optional<SheetTracksResult> GetTopListDetail(const nlohmann::json& sheet,
+                                                     int page = 1);
+
+    // 推荐歌单标签（getRecommendSheetTags）。
+    std::optional<SheetTagsResult> GetRecommendSheetTags();
+
+    // 某标签下的推荐歌单（getRecommendSheetsByTag）。
+    std::optional<TopListsResult> GetRecommendSheetsByTag(const nlohmann::json& tag,
+                                                         int page = 1);
+
+    // 歌单详情：给定歌单原始对象，取它的曲目（getMusicSheetInfo）。
+    std::optional<SheetTracksResult> GetMusicSheetInfo(const nlohmann::json& sheet,
+                                                     int page = 1);
+
 private:
     // 调用插件方法并 await；返回已解析的 JSValue（调用方释放），失败抛异常。
     JSValue CallMethod(std::string_view method, int argc, JSValueConst* argv);
+
+    // 详情类内容方法（getTopListDetail / getMusicSheetInfo / getRecommendSheetsByTag）
+    // 的通用 await + 解析；声明为私有静态成员以便访问私有的 CallMethod。
+    template <typename ResultT>
+    static ResultT AwaitSheetCall(MusicFreePlugin* self, JSContext* ctx,
+                                  std::string_view method, JSValue argv[], int argc,
+                                  ResultT (*parse)(const nlohmann::json&));
 
     std::unique_ptr<QuickJsEngine> engine_;
     PluginMeta meta_;

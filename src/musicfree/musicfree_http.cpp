@@ -32,6 +32,9 @@ namespace ttplayer::musicfree {
 
 namespace {
 
+// 兜底解析时由 ScopedHttpTimeout 设置的每线程超时覆盖值（0 = 不覆盖）。
+thread_local std::uint32_t g_http_timeout_override = 0;
+
 // ---------------------------------------------------------------------------
 // WinHTTP 阻塞请求
 // ---------------------------------------------------------------------------
@@ -187,7 +190,8 @@ HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
         WinHttpSetOption(hSession.h, WINHTTP_OPTION_PROXY, &pi, sizeof(pi));
     }
 
-    DWORD timeout = cfg.timeout_ms ? cfg.timeout_ms : 20000;
+    DWORD timeout = g_http_timeout_override ? g_http_timeout_override
+                    : (cfg.timeout_ms ? cfg.timeout_ms : 20000);
     WinHttpSetTimeouts(hSession.h, timeout, timeout, timeout, timeout);
 
     hConnect.h = WinHttpConnect(hSession.h, parts.host.c_str(),
@@ -852,6 +856,17 @@ JSValue FetchCall(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
 }
 
 } // namespace
+
+ScopedHttpTimeout::ScopedHttpTimeout(std::uint32_t ms) noexcept {
+    if (ms == 0) return;
+    previous_ = g_http_timeout_override;
+    active_ = true;
+    g_http_timeout_override = ms;
+}
+
+ScopedHttpTimeout::~ScopedHttpTimeout() noexcept {
+    if (active_) g_http_timeout_override = previous_;
+}
 
 JSValue CreateAxiosModule(JSContext* ctx, const NetworkConfig& cfg, QuickJsEngine*) {
     return MakeAxios(ctx, cfg);

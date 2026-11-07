@@ -10,11 +10,14 @@
 #include "ttplayer/musicfree/musicfree_app.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 

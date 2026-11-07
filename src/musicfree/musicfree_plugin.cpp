@@ -87,6 +87,11 @@ bool MusicFreePlugin::Mount(std::string_view js_code, std::string_view app_versi
         meta_.can_music_info = HasMethod(ctx, instance_, "getMusicInfo");
         meta_.can_album = HasMethod(ctx, instance_, "getAlbumInfo");
         meta_.can_sheet = HasMethod(ctx, instance_, "getMusicSheetInfo");
+        meta_.can_top_lists = HasMethod(ctx, instance_, "getTopLists");
+        meta_.can_sheet_detail = HasMethod(ctx, instance_, "getTopListDetail") ||
+                                HasMethod(ctx, instance_, "getMusicSheetInfo");
+        meta_.can_recommend = HasMethod(ctx, instance_, "getRecommendSheetTags") &&
+                              HasMethod(ctx, instance_, "getRecommendSheetsByTag");
 
         if (meta_.name.empty()) {
             last_error_ = "插件未提供 platform 名称";
@@ -104,6 +109,7 @@ bool MusicFreePlugin::Mount(std::string_view js_code, std::string_view app_versi
 }
 
 JSValue MusicFreePlugin::CallMethod(std::string_view method, int argc, JSValueConst* argv) {
+    engine_->RefreshStackTop();  // 后台线程调用插件：修正 QuickJS 栈溢出基准
     JSContext* ctx = engine_->context();
     JSValue fn = JS_GetPropertyStr(ctx, instance_, std::string(method).c_str());
     if (!JS_IsFunction(ctx, fn)) {
@@ -264,6 +270,216 @@ MusicItem MusicItem::FromJson(const nlohmann::json& j) {
     else if (j.contains("durationMs") && j["durationMs"].is_number())
         item.duration_ms = j["durationMs"].get<std::int64_t>();
     return item;
+}
+
+MusicSheet MusicSheet::FromJson(const nlohmann::json& j) {
+    MusicSheet sheet;
+    sheet.raw = j;
+    auto get_str = [&](const char* k) -> std::string {
+        if (!j.contains(k)) return {};
+        const nlohmann::json& v = j[k];
+        if (v.is_string()) return v.get<std::string>();
+        if (v.is_number()) return v.dump();
+        return {};
+    };
+    sheet.id = get_str("id");
+    sheet.platform = get_str("platform");
+    sheet.title = get_str("title");
+    sheet.description = get_str("description");
+    // 封面在 MusicFree 里叫 coverImg，部分插件用 artwork，两个都认。
+    sheet.artwork = get_str("coverImg");
+    if (sheet.artwork.empty()) sheet.artwork = get_str("artwork");
+    sheet.work_id = get_str("workId");
+    if (j.contains("playCount") && j["playCount"].is_number())
+        sheet.play_count = j["playCount"].get<std::int64_t>();
+    if (j.contains("createAt") && j["createAt"].is_number())
+        sheet.create_at = j["createAt"].get<std::int64_t>();
+    return sheet;
+}
+
+SheetTag SheetTag::FromJson(const nlohmann::json& j) {
+    SheetTag tag;
+    tag.raw = j;
+    if (j.is_string()) {
+        tag.id = j.get<std::string>();
+        tag.title = tag.id;
+    } else if (j.is_object()) {
+        auto get_str = [&](const char* k) -> std::string {
+            if (!j.contains(k) || !j[k].is_string()) return {};
+            return j[k].get<std::string>();
+        };
+        tag.id = get_str("id");
+        tag.title = get_str("title");
+        if (tag.title.empty()) tag.title = tag.id;
+    }
+    return tag;
+}
+
+namespace {
+
+// 把 getTopLists / getRecommendSheetsByTag 的返回（Array<IMusicSheetItem |
+// IMusicSheetGroup>）解析成扁平的歌单列表。分组（group）里的每条记录都带上
+// group 标题，UI 据此画出分区。
+TopListsResult ParseSheetArray(const nlohmann::json& j) {
+    TopListsResult out;
+    if (!j.is_array()) return out;
+    for (const auto& entry : j) {
+        if (!entry.is_object()) continue;
+        // 分组：{ title, data: [...] }
+        if (entry.contains("data") && entry["data"].is_array()) {
+            const std::string group = entry.value("title", std::string());
+            for (const auto& item : entry["data"]) {
+                MusicSheet sheet = MusicSheet::FromJson(item);
+                sheet.group = group;
+                out.items.push_back(std::move(sheet));
+            }
+        } else {
+            out.items.push_back(MusicSheet::FromJson(entry));
+        }
+    }
+    return out;
+}
+
+// 把 getTopListDetail / getMusicSheetInfo 的返回解析成曲目列表 + 是否末页。
+// MusicFree 既可能返回 { musicList:[...], isEnd }，也可能返回 { data:[...] }，
+// 或直接返回 IMusicItem[]；三种都兼容。
+SheetTracksResult ParseSheetTracks(const nlohmann::json& j) {
+    SheetTracksResult result;
+    if (j.is_array()) {
+        for (const auto& item : j) result.items.push_back(MusicItem::FromJson(item));
+    } else if (j.is_object()) {
+        const nlohmann::json* arr = nullptr;
+        if (j.contains("musicList") && j["musicList"].is_array()) arr = &j["musicList"];
+        else if (j.contains("data") && j["data"].is_array()) arr = &j["data"];
+        else if (j.contains("list") && j["list"].is_array()) arr = &j["list"];
+        if (arr) {
+            for (const auto& item : *arr)
+                result.items.push_back(MusicItem::FromJson(item));
+        }
+        if (j.contains("isEnd") && j["isEnd"].is_boolean())
+            result.is_end = j["isEnd"].get<bool>();
+        else if (j.contains("is_end") && j["is_end"].is_boolean())
+            result.is_end = j["is_end"].get<bool>();
+    }
+    return result;
+}
+
+} // namespace
+
+// 取详情类方法（getTopListDetail / getMusicSheetInfo / getRecommendSheetsByTag）
+// 的结果：详情方法返回的是 Promise，这里统一 await 后转换为 C++ 结果。声明为
+// MusicFreePlugin 的私有静态成员，以便访问私有的 CallMethod。
+template <typename ResultT>
+ResultT MusicFreePlugin::AwaitSheetCall(MusicFreePlugin* self, JSContext* ctx,
+                                        std::string_view method, JSValue argv[],
+                                        int argc,
+                                        ResultT (*parse)(const nlohmann::json&)) {
+    ResultT result;
+    try {
+        JSValue res = self->CallMethod(method, argc, argv);
+        nlohmann::json j = QuickJsEngine::ValueToJson(ctx, res);
+        JS_FreeValue(ctx, res);
+        // Await 在「微任务队列已空但 Promise 仍未决」时会返回一个零初始化的
+        // JSValue，ValueToJson 会得到数字 0 / null。以前这里直接交给 parse，
+        // 结果是 items 为空且 error 也为空，UI 只显示「没有返回曲目」而无从定位。
+        if (!j.is_array() && !j.is_object()) {
+            std::string got = j.dump();
+            if (got.size() > 120) got.resize(120);
+            result.error = "插件方法 " + std::string(method) +
+                           " 未返回有效对象（得到 " + got +
+                           "，通常是 Promise 未决或返回 undefined）";
+            return result;
+        }
+        result = parse(j);
+    } catch (const std::exception& e) {
+        result.error = e.what();
+    }
+    return result;
+}
+
+
+std::optional<TopListsResult> MusicFreePlugin::GetTopLists() {
+    if (!mounted_ || !meta_.can_top_lists)
+        return std::nullopt;
+    JSContext* ctx = engine_->context();
+    try {
+        JSValue res = CallMethod("getTopLists", 0, nullptr);
+        nlohmann::json j = QuickJsEngine::ValueToJson(ctx, res);
+        JS_FreeValue(ctx, res);
+        TopListsResult result;
+        result = ParseSheetArray(j);
+        return result;
+    } catch (const std::exception& e) {
+        TopListsResult result;
+        result.error = e.what();
+        return result;
+    }
+}
+
+std::optional<SheetTracksResult> MusicFreePlugin::GetTopListDetail(
+    const nlohmann::json& sheet, int page) {
+    if (!mounted_ || !HasMethod(engine_->context(), instance_, "getTopListDetail"))
+        return std::nullopt;
+    JSContext* ctx = engine_->context();
+    JSValue arg_sheet = QuickJsEngine::JsonToValue(ctx, sheet);
+    JSValue arg_page = JS_NewInt32(ctx, page);
+    JSValue argv[2] = {arg_sheet, arg_page};
+    auto result = AwaitSheetCall<SheetTracksResult>(
+        this, ctx, "getTopListDetail", argv, 2, ParseSheetTracks);
+    JS_FreeValue(ctx, arg_sheet);
+    JS_FreeValue(ctx, arg_page);
+    return result;
+}
+
+std::optional<SheetTagsResult> MusicFreePlugin::GetRecommendSheetTags() {
+    if (!mounted_ || !HasMethod(engine_->context(), instance_, "getRecommendSheetTags"))
+        return std::nullopt;
+    JSContext* ctx = engine_->context();
+    try {
+        JSValue res = CallMethod("getRecommendSheetTags", 0, nullptr);
+        nlohmann::json j = QuickJsEngine::ValueToJson(ctx, res);
+        JS_FreeValue(ctx, res);
+        SheetTagsResult result;
+        if (j.is_array())
+            for (const auto& t : j) result.tags.push_back(SheetTag::FromJson(t));
+        return result;
+    } catch (const std::exception& e) {
+        SheetTagsResult result;
+        result.error = e.what();
+        return result;
+    }
+}
+
+std::optional<TopListsResult> MusicFreePlugin::GetRecommendSheetsByTag(
+    const nlohmann::json& tag, int page) {
+    if (!mounted_ ||
+        !HasMethod(engine_->context(), instance_, "getRecommendSheetsByTag"))
+        return std::nullopt;
+    JSContext* ctx = engine_->context();
+    JSValue arg_tag = QuickJsEngine::JsonToValue(ctx, tag);
+    JSValue arg_page = JS_NewInt32(ctx, page);
+    JSValue argv[2] = {arg_tag, arg_page};
+    auto result = AwaitSheetCall<TopListsResult>(
+        this, ctx, "getRecommendSheetsByTag", argv, 2, ParseSheetArray);
+    JS_FreeValue(ctx, arg_tag);
+    JS_FreeValue(ctx, arg_page);
+    return result;
+}
+
+std::optional<SheetTracksResult> MusicFreePlugin::GetMusicSheetInfo(
+    const nlohmann::json& sheet, int page) {
+    if (!mounted_ ||
+        !HasMethod(engine_->context(), instance_, "getMusicSheetInfo"))
+        return std::nullopt;
+    JSContext* ctx = engine_->context();
+    JSValue arg_sheet = QuickJsEngine::JsonToValue(ctx, sheet);
+    JSValue arg_page = JS_NewInt32(ctx, page);
+    JSValue argv[2] = {arg_sheet, arg_page};
+    auto result = AwaitSheetCall<SheetTracksResult>(
+        this, ctx, "getMusicSheetInfo", argv, 2, ParseSheetTracks);
+    JS_FreeValue(ctx, arg_sheet);
+    JS_FreeValue(ctx, arg_page);
+    return result;
 }
 
 } // namespace ttplayer::musicfree

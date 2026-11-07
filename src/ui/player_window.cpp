@@ -3105,6 +3105,10 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         // player_window_playlist_network.cpp 的 StartOnlineTrackResolveAndPlay）。
         if (HandleOnlinePlayResolved(lparam)) return 0;
         break;
+    case detail::kMsgOnlineCacheReady:
+        // 流式播放的本地副本就绪：必要时自动重播，避免用户再手点一次播放。
+        if (HandleOnlineCacheReady(lparam)) return 0;
+        break;
     case WM_COMMAND:
         if (HIWORD(wparam) == THBN_CLICKED) {
             HandleTaskbarPlaybackClick(wparam);
@@ -6524,6 +6528,11 @@ bool PlayerWindow::PlayCurrent() {
         // 流式打开失败（如 HLS 系统不支持、链接已失效）→ 回退阻塞下载后本地播放。
         if (requested_track.path.wstring().rfind(L"http", 0) == 0 &&
             play_path.wstring().rfind(L"http", 0) == 0) {
+            // 刚用的直链打不开，缓存里的同一地址必须作废，否则回退路径
+            // 与后续重播会继续拿着过期 URL 反复失败。
+            std::string bad_platform, bad_song_id;
+            if (OnlineTrackIdentity(requested_track, &bad_platform, &bad_song_id))
+                musicfree::InvalidateResolveCache(bad_platform, bad_song_id);
             const size_t pi = playback_playlist_index
                 ? *playback_playlist_index : playlists_.ActiveIndex();
             StartOnlineTrackResolveAndPlay(pi, *current_, requested_track);

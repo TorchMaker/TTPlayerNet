@@ -122,11 +122,62 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             std::string* error = nullptr,
                                             const nlohmann::json* raw = nullptr);
 
+// 播放或下载失败时丢弃该曲目的解析结果缓存：CDN 直链可能在 TTL 内提前失效，
+// 不清掉的话下一次播放会继续拿到同一个坏地址。
+void InvalidateResolveCache(const std::string& platform, const std::string& id);
+
 // 从播放列表条目的元数据袋取回音源原始对象。优先读 AddOnlineTrack 写入的
 // "SourceRaw"（完整字段）；旧条目没有该键时，用 Title/Artist/Album/Platform/
 // SongId 拼一个最小对象，保证洛雪音源至少能按歌名+歌手去取直链。
 nlohmann::json RestoreSourceRaw(
     const std::vector<std::pair<std::string, std::string>>& metadata);
+
+// ---- 内容浏览：排行榜 / 推荐歌单（数据来自 MusicFree 插件）----
+//
+// 洛雪音源协议（user-api）只暴露 musicUrl / lyric / pic，**没有**排行榜、推荐、
+// 歌单能力 —— 这些能力只存在于洛雪桌面客户端（它直接调各平台的 API）。因此本兼容层
+// 的「推荐 / 封面」内容完全来自 MusicFree 插件（getTopLists / getRecommend* /
+// getMusicSheetInfo），与洛雪源协议无关。
+
+enum class SheetKind { kTopList, kSheet };
+
+// 汇总所有支持 getTopLists 的插件，返回带 platform 的排行榜列表。
+std::vector<MusicSheet> GetAllTopLists();
+
+// 取某音源某标签下的推荐歌单（getRecommendSheetsByTag）。
+std::vector<MusicSheet> GetRecommendSheets(const std::string& platform,
+                                           const nlohmann::json& tag, int page = 1);
+
+// 取某音源的推荐歌单标签（getRecommendSheetTags）。
+std::vector<SheetTag> GetRecommendTags(const std::string& platform);
+
+// 取歌单 / 排行榜详情里的曲目（getTopListDetail 或 getMusicSheetInfo，由 kind 决定）。
+// 返回空 vector 表示失败；错误信息写入 error。
+struct SheetTracksOutcome {
+    std::vector<MusicItem> items;
+    bool is_end = true;
+    std::string error;
+};
+SheetTracksOutcome GetSheetTracks(const std::string& platform,
+                                 const nlohmann::json& sheet, SheetKind kind,
+                                 int page = 1);
+
+// 列出支持某内容能力的音源 platform 名（供音乐窗下拉框）。
+std::vector<std::string> ListTopListPlatforms();    // can_top_lists
+std::vector<std::string> ListRecommendPlatforms();  // can_recommend
+
+// ---- 发现页聚合（单页展示所有音源，逐音源渐进加载）----
+//
+// 每个音源独立完成一次聚合，UI 收到一批就追加一组卡片，慢音源 / 失效音源
+// 不会拖住其它音源，也不会阻塞窗口。内部会等待后台插件挂载完成，因此
+// 调用方必须在工作线程里使用。
+struct DiscoverOutcome {
+    std::vector<MusicSheet> sheets;  // 排行榜 + 推荐歌单，带 platform / raw
+    std::string error;               // 诊断信息（可为空）
+};
+std::vector<std::string> ListDiscoverPlatforms();  // can_top_lists || can_recommend
+DiscoverOutcome GetDiscoverSheets(const std::string& platform,
+                                  int max_top = 12, int max_recommend = 8);
 
 // 把在线曲目的播放地址下载到本地文件（音乐窗的「下载到…」）。
 //   url  : ResolvePlayUrl 解析出来的地址（宽字符，与音乐窗内部一致）。

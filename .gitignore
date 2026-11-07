@@ -110,3 +110,8 @@ Desktop.ini
 *.temp
 __pycache__/
 rebuild.7z
+
+# WorkBuddy local project state and one-off source backups are machine-local,
+# not reconstruction sources. Keep them out of the public mirror.
+/.workbuddy/
+*.bak-*

@@ -437,6 +437,8 @@ private:
                                         const playlist::Track& track);
     // kMsgOnlinePlayResolved 的收尾：取出解析结果，重选同一行触发 PlayCurrent。
     bool HandleOnlinePlayResolved(LPARAM payload);
+    // kMsgOnlineCacheReady 的收尾：本地副本就绪但播放未推进时自动重播。
+    bool HandleOnlineCacheReady(LPARAM payload);
     // 在线曲目流式播放时顺手把地址落盘到本地缓存（不重选、不阻塞播放），下次重播
     // 优先命中本地副本；下载失败（需自定义头 / HLS 切片流）静默跳过，流式不受影响。
     void StartOnlineTrackBackgroundCache(const playlist::Track& track,

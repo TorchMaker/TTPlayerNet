@@ -11,6 +11,7 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -205,6 +206,15 @@ constexpr UINT kMsgOnlinePlayResolved = WM_APP + 0x519;
 struct PlayResolvedPayload {
     size_t playlist_index;
     size_t row;
+};
+// 流式播放时后台落盘的本地副本就绪通知。若此刻播放没有真正推进（部分 CDN
+// 只建立了流会话却没吐数据），UI 线程用本地文件重播一次，用户无需手点播放。
+constexpr UINT kMsgOnlineCacheReady = WM_APP + 0x51A;
+struct CacheReadyPayload {
+    size_t playlist_index;
+    size_t row;
+    std::string platform;
+    std::string song_id;
 };
 constexpr UINT kCmdMiniMode = 0x7dd4;
 constexpr UINT kCmdShowElapsedTime = 0x7ddd;

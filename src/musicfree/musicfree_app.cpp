@@ -13,9 +13,12 @@
 #include <cstdio>
 #include <ctime>
 #include <cwctype>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -129,7 +132,150 @@ AsyncSourcesState& AsyncSources() {
     return state;
 }
 
+// ---- 解析结果缓存（对齐 MusicFree 的 MediaCache）--------------------------
+//
+// MusicFree 的 PluginManager.getMediaSource 把 {url, headers, userAgent} 写进
+// Cache.update(musicItem, ...)，重复点同一首歌直接命中；本兼容层以前完全没有
+// 这一层，导致「音乐窗解析一次 + 播放器再解析一次」以及切歌回来都要把插件
+// 与兜底音源全量重跑。实测一次兜底解析串行发 28 个 HTTP 请求、16s 以上。
+// CDN 直链有时效，故给 20 分钟 TTL；进程内 map + 磁盘 JSON 双份，进程重启
+// 后仍能复用。缓存命中连 WaitForMusicFreeSources() 都不需要等。
+constexpr std::int64_t kResolveCacheTtlSeconds = 20 * 60;
+constexpr size_t kResolveCacheMaxEntries = 256;
+
+struct ResolveCacheEntry {
+    MediaSource source;
+    std::int64_t saved_at = 0;
+};
+
+std::mutex g_resolve_cache_mutex;
+std::map<std::string, ResolveCacheEntry> g_resolve_cache;
+bool g_resolve_cache_loaded = false;
+
+std::int64_t ResolveNowSeconds() {
+    return static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::filesystem::path ResolveCachePath() {
+    const auto dir = ExecutableDir();
+    if (dir.empty()) return {};
+    return dir / "musicfree" / "resolve_cache.json";
+}
+
+std::string MakeResolveCacheKey(const std::string& platform,
+                                const std::string& id) {
+    // 解析质量固定 QualityKey::kStandard，不必进 key。
+    return platform + "\x1f" + id;
+}
+
+void LoadResolveCacheLocked() {
+    if (g_resolve_cache_loaded) return;
+    g_resolve_cache_loaded = true;
+    const auto path = ResolveCachePath();
+    if (path.empty()) return;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return;
+    auto j = nlohmann::json::parse(in, nullptr, false);
+    if (j.is_discarded() || !j.is_object() ||
+        !j.contains("entries") || !j["entries"].is_object()) return;
+    const std::int64_t now = ResolveNowSeconds();
+    for (auto it = j["entries"].begin(); it != j["entries"].end(); ++it) {
+        const auto& e = it.value();
+        if (!e.is_object()) continue;
+        const std::string url = JsonString(e, "url");
+        if (url.empty()) continue;
+        const std::int64_t saved =
+            e.contains("saved_at") && e["saved_at"].is_number()
+                ? e["saved_at"].get<std::int64_t>() : 0;
+        if (saved <= 0 || now - saved >= kResolveCacheTtlSeconds) continue;
+        ResolveCacheEntry entry;
+        entry.saved_at = saved;
+        entry.source.url = url;
+        entry.source.user_agent = JsonString(e, "user_agent");
+        if (e.contains("headers") && e["headers"].is_object()) {
+            for (auto h = e["headers"].begin(); h != e["headers"].end(); ++h)
+                if (h.value().is_string())
+                    entry.source.headers[h.key()] = h.value().get<std::string>();
+        }
+        g_resolve_cache[it.key()] = std::move(entry);
+    }
+}
+
+void SaveResolveCacheLocked() {
+    const auto path = ResolveCachePath();
+    if (path.empty()) return;
+    nlohmann::json entries = nlohmann::json::object();
+    for (const auto& kv : g_resolve_cache) {
+        nlohmann::json e = nlohmann::json::object();
+        e["url"] = kv.second.source.url;
+        e["user_agent"] = kv.second.source.user_agent;
+        e["headers"] = kv.second.source.headers;
+        e["saved_at"] = kv.second.saved_at;
+        entries[kv.first] = std::move(e);
+    }
+    nlohmann::json root = nlohmann::json::object();
+    root["version"] = 1;
+    root["entries"] = std::move(entries);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const std::wstring tmp = path.wstring() + L".tmp";
+    {
+        std::ofstream out(std::filesystem::path(tmp),
+                          std::ios::binary | std::ios::trunc);
+        if (!out) return;
+        const std::string text = root.dump(2);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    }
+    if (!MoveFileExW(tmp.c_str(), path.wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        std::filesystem::remove(tmp, ec);
+}
+
+std::optional<MediaSource> ResolveCacheGet(const std::string& platform,
+                                           const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_resolve_cache_mutex);
+    LoadResolveCacheLocked();
+    const auto it = g_resolve_cache.find(MakeResolveCacheKey(platform, id));
+    if (it == g_resolve_cache.end()) return std::nullopt;
+    if (ResolveNowSeconds() - it->second.saved_at >= kResolveCacheTtlSeconds) {
+        g_resolve_cache.erase(it);
+        return std::nullopt;
+    }
+    return it->second.source;
+}
+
+void ResolveCachePut(const std::string& platform, const std::string& id,
+                     const MediaSource& source) {
+    if (source.url.empty()) return;
+    std::lock_guard<std::mutex> lock(g_resolve_cache_mutex);
+    LoadResolveCacheLocked();
+    g_resolve_cache[MakeResolveCacheKey(platform, id)] =
+        ResolveCacheEntry{source, ResolveNowSeconds()};
+    const std::int64_t now = ResolveNowSeconds();
+    for (auto it = g_resolve_cache.begin(); it != g_resolve_cache.end();) {
+        if (now - it->second.saved_at >= kResolveCacheTtlSeconds)
+            it = g_resolve_cache.erase(it);
+        else ++it;
+    }
+    while (g_resolve_cache.size() > kResolveCacheMaxEntries) {
+        auto oldest = g_resolve_cache.begin();
+        for (auto it = g_resolve_cache.begin(); it != g_resolve_cache.end(); ++it)
+            if (it->second.saved_at < oldest->second.saved_at) oldest = it;
+        g_resolve_cache.erase(oldest);
+    }
+    SaveResolveCacheLocked();
+}
+
 } // namespace
+
+void InvalidateResolveCache(const std::string& platform, const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_resolve_cache_mutex);
+    LoadResolveCacheLocked();
+    if (g_resolve_cache.erase(MakeResolveCacheKey(platform, id)) > 0)
+        SaveResolveCacheLocked();
+}
 
 MusicFreeSourceManager* AppMusicFreeManager() {
     std::call_once(g_once, [] {
@@ -373,10 +519,39 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             const std::string& id,
                                             std::string* error,
                                             const nlohmann::json* raw) {
+    using Clock = std::chrono::steady_clock;
+    const auto t_start = Clock::now();
+
+    // 第 0 路：解析结果缓存（对齐 MusicFree 的 MediaCache）。命中直接返回，
+    // 连 WaitForMusicFreeSources() 都不必等 —— 冷启动早期点已解析过的歌也能秒开。
+    if (auto cached = ResolveCacheGet(platform, id)) {
+        TraceDiagnostic("RESOLVE_TIMING",
+            "route=cache_hit\nplatform=" + platform + "\nid=" + id +
+            "\ncache=hit\ntotal_ms=0");
+        return cached;
+    }
+
     WaitForMusicFreeSources();
+    const auto t_wait_done = Clock::now();
     const nlohmann::json item_raw = BuildItemRaw(platform, id, raw);
     const ProtocolTrack track = BuildProtocolTrack(platform, id, item_raw);
     std::string primary_error;
+
+    // 分段计时（默认零文件 I/O，仅 TTPLAYER_MF_TRACE=1 时落日志）。
+    auto emit_timing = [&](const char* route, Clock::time_point t_plugin_done,
+                           Clock::time_point t_fallback_done) {
+        const auto ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
+        };
+        TraceDiagnostic("RESOLVE_TIMING",
+            std::string("route=") + route + "\nplatform=" + platform +
+            "\nid=" + id + "\ncache=miss" +
+            "\nwait_ms=" + ms(t_start, t_wait_done) +
+            "\nplugin_ms=" + ms(t_wait_done, t_plugin_done) +
+            "\nfallback_ms=" + ms(t_plugin_done, t_fallback_done) +
+            "\ntotal_ms=" + ms(t_start, t_fallback_done));
+    };
 
     // 第一路：MusicFree 插件。完整 raw 回传后，咪咕/酷狗这类依赖私有字段的
     // 插件不再因为缺 contentId、hash 而在 resolveWithFallback 里被拒。
@@ -393,34 +568,47 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
         item.artwork = track.artwork;
         item.duration_ms = track.duration_ms;
         if (auto ms = plugin->GetMediaSource(item, QualityKey::kStandard,
-                                             &primary_error))
+                                             &primary_error)) {
+            ResolveCachePut(platform, id, *ms);
+            const auto now = Clock::now();
+            emit_timing("plugin", now, now);
             return *ms;
+        }
     } else {
         primary_error = "找不到 MusicFree 音源「" + platform + "」";
     }
+    const auto t_plugin_done = Clock::now();
 
     // 第二路：其它协议音源。REST 音源本身就可能是曲目的来源平台；洛雪音源
     // 则在 MusicFree 插件解析失败时按歌名/歌手/私有 id 补一条可用直链。
+    // 兜底脚本会串行试探多条线路（实测 28 个请求），失效线路若按全局 20s
+    // 超时等待会把一次解析拖到十几秒；这里只把兜底段的单请求超时压到 6s。
     std::string fallback_error;
-    if (auto* registry = AppSourceProtocolRegistry()) {
-        try {
-            ProtocolResolveResult result = registry->ResolveFallback(track);
-            if (result.ok()) {
-                MediaSource ms;
-                ms.url = std::move(result.url);
-                ms.headers = std::move(result.headers);
-                ms.user_agent = std::move(result.user_agent);
-                TraceDiagnostic("PROTOCOL_FALLBACK",
-                    "platform=" + platform + "\nid=" + id +
-                    "\nvia=" + result.via + "\nurl=" + ms.url);
-                return ms;
+    {
+        ScopedHttpTimeout short_timeout(6000);
+        if (auto* registry = AppSourceProtocolRegistry()) {
+            try {
+                ProtocolResolveResult result = registry->ResolveFallback(track);
+                if (result.ok()) {
+                    MediaSource ms;
+                    ms.url = std::move(result.url);
+                    ms.headers = std::move(result.headers);
+                    ms.user_agent = std::move(result.user_agent);
+                    ResolveCachePut(platform, id, ms);
+                    TraceDiagnostic("PROTOCOL_FALLBACK",
+                        "platform=" + platform + "\nid=" + id +
+                        "\nvia=" + result.via + "\nurl=" + ms.url);
+                    emit_timing("fallback", t_plugin_done, Clock::now());
+                    return ms;
+                }
+                fallback_error = std::move(result.error);
+            } catch (const std::exception& e) {
+                fallback_error = e.what();
             }
-            fallback_error = std::move(result.error);
-        } catch (const std::exception& e) {
-            fallback_error = e.what();
         }
     }
 
+    emit_timing("failed", t_plugin_done, Clock::now());
     if (error) {
         *error = primary_error.empty() ? "无法解析播放地址" : primary_error;
         if (!fallback_error.empty()) *error += "；其它协议音源：" + fallback_error;
@@ -432,6 +620,262 @@ std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
                            std::string* error, const nlohmann::json* raw) {
     const auto ms = ResolvePlayUrlEx(platform, id, error, raw);
     return ms ? ms->url : std::string{};
+}
+
+// ---- 内容浏览：排行榜 / 推荐歌单 -------------------------------------------
+
+// 发现页：列出具备任一内容能力的音源。调用方必须在工作线程里执行，
+// 因为这里要等后台插件挂载完成；挂载完成后是无锁的零开销判断。
+std::vector<std::string> ListDiscoverPlatforms() {
+    WaitForMusicFreeSources();
+    std::vector<std::string> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    for (const auto& meta : mgr->ListPlugins()) {
+        if (meta.can_top_lists || meta.can_recommend)
+            out.push_back(meta.name);
+    }
+    return out;
+}
+
+// 单个音源的「榜单 + 推荐」聚合。任何一步失败都只记诊断、不影响其它音源；
+// 返回的 sheet 保留插件原始 raw，打开详情时才能还原 contentId 等私有字段。
+DiscoverOutcome GetDiscoverSheets(const std::string& platform,
+                                  int max_top, int max_recommend) {
+    WaitForMusicFreeSources();
+    DiscoverOutcome out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) { out.error = "音源管理器不可用"; return out; }
+    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
+    if (!plugin || !plugin->IsMounted()) {
+        out.error = "音源未挂载";
+        return out;
+    }
+    const auto& meta = plugin->meta();
+
+    if (meta.can_top_lists) {
+        try {
+            auto r = plugin->GetTopLists();
+            if (r) {
+                for (auto& s : r->items) {
+                    if (max_top-- <= 0) break;
+                    if (s.platform.empty()) s.platform = platform;
+                    const std::string origin = s.group;
+                    s.group = origin.empty() ? "榜单" : "榜单 · " + origin;
+                    out.sheets.push_back(std::move(s));
+                }
+                if (!r->error.empty()) out.error = r->error;
+            }
+        } catch (const std::exception& e) {
+            out.error = e.what();
+        } catch (...) {
+            out.error = "榜单读取异常";
+        }
+    }
+
+    // 推荐只取第一个标签的第一页：多个标签会成倍增加网络请求，慢音源
+    // 不该拖住整个发现页（用户仍可从卡片进入对应歌单）。
+    if (meta.can_recommend) {
+        try {
+            auto tags = plugin->GetRecommendSheetTags();
+            if (tags && !tags->tags.empty()) {
+                const SheetTag& tag = tags->tags.front();
+                auto r = plugin->GetRecommendSheetsByTag(tag.raw, 1);
+                if (r) {
+                    const std::string prefix = "推荐" +
+                        (tag.title.empty() ? std::string() : " · " + tag.title);
+                    for (auto& s : r->items) {
+                        if (max_recommend-- <= 0) break;
+                        if (s.platform.empty()) s.platform = platform;
+                        const std::string origin = s.group;
+                        s.group = origin.empty() ? prefix : prefix + " · " + origin;
+                        out.sheets.push_back(std::move(s));
+                    }
+                    if (!r->error.empty() && out.error.empty()) out.error = r->error;
+                }
+            }
+        } catch (const std::exception& e) {
+            if (out.error.empty()) out.error = e.what();
+        } catch (...) {
+            if (out.error.empty()) out.error = "推荐歌单读取异常";
+        }
+    }
+    return out;
+}
+
+std::vector<MusicSheet> GetAllTopLists() {
+    WaitForMusicFreeSources();
+    std::vector<MusicSheet> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    for (const auto& meta : mgr->ListPlugins()) {
+        MusicFreePlugin* plugin = mgr->FindPlugin(meta.name);
+        if (!plugin || !plugin->IsMounted() || !plugin->meta().can_top_lists)
+            continue;
+        auto result = plugin->GetTopLists();
+        if (!result || result->items.empty()) continue;
+        for (auto& sheet : result->items) {
+            if (sheet.platform.empty()) sheet.platform = meta.name;
+            out.push_back(std::move(sheet));
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> ListTopListPlatforms() {
+    std::vector<std::string> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    for (const auto& meta : mgr->ListPlugins())
+        if (meta.can_top_lists) out.push_back(meta.name);
+    return out;
+}
+
+std::vector<std::string> ListRecommendPlatforms() {
+    std::vector<std::string> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    for (const auto& meta : mgr->ListPlugins())
+        if (meta.can_recommend) out.push_back(meta.name);
+    return out;
+}
+
+std::vector<SheetTag> GetRecommendTags(const std::string& platform) {
+    WaitForMusicFreeSources();
+    std::vector<SheetTag> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
+    if (!plugin || !plugin->IsMounted() || !plugin->meta().can_recommend)
+        return out;
+    auto result = plugin->GetRecommendSheetTags();
+    if (result) out = std::move(result->tags);
+    return out;
+}
+
+std::vector<MusicSheet> GetRecommendSheets(const std::string& platform,
+                                           const nlohmann::json& tag, int page) {
+    WaitForMusicFreeSources();
+    std::vector<MusicSheet> out;
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
+    if (!plugin || !plugin->IsMounted() || !plugin->meta().can_recommend)
+        return out;
+    auto result = plugin->GetRecommendSheetsByTag(tag, page);
+    if (result) {
+        for (auto& sheet : result->items) {
+            if (sheet.platform.empty()) sheet.platform = platform;
+            out.push_back(std::move(sheet));
+        }
+    }
+    return out;
+}
+
+// 打开歌单诊断：仅当 TTPLAYER_SHEET_TRACE=1 时写 %TEMP%\ttplayer_sheet.log，
+// 默认零文件 I/O。用于定位「打开歌单没有返回曲目」这类插件侧静默失败。
+void SheetTrace(const std::string& line) {
+    if (GetEnvironmentVariableW(L"TTPLAYER_SHEET_TRACE", nullptr, 0) == 0) return;
+    wchar_t tmp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return;
+    const std::filesystem::path path = std::filesystem::path(tmp) / L"ttplayer_sheet.log";
+    std::ofstream f(path, std::ios::app);
+    if (!f) return;
+    f << line << '\n';
+}
+
+SheetTracksOutcome GetSheetTracks(const std::string& platform,
+                                  const nlohmann::json& sheet, SheetKind kind,
+                                  int page) {
+    WaitForMusicFreeSources();
+    SheetTracksOutcome out;
+    std::string sheet_dump = sheet.dump();
+    if (sheet_dump.size() > 400) sheet_dump.resize(400);
+    SheetTrace("CALL platform=" + platform +
+               " kind=" + (kind == SheetKind::kTopList ? "toplist" : "sheet") +
+               " page=" + std::to_string(page) + " sheet=" + sheet_dump);
+    auto* mgr = AppMusicFreeManager();
+    if (!mgr) return out;
+    MusicFreePlugin* plugin = mgr->FindPlugin(platform);
+    if (!plugin || !plugin->IsMounted()) {
+        out.error = "找不到音源「" + platform + "」";
+        SheetTrace("NO_PLUGIN " + out.error);
+        return out;
+    }
+    // 榜单优先 getTopListDetail、歌单优先 getMusicSheetInfo；但不少插件只实现
+    // 其中一个，或只对特定 id 走 getTopListDetail 的某个分支（其余分支隐式返回
+    // undefined）。因此首选方法缺失 / 返回空时，自动用另一个方法兜底再试一次。
+    auto primary = [&]() -> std::optional<SheetTracksResult> {
+        return kind == SheetKind::kTopList
+                   ? plugin->GetTopListDetail(sheet, page)
+                   : plugin->GetMusicSheetInfo(sheet, page);
+    };
+    auto alternate = [&]() -> std::optional<SheetTracksResult> {
+        return kind == SheetKind::kTopList
+                   ? plugin->GetMusicSheetInfo(sheet, page)
+                   : plugin->GetTopListDetail(sheet, page);
+    };
+    // 插件刚挂载完成时偶尔返回 pending Promise 或空列表（冷启动点第一张卡片
+    // 尤其明显）：这类是瞬态失败，稍后再试一次即可拿到数据。过去的表现是
+    // 「第一次点没曲目、第二次点同一张就有了」，这里把它做成自动重试。
+    const auto transient = [](const std::string& error) {
+        return error.empty() ||
+               error.find("Promise 未决") != std::string::npos ||
+               error.find("超时") != std::string::npos ||
+               error.find("异步任务异常") != std::string::npos ||
+               error.find("then 调用异常") != std::string::npos;
+    };
+    std::optional<SheetTracksResult> result;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        result = primary();
+        if (!result) {
+            result = alternate();
+            if (result) SheetTrace("FALLBACK_METHOD_MISSING");
+        }
+        if (result && result->items.empty()) {
+            const std::string first_error = result->error;
+            auto fallback = alternate();
+            if (fallback && !fallback->items.empty()) {
+                result = std::move(fallback);
+                SheetTrace("FALLBACK_EMPTY first_error=" + first_error);
+            }
+        }
+        const bool empty = !result || result->items.empty();
+        const std::string reason = result ? result->error : std::string();
+        if (!empty || !transient(reason) || attempt == 2) break;
+        SheetTrace("RETRY attempt=" + std::to_string(attempt + 1) +
+                   " reason=" + reason);
+        result.reset();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (!result) {
+        out.error = "音源「" + platform + "」不支持该内容方法";
+        SheetTrace("NO_METHOD " + out.error);
+        return out;
+    }
+    out.items = std::move(result->items);
+    out.is_end = result->is_end;
+    // 这里曾经写成 `if (!out.error.empty())`，条件恰好反了：out.error 初始为空，
+    // 于是插件抛出的异常（网络失败 / Promise 未决 / 参数拒绝）永远被吞掉，
+    // UI 只能显示「该歌单/排行榜没有返回曲目」这句没有任何线索的话。
+    if (out.error.empty()) out.error = result->error;
+    // 插件正常返回但曲目为空时，也给一条可诊断的提示。
+    if (out.items.empty() && out.error.empty())
+        out.error = "插件返回了空的曲目列表（该榜单暂无数据或网络请求失败）";
+    // 与 Search 保持一致：插件返回的曲目常不带 platform，不回填会导致
+    // 随后双击播放时 ResolvePlayUrl 找不到音源。raw 里也要带上。
+    for (auto& item : out.items) {
+        if (item.platform.empty()) {
+            item.platform = platform;
+            if (item.raw.is_object()) item.raw["platform"] = platform;
+        }
+    }
+    std::string first;
+    for (size_t i = 0; i < out.items.size() && i < 3; ++i)
+        first += (i ? " | " : "") + out.items[i].title;
+    SheetTrace("RESULT items=" + std::to_string(out.items.size()) +
+               " error=" + out.error + " first=" + first);
+    return out;
 }
 
 bool DownloadTrackFile(const std::wstring& url, const std::filesystem::path& path,

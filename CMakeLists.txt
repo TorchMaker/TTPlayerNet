@@ -107,6 +107,7 @@ add_library(ttplayer_core
   src/musicfree/musicfree_import_dialog.cpp
   src/musicfree/musicfree_browser_window.cpp
   src/musicfree/musicfree_app.cpp
+  src/musicfree/musicfree_artwork.cpp
   src/musicfree/source_protocol.cpp
   src/musicfree/lx_source_adapter.cpp
   src/musicfree/rest_source_adapter.cpp

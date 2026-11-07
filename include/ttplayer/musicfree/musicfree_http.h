@@ -60,6 +60,22 @@ HttpExchange PerformHttpRequest(
     const std::vector<std::uint8_t>& body, const NetworkConfig& cfg);
 
 // 下载文本（注册表 JSON / 插件 JS）。失败抛 std::runtime_error。
+// 解析兜底链专用：把「当前线程」后续 WinHTTP 请求的超时临时压到 ms 毫秒，
+// 离开作用域自动恢复。多协议兜底会串行试探多条线路，失效线路若按全局
+// 20s 超时等待，一次解析会被拖到十几秒；这里只缩短兜底段，插件搜索 /
+// 封面 / 插件更新仍用 NetworkConfig 的正常超时。thread_local 保证后台
+// 解析线程与 UI 线程互不干扰。
+class ScopedHttpTimeout {
+public:
+    explicit ScopedHttpTimeout(std::uint32_t ms) noexcept;
+    ~ScopedHttpTimeout() noexcept;
+    ScopedHttpTimeout(const ScopedHttpTimeout&) = delete;
+    ScopedHttpTimeout& operator=(const ScopedHttpTimeout&) = delete;
+private:
+    std::uint32_t previous_ = 0;
+    bool active_ = false;
+};
+
 std::string DownloadText(const std::string& url, const NetworkConfig& cfg);
 
 // 下载二进制资源（音频文件）的原始字节。与 DownloadText 走同一条 WinHTTP 链路

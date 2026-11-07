@@ -8,10 +8,12 @@
 
 #include "ttplayer/musicfree/quickjs_engine.h"
 
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include <quickjs.h>
 #include <nlohmann/json.hpp>
@@ -232,6 +234,7 @@ void QuickJsEngine::SetGlobal(std::string_view name, JSValue value) {
 }
 
 JSValue QuickJsEngine::EvalPlugin(std::string_view code, std::string_view filename) {
+    RefreshStackTop();  // 挂载通常在后台线程，换线程后必须刷新栈基准
     // 与 plugin.ts 完全一致：用 Function('return function(...){ ... }')() 包裹，
     // 使 JS_Eval 返回内部函数（裸 function 声明在 script 中求值结果为 undefined）。
     std::string src = std::string(
@@ -278,6 +281,7 @@ JSValue QuickJsEngine::EvalPlugin(std::string_view code, std::string_view filena
 }
 
 JSValue QuickJsEngine::EvalLibrary(std::string_view code, std::string_view filename) {
+    RefreshStackTop();
     // UMD 库检测 module.exports / exports / define。提供 module+exports+require。
     // 用 IIFE 返回内部函数，避免裸 function 声明求值为 undefined。
     std::string src = std::string(
@@ -312,6 +316,7 @@ JSValue QuickJsEngine::EvalLibrary(std::string_view code, std::string_view filen
 }
 
 JSValue QuickJsEngine::Await(JSValue promise) {
+    RefreshStackTop();
     JSValue then = JS_GetPropertyStr(ctx_, promise, "then");
     if (!JS_IsFunction(ctx_, then)) {
         JS_FreeValue(ctx_, then);
@@ -324,21 +329,59 @@ JSValue QuickJsEngine::Await(JSValue promise) {
     JSValue on_reject = JS_NewCFunction(ctx_, &AwaitRejected, "onRejected", 1);
     JSValue cb_args[2] = { on_fulfill, on_reject };
     JSValue call = JS_Call(ctx_, then, promise, 2, cb_args);
+    const bool then_failed = JS_IsException(call);
     JS_FreeValue(ctx_, call);
     JS_FreeValue(ctx_, then);
     JS_FreeValue(ctx_, on_fulfill);
     JS_FreeValue(ctx_, on_reject);
+    if (then_failed) {
+        // 「Promise 未决 (jobs=0)」有一部分是这里抛出的 JS 异常被静默丢弃：
+        // then 调用失败后队列自然是空的，上层只看到一句没有线索的超时。
+        const std::string text = ExceptionText(ctx_);
+        await_state_ = nullptr;
+        throw std::runtime_error("MusicFree 插件 Promise.then 调用异常: " + text);
+    }
 
     JSContext* pctx = nullptr;
+    int jobs = 0;
+    // 微任务队列暂时为空不等于调用失败：插件刚挂载时，宿主侧的异步回调
+    // （网络 / 定时器 / 分片解析）可能稍后才把 job 排进来。以前这里一见到
+    // rc==0 就 break，导致冷启动后第一次打开歌单必定报「Promise 未决(jobs=0)」，
+    // 而第二次点同一张卡片又正常。这里给一个短的泵送窗口，仍不决才算超时。
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(1500);
     while (!state.done) {
         int rc = JS_ExecutePendingJob(rt_, &pctx);
-        if (rc <= 0) break; // 无更多微任务却未决（例如遇到真实定时器）—— 放弃，避免死循环
+        if (rc > 0) { ++jobs; continue; }
+        // rc < 0 表示某个微任务抛了未捕获异常：把异常文本取出来报告，
+        // 否则 state.result 会一直保持初值 JS_UNDEFINED，上层只看到「返回 null」。
+        if (rc < 0) {
+            JSContext* ectx = pctx ? pctx : ctx_;
+            JSValue exc = JS_GetException(ectx);
+            const char* c = JS_ToCString(ectx, exc);
+            std::string text = c ? c : "(无法读取异常)";
+            if (c) JS_FreeCString(ectx, c);
+            JS_FreeValue(ectx, exc);
+            await_state_ = nullptr;
+            if (!JS_IsUndefined(state.result)) JS_FreeValue(ctx_, state.result);
+            throw std::runtime_error("MusicFree 插件异步任务异常 (jobs=" +
+                                     std::to_string(jobs) + "): " + text);
+        }
+        // rc == 0：队列已空。让出 CPU 再泵一次，而不是立刻判超时。
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     await_state_ = nullptr;
 
     if (state.rejected) {
         if (!JS_IsUndefined(state.result)) JS_FreeValue(ctx_, state.result);
         throw std::runtime_error("MusicFree 插件调用被拒绝: " + state.error);
+    }
+    if (!state.done) {
+        // 以前这里直接返回初值 JS_UNDEFINED，调用方拿到 null 且拿不到任何线索。
+        if (!JS_IsUndefined(state.result)) JS_FreeValue(ctx_, state.result);
+        throw std::runtime_error("MusicFree 插件调用超时：Promise 未决 (jobs=" +
+                                 std::to_string(jobs) + ")");
     }
     return state.result; // 调用方负责释放
 }
@@ -460,6 +503,7 @@ void QuickJsEngine::InitRequireRegistry() {
 // ---------------------------------------------------------------------------
 
 JSValue QuickJsEngine::JsonToValue(JSContext* ctx, const nlohmann::json& j) {
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
     if (j.is_null()) return JS_NULL;
     if (j.is_boolean()) return JS_NewBool(ctx, j.get<bool>());
     if (j.is_number()) {
@@ -495,6 +539,7 @@ JSValue QuickJsEngine::JsonToValue(JSContext* ctx, const nlohmann::json& j) {
 }
 
 nlohmann::json QuickJsEngine::ValueToJson(JSContext* ctx, JSValueConst v) {
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
     // 注意：quickjs-ng 的 JS_VALUE_GET_TAG 对引用类型返回的是“加掩码后的值”
     //（对象 -1 → 15、字符串 -7 → 9），因此不能用 switch(JS_TAG_OBJECT) 判断。
     // 这里改用谓词函数，保证正确性。

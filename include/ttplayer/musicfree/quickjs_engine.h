@@ -70,6 +70,12 @@ public:
     JSRuntime* runtime() const { return rt_; }
     JSContext* context() const { return ctx_; }
 
+    // QuickJS 在 JS_NewRuntime() 所在线程记录栈顶，用它检查 JS 栈溢出。
+    // 插件挂载 / 歌单调用跑在后台线程，线程栈地址不同会让检查把「已用栈」
+    // 算成一个巨大的值，随机报 Maximum call stack size exceeded（表现为同一张
+    // 歌单第一次点没曲目、后面又正常）。官方要求换线程后调用下面这个 API。
+    void RefreshStackTop() { if (rt_) JS_UpdateStackTop(rt_); }
+
     // 注册原生 require 包：name -> factory(ctx) 返回 module.exports（引擎托管释放）。
     using RequireFactory = std::function<JSValue(JSContext*)>;
     void RegisterRequire(std::string name, RequireFactory factory);

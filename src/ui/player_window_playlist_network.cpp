@@ -497,6 +497,31 @@ bool PlayerWindow::HandleOnlinePlayResolved(LPARAM payload) {
     return true;
 }
 
+bool PlayerWindow::HandleOnlineCacheReady(LPARAM payload) {
+    auto* data = reinterpret_cast<detail::CacheReadyPayload*>(payload);
+    if (!data) return true;
+    const auto info = *data;
+    delete data;
+    if (info.playlist_index >= playlists_.Size() ||
+        info.row >= playlists_.At(info.playlist_index).Tracks().size())
+        return true;
+    // 用户已经切到别的曲目 / 列表，就不要打扰当前播放。
+    if (!playing_playlist_index_ ||
+        *playing_playlist_index_ != info.playlist_index ||
+        !current_ || *current_ != info.row) return true;
+    const auto& track = playlists_.At(info.playlist_index).Tracks()[info.row];
+    std::string platform, song_id;
+    if (!OnlineTrackIdentity(track, &platform, &song_id) ||
+        platform != info.platform || song_id != info.song_id) return true;
+    std::filesystem::path local;
+    if (!ResolveOnlineTrackLocalCopy(track, local)) return true;
+    // 流式已经在正常推进就别从头重播；否则用本地副本真正出声。
+    const bool advancing = audio_->State() == audio::PlaybackState::playing &&
+        audio_->Position().count() > 0;
+    if (!advancing) SelectTrackFrom(info.playlist_index, info.row, true);
+    return true;
+}
+
 // 后台「边播边落盘」缓存：在线曲目走流式播放的同时，在另一线程把同一地址下载到本地
 // 默认下载目录，成功后写进 g_online_local_cache。下一次重播时 ResolveOnlineTrackLocalCopy
 // 会优先命中这个本地副本，从而零网络直接出声 —— 正是用户要的「能下载到本地就下载，下次
@@ -536,15 +561,27 @@ void PlayerWindow::StartOnlineTrackBackgroundCache(
     }
 
     // 把需要跨线程的字段按值捕获，避免引用悬空。
-    std::thread([platform, song_id, target, resolved_url] {
+    const HWND notify = window_;
+    const size_t target_playlist = playlists_.ActiveIndex();
+    const size_t target_row = current_.value_or(0);
+    std::thread([platform, song_id, target, resolved_url, notify,
+                 target_playlist, target_row] {
         std::string reason;
         const bool ok = musicfree::DownloadTrackFile(
             core::Utf8ToWide(resolved_url), std::filesystem::path(target),
             &reason);
         if (ok) {
             const std::string key = OnlineLocalKey(platform, song_id);
-            const std::scoped_lock lock(g_online_local_mutex);
-            g_online_local_cache[key] = std::filesystem::path(target);
+            {
+                const std::scoped_lock lock(g_online_local_mutex);
+                g_online_local_cache[key] = std::filesystem::path(target);
+            }
+            // 本地副本就绪：让 UI 线程判断是否需要「用本地文件重播」兜底。
+            auto* ready = new detail::CacheReadyPayload{
+                target_playlist, target_row, platform, song_id};
+            if (!PostMessageW(notify, detail::kMsgOnlineCacheReady, 0,
+                              reinterpret_cast<LPARAM>(ready)))
+                delete ready;
             musicfree::TraceDiagnostic("ONLINE_BACKGROUND_CACHE",
                 "ok=1 key=" + key + "\ntarget=" + core::WideToUtf8(target));
         } else {
