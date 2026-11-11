@@ -1030,6 +1030,9 @@ private:
     bool have_mini_window_bounds_{};
     bool playback_was_active_{};
     bool playback_source_open_{};
+    // 在线曲目已入列、后台正在取链：此时没有打开任何音源，播放按钮不能走
+    // Resume()，PlayCurrent 也不能重复启动解析线程（详见 2026-11-10 第五轮）。
+    bool pending_online_resolve_{};
     bool natural_completion_dispatch_{};
     bool pending_natural_play_{};
     std::optional<playlist::Track> pending_wave_track_change_;

@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <wrl/client.h>
 
@@ -481,7 +482,9 @@ std::wstring LogFontText(const LOGFONTW& font) {
 
 void SetAttribute(IXMLDOMElement* element,const wchar_t* name,
                   const std::wstring& value) {
-    if(element) element->setAttribute(_bstr_t(name),_variant_t(value.c_str()));
+    if(element) {
+        element->setAttribute(_bstr_t(name),_variant_t(value.c_str()));
+    }
 }
 
 void SetAttribute(IXMLDOMElement* element,const wchar_t* name,int value) {
@@ -1637,10 +1640,12 @@ bool SaveSkinVisualProfile(const std::filesystem::path& path,
     return SUCCEEDED(saved);
 }
 
-void SaveWindowState(const std::filesystem::path& path,
-                     const Settings& settings) {
+static void SaveWindowStateImpl(const std::filesystem::path& path,
+                                const Settings& settings) {
     if(path.empty()) return;
-    ComInit com; if(FAILED(com.hr) && com.hr!=RPC_E_CHANGED_MODE) return;
+    // 专用 STA 线程里必须真正拿到套间；放行 RPC_E_CHANGED_MODE 会让 MSXML
+    // 在 MTA 上以代理方式创建/释放，退出时表现为 "abnormal program termination"。
+    ComInit com; if(FAILED(com.hr)) return;
     IXMLDOMDocument* document{};
     if(!OpenSettingsDocument(path,&document)) return;
     auto document_owner=AdoptCom(document);
@@ -2111,5 +2116,20 @@ void SaveWindowState(const std::filesystem::path& path,
         SetAttribute(element,L"PackageName",package);
     }
     document->save(_variant_t(path.wstring().c_str()));
+}
+
+// SaveWindowState 仅负责把窗口布局/可见性状态写回配置文件。任何异常都不能逃出：
+// 退出时若在此抛错，std::terminate 会弹出 "abnormal program termination"。
+// （此前怀疑此处 MSXML abort，经验证崩溃实际源于 MusicFree 网络层在进程退出时
+// 仍有线程卡在 WinHTTP 阻塞调用，与配置保存无关。）
+void SaveWindowState(const std::filesystem::path& path,
+                     const Settings& settings) {
+    if (path.empty()) return;
+    try {
+        SaveWindowStateImpl(path, settings);
+    } catch (...) {
+        // 任何异常都不能逃出：视频模块退出时若在此抛错，std::terminate
+        // 会弹出 "abnormal program termination"。
+    }
 }
 }

@@ -1,5 +1,8 @@
 #include "ttplayer/ui/cover_image.h"
 #include "ttplayer/platform/optional_windows_api.h"
+#include "ttplayer/ui/image_decoder_registry.h"
+
+#include <windows.h>
 
 #include <objidl.h>
 #include <gdiplus.h>
@@ -130,13 +133,33 @@ CoverImage DecodeGdiPlus(std::span<const unsigned char> bytes, UINT maximum_edge
 }
 } // namespace
 
+// 取 HBITMAP 像素尺寸（CreateDIBSection 自顶向下，bmHeight 为绝对值）。
+SIZE GdiBitmapSize(HBITMAP bmp) {
+    BITMAP bm{};
+    if (bmp && GetObjectW(bmp, sizeof(bm), &bm) == sizeof(bm) &&
+        bm.bmWidth && bm.bmHeight)
+        return {static_cast<LONG>(bm.bmWidth), static_cast<LONG>(bm.bmHeight)};
+    return {};
+}
+
 CoverImage DecodeCoverImage(std::span<const unsigned char> bytes, UINT maximum_edge,
                            CoverImageDecoder decoder) {
     if (bytes.empty() || bytes.size() > kMaximumBytes) return {};
     try {
         if (decoder != CoverImageDecoder::gdi_plus) {
             const auto image = DecodeWic(bytes, maximum_edge);
-            if (image.bitmap || decoder == CoverImageDecoder::wic) return image;
+            if (image.bitmap) return image;
+            // WIC 解不动（WebP / AVIF 等现代格式）→ 交给图片解码插件 DLL 兜底。
+            // 仅 automatic 模式走插件；显式 wic/gdi_plus 用于测试，不旁路。
+            if (decoder == CoverImageDecoder::automatic) {
+                if (const HBITMAP bmp = ImageDecoderRegistry::Instance().Decode(
+                        bytes, static_cast<int>(maximum_edge))) {
+                    const SIZE size = GdiBitmapSize(bmp);
+                    if (size.cx && size.cy) return {bmp, size};
+                    DeleteObject(bmp);
+                }
+            }
+            if (decoder == CoverImageDecoder::wic) return {};
         }
         return DecodeGdiPlus(bytes, maximum_edge);
     } catch (const std::bad_alloc&) {

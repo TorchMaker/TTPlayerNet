@@ -21,6 +21,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,11 @@
 #include "ttplayer/musicfree/source_protocol_registry.h"
 
 namespace ttplayer::musicfree {
+
+// 进程级音源管理器（含 QuickJS 引擎 / 插件）。提升为具名命名空间级对象，使
+// ShutdownMusicFree 能在受控退出时确定性销毁它，避免与仍存活的后台线程竞态。
+std::once_flag g_once;
+std::unique_ptr<MusicFreeSourceManager> g_manager;
 
 namespace {
 
@@ -110,9 +116,6 @@ ProtocolTrack BuildProtocolTrack(const std::string& platform,
     }
     return track;
 }
-
-std::once_flag g_once;
-std::unique_ptr<MusicFreeSourceManager> g_manager;
 
 // 后台音源重建的状态。started/done 受 mutex 保护，worker 只在主线程 join/detach。
 struct AsyncSourcesState {
@@ -270,6 +273,64 @@ void ResolveCachePut(const std::string& platform, const std::string& id,
 
 } // namespace
 
+// ---- 优雅退出：后台线程协调 ------------------------------------------------
+//
+// g_musicfree_shutting_down 在 ShutdownMusicFree 置位，此后所有 MusicFree 后台线程
+// 的入口 / 循环点早退，不再触碰 g_manager；在飞线程走完当前调用后由 BgThreadGuard
+// 计数归零，ShutdownMusicFree 据此等待，再安全地 reset g_manager —— 避免与引擎 /
+// 插件析构竞态触发 "abnormal program termination"。
+std::atomic<bool> g_musicfree_shutting_down{false};
+std::atomic<int> g_bg_threads{0};
+std::mutex g_bg_mtx;
+std::condition_variable g_bg_cv;
+
+namespace detail {
+void MusicFreeBgThreadEnter() noexcept {
+    g_bg_threads.fetch_add(1, std::memory_order_relaxed);
+}
+void MusicFreeBgThreadLeave() noexcept {
+    if (g_bg_threads.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        g_bg_cv.notify_all();
+}
+} // namespace detail
+
+bool IsMusicFreeShuttingDown() noexcept {
+    return g_musicfree_shutting_down.load(std::memory_order_relaxed);
+}
+
+void WaitMusicFreeBackgroundThreads(std::chrono::milliseconds timeout) noexcept {
+    if (g_bg_threads.load(std::memory_order_relaxed) == 0) return;
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(g_bg_mtx);
+    while (g_bg_threads.load(std::memory_order_relaxed) > 0) {
+        // 各后台线程走完当前调用（网络层已置关闭标志，会自行从 WinHTTP 阻塞里
+        // 抛出并展开）后通过 BgThreadGuard 通知计数归零；超时则放弃等待，
+        // 交由进程退出兜底。
+        if (g_bg_cv.wait_for(lock, std::chrono::milliseconds(50),
+                             [] { return g_bg_threads.load(std::memory_order_relaxed) == 0; }))
+            break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+}
+
+void ShutdownMusicFree(std::chrono::milliseconds timeout) noexcept {
+    g_musicfree_shutting_down.store(true, std::memory_order_relaxed);
+    // 1) 禁止新网络请求并（有界）等待在飞 WinHTTP 调用展开，让后台线程尽快退场。
+    //    网络排空上限取 timeout 的 2/3，剩下 1/3 给后台线程计数归零。
+    MusicFreeNetworkShutdown(std::chrono::milliseconds(
+        static_cast<std::int64_t>(timeout.count() * 2 / 3)));
+    // 2) 等待所有后台线程计数归零，确保此刻已无线程持有引擎引用。
+    WaitMusicFreeBackgroundThreads(std::chrono::milliseconds(
+        static_cast<std::int64_t>(timeout.count() / 3)));
+    // 3) 确定性地销毁 g_manager（引擎 / 插件），此刻不再有线程访问它。
+    g_manager.reset();
+}
+
+std::optional<MediaSource> PeekResolveCache(const std::string& platform,
+                                             const std::string& id) {
+    return ResolveCacheGet(platform, id);
+}
+
 void InvalidateResolveCache(const std::string& platform, const std::string& id) {
     std::lock_guard<std::mutex> lock(g_resolve_cache_mutex);
     LoadResolveCacheLocked();
@@ -372,6 +433,7 @@ void StartMusicFreeSourcesLoading(void* notify_hwnd, unsigned notify_msg) {
 }
 
 void WaitForMusicFreeSources() {
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed)) return;
     auto& state = AsyncSources();
     std::unique_lock<std::mutex> lock(state.mutex);
     if (!state.started) {
@@ -418,6 +480,33 @@ void TraceDiagnostic(const std::string& tag, const std::string& text) {
     std::fclose(file);
 }
 
+void AppendPlayLog(const std::string& text) {
+    wchar_t exe[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+    std::wstring dir(exe);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return;
+    const std::wstring path = dir.substr(0, slash) + L"\\musicfree\\play.log";
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(path).parent_path(), ec);
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) &&
+        fa.nFileSizeHigh == 0 && fa.nFileSizeLow > 512 * 1024) {
+        MoveFileExW(path.c_str(), (path + L".1").c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"ab") != 0 || !f) return;
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    char stamp[32]{};
+    std::strftime(stamp, sizeof(stamp), "%m-%d %H:%M:%S", &tm);
+    std::fprintf(f, "[%s] %s\n", stamp, text.c_str());
+    std::fclose(f);
+}
+
 nlohmann::json RestoreSourceRaw(
     const std::vector<std::pair<std::string, std::string>>& metadata) {
     for (const auto& kv : metadata) {
@@ -451,37 +540,73 @@ std::vector<OnlineSearchHit> SearchAllSources(const std::string& query,
                                               int page,
                                               OnlineSearchDiagnostics* diagnostics) {
     std::vector<OnlineSearchHit> out;
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed)) return out;
     if (query.empty()) return out;
     WaitForMusicFreeSources();
     auto* mgr = AppMusicFreeManager();
 
-    auto collect = [&](MusicFreePlugin* plugin) {
-        if (!plugin || !plugin->IsMounted() || !plugin->meta().can_search) return;
-        if (diagnostics) ++diagnostics->sources;
-        SearchResult r = plugin->Search(query, page, "music");
-        if (!r.error.empty() && diagnostics)
-            diagnostics->errors.push_back(plugin->meta().name + ": " + r.error);
-        if (!r.items.empty() && diagnostics) ++diagnostics->sources_with_hits;
-        for (const auto& item : r.items) {
-            OnlineSearchHit hit;
-            hit.platform = item.platform.empty() ? plugin->meta().name : item.platform;
-            hit.id = item.id;
-            hit.title = item.title;
-            hit.artist = item.artist;
-            hit.album = item.album;
-            hit.artwork = item.artwork;
-            hit.duration_ms = item.duration_ms;
-            hit.raw = item.raw;  // 咪咕 contentId / copyrightId 等私有字段
-            out.push_back(std::move(hit));
-        }
-    };
-
+    // 各音源并行搜索：以前是串行 collect，一个超时音源（实测咪咕 20s）会把
+    // 整轮拖到 20s+（6 个音源实测 23.5s），页面看起来就是「搜索没反应/没结果」。
+    // 每个插件持有独立 QuickJS runtime，并行安全；每线程再压 6s 超时，
+    // 最慢的音源不再拖垮整轮。
     if (mgr) {
+        std::vector<MusicFreePlugin*> plugins;
         if (!platform.empty()) {
-            collect(mgr->FindPlugin(platform));
+            if (auto* p = mgr->FindPlugin(platform)) plugins.push_back(p);
         } else {
             for (const auto& meta : mgr->ListPlugins())
-                collect(mgr->FindPlugin(meta.name));
+                if (auto* p = mgr->FindPlugin(meta.name)) plugins.push_back(p);
+        }
+        struct Slot {
+            SearchResult result;
+            std::string name;
+            bool searchable = false;
+        };
+        std::vector<Slot> slots(plugins.size());
+        std::atomic<std::size_t> next{0};
+        const int worker_count = static_cast<int>(
+            std::min<std::size_t>(plugins.size(), 6));
+        std::vector<std::thread> workers;
+        for (int w = 0; w < worker_count; ++w) {
+            workers.emplace_back([&] {
+                ScopedHttpTimeout tick(6000);
+                for (;;) {
+                    const std::size_t i = next.fetch_add(1);
+                    if (i >= plugins.size()) break;
+                    MusicFreePlugin* p = plugins[i];
+                    if (!p || !p->IsMounted() || !p->meta().can_search) continue;
+                    slots[i].name = p->meta().name;
+                    slots[i].searchable = true;
+                    try {
+                        slots[i].result = p->Search(query, page, "music");
+                    } catch (const std::exception& e) {
+                        slots[i].result.error = e.what();
+                    } catch (...) {
+                        slots[i].result.error = "未知错误";
+                    }
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+        for (auto& slot : slots) {
+            if (!slot.searchable) continue;
+            if (diagnostics) ++diagnostics->sources;
+            if (!slot.result.error.empty() && diagnostics)
+                diagnostics->errors.push_back(slot.name + ": " + slot.result.error);
+            if (!slot.result.items.empty() && diagnostics)
+                ++diagnostics->sources_with_hits;
+            for (const auto& item : slot.result.items) {
+                OnlineSearchHit hit;
+                hit.platform = item.platform.empty() ? slot.name : item.platform;
+                hit.id = item.id;
+                hit.title = item.title;
+                hit.artist = item.artist;
+                hit.album = item.album;
+                hit.artwork = item.artwork;
+                hit.duration_ms = item.duration_ms;
+                hit.raw = item.raw;  // 咪咕 contentId / copyrightId 等私有字段
+                out.push_back(std::move(hit));
+            }
         }
     }
 
@@ -519,6 +644,10 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             const std::string& id,
                                             std::string* error,
                                             const nlohmann::json* raw) {
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed)) {
+        if (error) *error = "正在退出";
+        return std::nullopt;
+    }
     using Clock = std::chrono::steady_clock;
     const auto t_start = Clock::now();
 
@@ -553,8 +682,11 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
             "\ntotal_ms=" + ms(t_start, t_fallback_done));
     };
 
-    // 第一路：MusicFree 插件。完整 raw 回传后，咪咕/酷狗这类依赖私有字段的
-    // 插件不再因为缺 contentId、hash 而在 resolveWithFallback 里被拒。
+    // 第一路：MusicFree 插件，按音质档位依次 fallback。对齐原版 MusicFree
+    // TrackPlayer（core/trackPlayer/index.ts：getQualityOrder + for 循环
+    // getMediaSource）—— 只在「来源平台」插件内按音质重试，从不遍历所有音源。
+    // 此前我们在此之外另加了「遍历所有注册音源串行 28 请求」的兜底，是
+    // 「加到列表很久才播放」的元凶（实测 16~29s），原版根本没有这条路径。
     auto* mgr = AppMusicFreeManager();
     MusicFreePlugin* plugin = mgr ? mgr->FindPlugin(platform) : nullptr;
     if (plugin && plugin->IsMounted()) {
@@ -567,12 +699,19 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
         item.album = track.album;
         item.artwork = track.artwork;
         item.duration_ms = track.duration_ms;
-        if (auto ms = plugin->GetMediaSource(item, QualityKey::kStandard,
-                                             &primary_error)) {
-            ResolveCachePut(platform, id, *ms);
-            const auto now = Clock::now();
-            emit_timing("plugin", now, now);
-            return *ms;
+        // 音质升序：standard 最通用优先，失败再试更高音质（对齐原版 qualityOrder）。
+        static const QualityKey kQualityOrder[] = {
+            QualityKey::kStandard, QualityKey::kHigh, QualityKey::kSuper,
+            QualityKey::kLossless, QualityKey::kHires, QualityKey::kSurpass,
+        };
+        for (QualityKey q : kQualityOrder) {
+            std::string perr;
+            if (auto ms = plugin->GetMediaSource(item, q, &perr)) {
+                ResolveCachePut(platform, id, *ms);
+                emit_timing("plugin", Clock::now(), Clock::now());
+                return *ms;
+            }
+            if (primary_error.empty()) primary_error = perr;
         }
     } else {
         primary_error = "找不到 MusicFree 音源「" + platform + "」";
@@ -627,6 +766,7 @@ std::string ResolvePlayUrl(const std::string& platform, const std::string& id,
 // 发现页：列出具备任一内容能力的音源。调用方必须在工作线程里执行，
 // 因为这里要等后台插件挂载完成；挂载完成后是无锁的零开销判断。
 std::vector<std::string> ListDiscoverPlatforms() {
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed)) return {};
     WaitForMusicFreeSources();
     std::vector<std::string> out;
     auto* mgr = AppMusicFreeManager();
@@ -642,6 +782,7 @@ std::vector<std::string> ListDiscoverPlatforms() {
 // 返回的 sheet 保留插件原始 raw，打开详情时才能还原 contentId 等私有字段。
 DiscoverOutcome GetDiscoverSheets(const std::string& platform,
                                   int max_top, int max_recommend) {
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed)) return {{}, "正在退出"};
     WaitForMusicFreeSources();
     DiscoverOutcome out;
     auto* mgr = AppMusicFreeManager();
@@ -787,6 +928,8 @@ void SheetTrace(const std::string& line) {
 SheetTracksOutcome GetSheetTracks(const std::string& platform,
                                   const nlohmann::json& sheet, SheetKind kind,
                                   int page) {
+    if (g_musicfree_shutting_down.load(std::memory_order_relaxed))
+        return {{}, false, "正在退出"};
     WaitForMusicFreeSources();
     SheetTracksOutcome out;
     std::string sheet_dump = sheet.dump();

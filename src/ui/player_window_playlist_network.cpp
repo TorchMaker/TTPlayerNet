@@ -3,6 +3,7 @@
 #include "ttplayer/ui/player_window.h"
 
 #include "player_window_internal.h"
+#include "ttplayer/audio/online_stream_descriptor.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
 #include "ttplayer/ui/playlist_network_commands.h"
@@ -12,7 +13,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -48,6 +51,10 @@ struct OnlineDownloadJob {
     std::wstring error;
     std::int64_t bytes{};
 };
+
+// 后台「解析直链」的最新请求序号。与下载任务的单任务互斥解耦：解析允许并发，
+// 连续双击多首歌时由 HandleOnlinePlayResolved 用序号只认最后一次。
+std::atomic<unsigned long long> g_online_resolve_serial{0};
 
 std::mutex g_download_mutex;
 std::shared_ptr<OnlineDownloadJob> g_download_job;
@@ -415,6 +422,12 @@ bool PlayerWindow::ResolveOnlineTrackLocalCopy(const playlist::Track& track,
     return false;
 }
 
+// 同一首歌只允许一个在途解析。PlayCurrent 会被换轨定时器 / UI 刷新反复调用，
+// 旧实现每次都启线程并让 serial 递增，先完成的结果全被判「过期」丢弃 →
+// 「列表里出现了但永远不出声」（2026-11-10 第五轮真机反馈）。
+std::mutex g_online_resolve_inflight_mutex;
+std::string g_online_resolve_inflight_key;
+
 void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
                                                   size_t row,
                                                   const playlist::Track& track) {
@@ -422,63 +435,45 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
     std::string song_id;
     if (!OnlineTrackIdentity(track, &platform, &song_id)) return;
 
-    const std::wstring url_hint = track.path.wstring();
-    const HWND notify = window_;
-    // 复用下载的「单任务」互斥，避免和用户点「下载歌曲」撞车。
-    auto job = std::make_shared<OnlineDownloadJob>();
+    const std::string key = platform + "\x1f" + song_id;
+    unsigned long long serial = 0;
     {
-        const std::scoped_lock lock(g_download_mutex);
-        if (g_download_job) {
-            musicfree::TraceDiagnostic("PLAYLIST_PLAY_RESOLVE",
-                "skip: another download in progress");
+        std::lock_guard<std::mutex> lock(g_online_resolve_inflight_mutex);
+        if (g_online_resolve_inflight_key == key) {
+            musicfree::AppendPlayLog("PLAYLIST resolve skip duplicate id=" +
+                                     song_id);
             return;
         }
-        g_download_job = job;
+        g_online_resolve_inflight_key = key;
+        serial = g_online_resolve_serial.fetch_add(1) + 1;
     }
 
+    const HWND notify = window_;
     const auto source_raw = musicfree::RestoreSourceRaw(track.metadata);
-    std::thread([job, notify, url_hint, platform, song_id,
-                 playlist_index, row, source_raw] {
-        std::wstring resolved = url_hint;
-        std::wstring error;
-        // path 是 http 地址时，按「音源平台 + 歌曲 id」重新解析（等价于 MusicFree
-        // getMediaSource 调插件现拉）。从旧配置恢复的条目 path 可能已是本地文件，
-        // 但这里只会在线条目（http）走到这，所以一律重新解析更稳。
+    musicfree::AppendPlayLog("PLAYLIST resolve thread start id=" + song_id +
+                             " serial=" + std::to_string(serial));
+    // 只解析并写 resolve_cache.json，绝不 DownloadTrackFile 完整下载；
+    // 完成后把真实直链带回 UI 线程直接起播（边下边播、不落盘）。
+    std::thread([notify, platform, song_id, playlist_index, row,
+                 source_raw, serial, key] {
         std::string reason;
-        resolved = core::Utf8ToWide(
-            musicfree::ResolvePlayUrl(platform, song_id, &reason, &source_raw));
-        if (resolved.empty()) {
-            error = reason.empty() ? L"无法解析播放地址"
-                                   : core::Utf8ToWide(reason);
-        }
-        bool ok = false;
-        if (error.empty()) {
-            const auto dir = musicfree::DefaultDownloadDirectory();
-            const std::wstring ext = musicfree::GuessExtension(resolved);
-            const std::wstring target =
-                (dir.empty() ? std::filesystem::temp_directory_path().wstring()
-                             : dir.wstring()) +
-                L"\\" + core::Utf8ToWide(platform) + L"_" + core::Utf8ToWide(song_id) +
-                ext;
-            ok = musicfree::DownloadTrackFile(resolved,
-                std::filesystem::path(target), &reason);
-            if (ok) {
-                const std::string key = OnlineLocalKey(platform, song_id);
-                const std::scoped_lock lock(g_online_local_mutex);
-                g_online_local_cache[key] = std::filesystem::path(target);
-            } else {
-                error = core::Utf8ToWide(reason);
-            }
-        }
+        const std::string url =
+            musicfree::ResolvePlayUrl(platform, song_id, &reason, &source_raw);
+        const bool ok = !url.empty();
         {
-            const std::scoped_lock lock(g_download_mutex);
-            job->ok = ok;
-            job->error = std::move(error);
-            job->path = resolved;
+            std::lock_guard<std::mutex> lock(g_online_resolve_inflight_mutex);
+            if (g_online_resolve_inflight_key == key)
+                g_online_resolve_inflight_key.clear();
         }
-        auto* payload = new detail::PlayResolvedPayload{playlist_index, row};
-        PostMessageW(notify, detail::kMsgOnlinePlayResolved, 0,
-                     reinterpret_cast<LPARAM>(payload));
+        musicfree::AppendPlayLog("PLAYLIST resolve done ok=" +
+            std::string(ok ? "1" : "0") + " serial=" +
+            std::to_string(serial) + " id=" + song_id +
+            (ok ? "" : " reason=" + reason.substr(0, 120)));
+        auto* payload = new detail::PlayResolvedPayload{
+            playlist_index, row, serial, ok, url};
+        if (!PostMessageW(notify, detail::kMsgOnlinePlayResolved, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
     }).detach();
 }
 
@@ -487,12 +482,59 @@ bool PlayerWindow::HandleOnlinePlayResolved(LPARAM payload) {
     if (!data) return true;
     const size_t playlist_index = data->playlist_index;
     const size_t row = data->row;
+    const unsigned long long serial = data->serial;
+    const bool success = data->success;
+    const std::string url = std::move(data->url);
     delete data;
-    if (playlist_index >= playlists_.Size() ||
-        row >= playlists_.At(playlist_index).Tracks().size())
+    musicfree::AppendPlayLog("PLAYLIST resolve msg ok=" +
+        std::string(success ? "1" : "0") + " serial=" +
+        std::to_string(serial) + " latest=" +
+        std::to_string(g_online_resolve_serial.load()));
+    if (!success) {
+        // 失败时清 pending，让「再点一次播放」能重新发起解析；但绝不重选行，
+        // 否则 PlayCurrent 又会因缓存未命中再启一次解析，形成无限循环。
+        pending_online_resolve_ = false;
+        playback_source_open_ = false;
+        RefreshPlaybackUi();
         return true;
-    // 重选同一行：这次 PlayCurrent 会经 ResolveOnlineTrackLocalCopy 命中刚写下的
-    // 本地缓存，于是 audio_->Play 拿到的是本地文件，真正出声。
+    }
+    if (serial != g_online_resolve_serial.load()) {
+        pending_online_resolve_ = false;
+        return true;  // 过期结果：用户已改点别的曲目
+    }
+    if (playlist_index >= playlists_.Size() ||
+        row >= playlists_.At(playlist_index).Tracks().size()) {
+        pending_online_resolve_ = false;
+        return true;
+    }
+
+    const playlist::Track track = playlists_.At(playlist_index).Tracks()[row];
+    CancelWaveTrackChange();       // 清掉可能卡住的换轨淡出状态
+    pending_online_resolve_ = false;
+    playback_source_open_ = false;
+
+    // ★ 直接起播，不再绕「重选同一行 → 查缓存」：那条路径受 same_item、
+    //   pending_wave_track_change_、缓存 key 影响，任一环出错就是「没声音」。
+    if (!url.empty()) {
+        const bool is_hls = url.size() >= 5 &&
+            _stricmp(url.c_str() + url.size() - 5, ".m3u8") == 0;
+        audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{
+            url, {}, "", is_hls});
+        const bool ok = audio_->Play(core::Utf8ToWide(url), track.subtrack);
+        musicfree::AppendPlayLog(std::string("PLAYLIST direct_play ok=") +
+                                 (ok ? "1" : "0") + " hls=" +
+                                 std::to_string(is_hls));
+        if (ok) {
+            playback_source_open_ = true;
+            playback_was_active_ = true;
+            opened_track_ = track;
+            settings_.player.playing_file_name = core::Utf8ToWide(url);
+            settings_.player.playing_time = 0;
+            RefreshPlaybackUi();
+            return true;
+        }
+    }
+    // 兜底：走既有 PlayCurrent（缓存已由后台写入）。
     SelectTrackFrom(playlist_index, row, true);
     return true;
 }

@@ -16,6 +16,10 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <quickjs.h>
 #include <nlohmann/json.hpp>
 
@@ -31,6 +35,25 @@ namespace ttplayer::musicfree {
 #endif
 
 namespace {
+
+// 优雅退出门控：置位后任何新的 WinHTTP 请求立即抛出，不再发起网络调用；
+// g_inflight 统计当前进入 WinHttpBlocking 且尚未返回的请求数，供退出时等待排空。
+std::atomic<bool> g_net_shutdown{false};
+std::atomic<int> g_inflight{0};
+std::mutex g_inflight_mtx;
+std::condition_variable g_inflight_cv;
+
+// 进入 WinHttpBlocking 时构造、离开（任何路径：返回或抛异常）时析构，
+// 用于精确增减在飞计数并唤醒等待者。
+struct InflightGuard {
+    InflightGuard() { g_inflight.fetch_add(1, std::memory_order_relaxed); }
+    ~InflightGuard() {
+        if (g_inflight.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            g_inflight_cv.notify_all();
+    }
+    InflightGuard(const InflightGuard&) = delete;
+    InflightGuard& operator=(const InflightGuard&) = delete;
+};
 
 // 兜底解析时由 ScopedHttpTimeout 设置的每线程超时覆盖值（0 = 不覆盖）。
 thread_local std::uint32_t g_http_timeout_override = 0;
@@ -148,14 +171,110 @@ std::wstring EncodeNonAsciiForUrl(const std::wstring& url) {
     return out;
 }
 
+// 主机名里的非 ASCII（中文等国际化域名 IDN）必须转成 punycode（xn--…），
+// 不能走上面的 %XX 路径 —— DNS 只认 ASCII，把 "www.饭太硬.net" 编码成
+// "www.%E9%A5%AD%E5%A4%AA%E7%A1%AC.net" 是个根本不存在的域名，WinHttpConnect
+// 会直接失败（用户导入中文域名的影视仓配置时踩到的就是这个）。
+bool HasNonAscii(std::wstring_view s) {
+    for (wchar_t c : s)
+        if (c < 0x21 || c > 0x7E) return true;
+    return false;
+}
+
+std::wstring IdnToPunycode(const std::wstring& host) {
+    if (host.empty() || !HasNonAscii(host)) return host;
+    // IdnToAscii 在 Vista / Win7 位于 Normaliz.dll，Win8 起并入 Kernel32。
+    // 动态取地址，避免为一个函数引入 Normaliz.lib 依赖。
+    using IdnToAsciiFn = int(WINAPI*)(DWORD, LPCWSTR, int, LPWSTR, int);
+    IdnToAsciiFn fn = nullptr;
+    for (const wchar_t* dll : {L"Normaliz.dll", L"kernel32.dll"}) {
+        HMODULE mod = GetModuleHandleW(dll);
+        if (!mod && wcscmp(dll, L"Normaliz.dll") == 0)
+            mod = LoadLibraryW(dll);
+        if (mod) {
+            fn = reinterpret_cast<IdnToAsciiFn>(GetProcAddress(mod, "IdnToAscii"));
+            if (fn) break;
+        }
+    }
+    if (!fn) return host;
+    std::wstring out(host.size() * 2 + 8, L'\0');
+    for (;;) {
+        const int n = fn(0, host.c_str(), static_cast<int>(host.size()), out.data(),
+                         static_cast<int>(out.size()));
+        if (n > 0) {
+            out.resize(static_cast<size_t>(n));
+            return out;
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) break;
+        out.resize(out.size() * 2);
+    }
+    return host;  // 转换失败就原样返回，由调用方照旧处理
+}
+
+// 交给 WinHTTP 之前的最后一道整形：
+//   scheme://userinfo@host:port/path?query
+//                    ^^^^^^^^^ 只这一段做 punycode
+//                              ^^^^^^^^^^^^^^^ 其余仍按 UTF-8 → %XX
+std::wstring NormalizeUrlForWinHttp(const std::wstring& url) {
+    const size_t scheme_end = url.find(L"://");
+    if (scheme_end == std::wstring::npos) return EncodeNonAsciiForUrl(url);
+    const size_t auth_begin = scheme_end + 3;
+    size_t auth_end = url.find_first_of(L"/?#", auth_begin);
+    if (auth_end == std::wstring::npos) auth_end = url.size();
+
+    std::wstring authority = url.substr(auth_begin, auth_end - auth_begin);
+    std::wstring userinfo;
+    const size_t at = authority.rfind(L'@');
+    if (at != std::wstring::npos) {
+        userinfo = authority.substr(0, at + 1);
+        authority = authority.substr(at + 1);
+    }
+
+    std::wstring host, port;
+    if (!authority.empty() && authority.front() == L'[') {
+        // IPv6 字面量 [::1]:8080，不能按 ':' 切
+        const size_t close = authority.find(L']');
+        if (close != std::wstring::npos) {
+            host = authority.substr(0, close + 1);
+            if (close + 1 < authority.size() && authority[close + 1] == L':')
+                port = authority.substr(close + 1);
+        } else {
+            host = authority;
+        }
+    } else {
+        const size_t colon = authority.rfind(L':');
+        if (colon != std::wstring::npos &&
+            authority.find_first_not_of(L"0123456789", colon + 1) == std::wstring::npos) {
+            host = authority.substr(0, colon);
+            port = authority.substr(colon);
+        } else {
+            host = authority;
+        }
+    }
+
+    std::wstring out = url.substr(0, auth_begin);
+    out += userinfo;
+    out += IdnToPunycode(host);
+    out += port;
+    out += EncodeNonAsciiForUrl(url.substr(auth_end));
+    return out;
+}
+
 HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
                              const std::vector<std::uint8_t>& post_body,
                              const std::map<std::string, std::string>& req_headers,
                              const NetworkConfig& cfg,
                              const std::wstring& verb_override = {}) {
     HttpResponse resp;
-    // 必须在 ParseUrl 之前编码：WinHttpCrackUrl 会把非 ASCII 降级为 '?'。
-    UrlParts parts = ParseUrl(EncodeNonAsciiForUrl(url));
+    // 优雅退出：进程正在关闭时不再发起新的 WinHTTP 请求，让上层把异常当作
+    // 网络失败处理（catch 后回退为空结果 / 拒绝 Promise），避免在进程拆卸
+    // DLL 时仍有线程卡在 WinHTTP 阻塞调用导致内部 abort。
+    if (g_net_shutdown.load(std::memory_order_relaxed))
+        throw std::runtime_error("MusicFree 网络已关闭，跳过请求");
+    InflightGuard inflight;  // 在飞计数 +1，所有退出路径自动 -1
+    // 必须先整形再 ParseUrl：WinHttpCrackUrl 会把非 ASCII 降级为 '?'，而主机名
+    // 只能走 punycode（见 NormalizeUrlForWinHttp）。
+    UrlParts parts = ParseUrl(NormalizeUrlForWinHttp(url));
     if (parts.host.empty()) throw std::runtime_error("非法 URL");
 
     // 用 RAII 包装 HINTERNET，离开作用域自动关闭。
@@ -179,6 +298,26 @@ HttpResponse WinHttpBlocking(const std::wstring& url, bool is_post,
         DWORD disable_features = WINHTTP_DISABLE_CACHE;
         WinHttpSetOption(hSession.h, WINHTTP_OPTION_DISABLE_FEATURE,
                          &disable_features, sizeof(disable_features));
+    }
+
+    // Windows 7 的 WinHTTP 默认只开 TLS 1.0，而现在的音源 / 视频源几乎全是
+    // HTTPS + TLS 1.2：不显式开启会全部握手失败（表现为「能启动但拉不到任何
+    // 数据」）。Win8+ 上这个设置同样无害。TLS 1.3 标志在 Win7 的头里不一定
+    // 可用，故先尝试 1.2+1.3，失败退回纯 TLS 1.2；绝不降级到 1.0/1.1。
+    if (parts.scheme == L"https") {
+        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+        protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        if (!WinHttpSetOption(hSession.h, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                              &protocols, sizeof(protocols))) {
+            protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+            WinHttpSetOption(hSession.h, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                             &protocols, sizeof(protocols));
+        }
+#else
+        WinHttpSetOption(hSession.h, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                         &protocols, sizeof(protocols));
+#endif
     }
 
     if (!cfg.proxy.empty()) {
@@ -886,6 +1025,33 @@ JSValue CreateFetchGlobal(JSContext* ctx) {
     return JS_NewCFunction(ctx, &FetchCall, "fetch", 2);
 }
 
+// ---------------------------------------------------------------------------
+// 优雅退出门控
+// ---------------------------------------------------------------------------
+
+void BeginMusicFreeNetworkShutdown() noexcept {
+    g_net_shutdown.store(true, std::memory_order_relaxed);
+}
+
+void WaitMusicFreeNetworkDrain(std::chrono::milliseconds timeout) noexcept {
+    if (g_inflight.load(std::memory_order_relaxed) == 0) return;
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(g_inflight_mtx);
+    while (g_inflight.load(std::memory_order_relaxed) > 0) {
+        // 在飞请求各自持有独立的 WinHTTP 会话句柄，会自行完成并关闭，
+        // 这里只等新请求结束、计数归零；超时则放弃，交由进程退出兜底。
+        if (g_inflight_cv.wait_for(lock, std::chrono::milliseconds(50),
+                                   [] { return g_inflight.load() == 0; }))
+            break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+}
+
+void MusicFreeNetworkShutdown(std::chrono::milliseconds timeout) noexcept {
+    BeginMusicFreeNetworkShutdown();
+    WaitMusicFreeNetworkDrain(timeout);
+}
+
 HttpExchange PerformHttpRequest(
     const std::string& url, const std::string& method,
     const std::map<std::string, std::string>& headers,
@@ -901,9 +1067,10 @@ HttpExchange PerformHttpRequest(
     return out;
 }
 
-std::string DownloadText(const std::string& url, const NetworkConfig& cfg) {
+std::string DownloadText(const std::string& url, const NetworkConfig& cfg,
+                         const std::map<std::string, std::string>& headers) {
     std::wstring wurl = ToWide(url);
-    HttpResponse r = WinHttpBlocking(wurl, false, {}, {}, cfg);
+    HttpResponse r = WinHttpBlocking(wurl, false, {}, headers, cfg);
     if (r.status < 200 || r.status >= 300)
         throw std::runtime_error("下载失败，HTTP " + std::to_string(r.status));
     return std::string(r.body.begin(), r.body.end());

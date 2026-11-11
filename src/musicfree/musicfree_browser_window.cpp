@@ -17,7 +17,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
@@ -44,8 +47,58 @@
 #include "ttplayer/musicfree/musicfree_theme.h"
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/skin/skin_frame.h"
+#include "ttplayer/video/video_source_manager.h"
+#include "ttplayer/video/video_source_dialog.h"
+#include "ttplayer/video/video_cms.h"
+#include "ttplayer/video/video_player_window.h"
+
+// WebView2 页面宿主 / C++↔页面桥 / 页面资产 / 三域命令注册入口（音乐窗 WebView2 化）。
+// 这些头与本文件同在 src/musicfree/：带 "musicfree/" 前缀的写法要求 CMake 把
+// src 加进头文件搜索路径（ttplayer_core 当前没加），用 __has_include 两种写法
+// 都接受，避免统一编译时找不到头文件。
+#if __has_include("musicfree/musicfree_webview_host.h")
+#include "musicfree/musicfree_webview_host.h"
+#include "musicfree/musicfree_bridge.h"
+#include "musicfree/webui_assets.h"
+#include "musicfree/bridge_cmds_music.h"
+#include "musicfree/bridge_cmds_video.h"
+#include "musicfree/bridge_cmds_misc.h"
+#else
+#include "musicfree_webview_host.h"
+#include "musicfree_bridge.h"
+#include "webui_assets.h"
+#include "bridge_cmds_music.h"
+#include "bridge_cmds_video.h"
+#include "bridge_cmds_misc.h"
+#endif
+// 与上面两种 include 写法无关：两个分支都要用运行时选择 / 自动安装。
+#include "ttplayer/musicfree/webview2_runtime.h"
 
 #include <set>
+
+// ---- 影视仓式外壳：顶部分类导航行 + 图标功能栏（仅视频页显示）-----------
+struct VideoNavTab {
+    RECT rect;
+    int cat_index;   // -1 = 推荐；≥0 = video_agg_categories 下标
+};
+struct VideoIconBtn {
+    RECT rect;
+    int icon_id;     // 见 VideoIconId
+};
+enum class VideoIconId {
+    kHistory = 0, kLive, kSearch, kSetting, kLine,
+    kDrive, kCollect, kPush, kConfig
+};
+// 图标功能栏顺序（与 VideoIconId 一一对应）：历史/直播/搜索/配置/线路/网盘/收藏/推送/设置
+static const wchar_t* kVideoIconLabels[] = {
+    L"历史", L"直播", L"搜索", L"配置", L"线路", L"网盘", L"收藏", L"推送", L"设置"
+};
+// 影视仓式首页分区：一个分类一段海报墙（"热播电影" / "热播剧集" / "动漫" …）。
+struct VideoHomeSection {
+    std::wstring title;  // 分区标题（已加「热播」等前缀）
+    int start = 0;       // 在 state->video_home_items 中的起始下标
+    int count = 0;       // 该分区卡片数
+};
 
 namespace ttplayer::musicfree {
 
@@ -54,6 +107,42 @@ namespace {
 // 调色板与基本图元（填充/描边/圆角框/文字/字体）都在共用主题里，音乐窗与导入窗
 // 共用同一套，免得两处各画一份风格漂移。
 using namespace theme;
+
+struct BrowserState;  // 定义见文件下方
+// 前向声明：视频（影视仓 / TVBox）相关函数（定义在 OnTabChanged 附近）。
+bool IsVideoMode(BrowserState* state);
+bool IsSearchMode(BrowserState* state);
+void SetVideoStatus(BrowserState* state, const std::wstring& text);
+void SetVideoSheetCaption(BrowserState* state, const std::wstring& text);
+void FillVideoList(BrowserState* state);
+void FillDiscoverList(BrowserState* state);
+void DrawDiscoverRowVideo(BrowserState* state, const DRAWITEMSTRUCT& item);
+bool HitVideoCard(BrowserState* state, int* group, int* item);
+// 音乐页海报墙卡片命中（视频页内部转调 HitVideoCard）。
+bool HitDiscoverCard(BrowserState* state, int* group, int* sheet);
+// 分类页签命中与加载（影视仓式页签，定义在 StartLoadVideo 之后）。
+bool HitVideoChip(BrowserState* state, int* group, int* cat_index);
+void StartLoadVideoCategory(BrowserState* state, int group_index,
+                            const ttplayer::video::VideoCategory& cat);
+// 顶部「刷新」按当前页签分派到对应的加载入口（定义在文件下方）。
+void StartLoadDiscover(BrowserState* state, bool force);
+void StartLoadVideo(BrowserState* state, bool force);
+void MaybeRefreshVideoSources(BrowserState* state);
+// 直播源卡片（定义在 StartLoadVideo 下方）：本地数据铺卡 + 点开拉频道表。
+void AddLiveSourceCards(BrowserState* state);
+void StartOpenVideoLive(BrowserState* state, const ttplayer::video::VideoItem& item);
+// 直接播放结果列表里选中的一行（定义在 SetVideoSheetCaption 下方）。
+void PlaySelectedVideoHit(BrowserState* state);
+// 影视仓式外壳用的两个入口（定义见文件后方，先前向声明以便顶部自绘函数调用）。
+void StartLoadAggVideoCategory(BrowserState* state, int cat_index);
+void OpenVideoSourceDialog(BrowserState* state);
+// 影视仓式外壳：视频页顶部分类导航行 + 图标功能栏（自绘 + 点击）
+std::vector<VideoNavTab> LayoutVideoNavTabs(HDC dc, BrowserState* state, const RECT& rc);
+std::vector<VideoIconBtn> LayoutVideoIconBtns(HDC dc, BrowserState* state, const RECT& rc);
+void PaintVideoNavbar(BrowserState* state, HWND control);
+void PaintVideoIconbar(BrowserState* state, HWND control);
+void HandleVideoNavClick(BrowserState* state, HWND control);
+void HandleVideoIconClick(BrowserState* state, HWND control);
 
 constexpr int kIdPlatform = 3001;
 constexpr int kIdQuery = 3002;
@@ -72,6 +161,29 @@ constexpr int kIdTagCombo = 3022;   // 保留控件但隐藏：推荐标签已�
 constexpr int kIdLoadSheets = 3023; // 「刷新」
 constexpr int kIdOpenSheet = 3024;  // 「打开歌单」
 constexpr int kIdTracksCaption = 3025; // 曲目区状态条（选中/加载/成功/失败都可见）
+// 影视仓式外壳：视频页顶部的分类导航行 + 图标功能栏（音乐/搜索页隐藏）
+constexpr int kIdVideoNav = 3040;     // 顶部分类导航行（推荐 + video_agg_categories）
+constexpr int kIdVideoIcons = 3041;   // 图标功能栏（历史/直播/搜索/配置/线路/网盘/收藏/推送/设置）
+
+// 导入路径诊断：设置 TTPLAYER_IMPORT_TRACE=1 时，把「点了导入之后走了哪个分支」
+// 追加写入 %TEMP%\ttplayer_import.log。只在真机上才复现的「点了没反应」问题，
+// 靠它区分「命令没到」「被 busy 挡掉」「对话框创建失败」三种情况。
+void TraceImport(const char* fmt, ...) {
+    static const bool enabled =
+        GetEnvironmentVariableW(L"TTPLAYER_IMPORT_TRACE", nullptr, 0) > 0;
+    if (!enabled) return;
+    wchar_t dir[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, dir)) return;
+    const std::wstring path = std::wstring(dir) + L"ttplayer_import.log";
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"a") != 0 || !file) return;
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(file, fmt, args);
+    va_end(args);
+    std::fputc('\n', file);
+    std::fclose(file);
+}
 
 // 发现页卡片网格：自绘 ListBox 的一行里放若干张竖向封面卡片。
 constexpr int kCardWidth = 168;
@@ -85,11 +197,48 @@ constexpr int kGroupRowHeight = 30;
 constexpr int kSheetRowHeight = 60;  // WM_MEASUREITEM 兜底
 constexpr int kSheetThumb = 48;
 
+// 视频页海报卡（影视仓风格）：竖版 2:3 海报 + 深色底。与音乐页共用 sheet_list
+// 自绘管线，但卡片度量独立一套 —— 海报比方形封面高得多，行高 / 列宽分开算。
+constexpr int kVideoCardWidth = 152;
+constexpr int kVideoRowHeight = 244;  // 3(边距)+4+196(海报)+4+18(标题)+2+14(备注)+3
+constexpr int kVideoPosterH = 196;    // 海报高；宽 = kVideoCardWidth - 20 = 132，≈2:3
+
+// ---- 视频页配色（影视仓风格深色）--------------------------------------
+// 放在文件头部：sheet_list 的自绘底色（WM_PAINT，行 ~1900）也要用。
+constexpr COLORREF kVideoPageBg   = RGB(15, 17, 23);   // 页面底
+constexpr COLORREF kVideoCardBg   = RGB(30, 35, 46);   // 海报占位底
+constexpr COLORREF kVideoCardLine = RGB(52, 60, 76);   // 卡片描边
+constexpr COLORREF kVideoSelLine  = RGB(56, 162, 194); // 选中描边（主色）
+constexpr COLORREF kVideoTitleTx  = RGB(232, 238, 244);
+constexpr COLORREF kVideoSubTx    = RGB(140, 152, 168);
+constexpr COLORREF kVideoChipBg   = RGB(36, 42, 56);   // 分类页签底
+constexpr COLORREF kVideoChipLine = RGB(64, 74, 94);
+
+// 影视仓式外壳条高度（视频页顶部：分类导航行 + 图标功能栏），音乐/搜索页不占。
+constexpr int kVideoNavH = 30;   // 顶部分类导航行高
+constexpr int kVideoIconH = 48;  // 图标功能栏高（图标方块 + 标签）
+
 constexpr UINT kMsgSheetsReady = WM_APP + 0x514;       // 发现页：单个音源的一批内容到达
 constexpr UINT kMsgSheetTracksReady = WM_APP + 0x515;  // 歌单详情曲目加载完成
 constexpr UINT kMsgArtworkReady = WM_APP + 0x516;      // 封面解码完成（触发重绘）
 constexpr UINT kMsgDiscoverStart = WM_APP + 0x517;     // 窗口显示后再启动异步加载
 constexpr UINT kMsgSourcesReady = WM_APP + 0x518;      // 后台插件挂载完成（只刷搜索下拉框）
+
+// 视频（影视仓 / TVBox）相关消息：首页聚合 / 详情选集 / 搜索结果。
+constexpr UINT kMsgVideoHomeReady = WM_APP + 0x520;    // 单个视频站点的首页卡片到达
+constexpr UINT kMsgVideoDetailReady = WM_APP + 0x521;  // 视频详情选集加载完成
+constexpr UINT kMsgVideoSearchReady = WM_APP + 0x522;  // 视频搜索结果到达
+constexpr UINT kMsgVideoStart = WM_APP + 0x523;        // 窗口显示后再启动视频异步加载
+constexpr UINT kMsgVideoSourcesRefreshed = WM_APP + 0x524;  // 后台自动更新已写入新配置
+constexpr UINT kMsgWebView2Installed = WM_APP + 0x526;     // WebView2 运行库后台装好，重试创建页面
+
+// 封面补抓：下载失败（停在彩色骨架）的封面按 3 秒节流统一重发，每个 url 限 2 次。
+constexpr int kVideoArtMaxRetries = 2;
+// 海报到位后的重绘合并：多张图在 250ms 窗口内只触发一次全网格重绘。
+// （16 并发下载时每秒可达 10+ 张完成，逐张 InvalidateRect 会让海报墙
+// 以每秒十几次的频率全量重绘——肉眼看到的就是「疯狂闪烁」。）
+constexpr UINT_PTR kArtworkRepaintTimerId = 1;
+constexpr UINT kMsgVideoPendingCat = WM_APP + 0x525;       // 加载中排队的分类切换
 
 // 发现页内容缓存：窗口每次重建都会重新跑一遍「等挂载 + 逐音源联网」，实测
 // 首批真实卡片要 14s。把聚合结果（含 raw）落到磁盘，缓存有效期内开窗直接渲染，
@@ -98,8 +247,9 @@ constexpr const wchar_t* kDiscoverCacheName = L"discover_cache.json";
 constexpr std::int64_t kDiscoverCacheTtlSeconds = 12 * 3600;  // 12 小时
 constexpr std::uintmax_t kDiscoverCacheMaxBytes = 8 * 1024 * 1024;
 
-// 只有两个页签：0=发现（所有音源的榜单/推荐同页展示），1=搜索（原有搜索功能）。
-enum class BrowserMode { kDiscover, kSearch };
+// 三个页签：0=音乐（原「发现」，所有音源的榜单/推荐同页展示），1=视频（影视仓/
+// TVBox 源），2=搜索（原有搜索功能）。
+enum class BrowserMode { kMusic, kVideo, kSearch };
 
 // 结果列表右键菜单的命令号（TrackPopupMenu 返回值，不是窗口命令）。
 constexpr int kMenuPlay = 4001;
@@ -117,6 +267,10 @@ constexpr UINT kMsgDownloadDone = WM_APP + 0x513;
 // 皮肤包没有 <browser_window> 时使用的兜底窗口尺寸。
 constexpr int kFallbackWidth = 720;
 constexpr int kFallbackHeight = 462;
+
+// 外框内容区四周的内缩量。皮肤形态下只用来决定标题栏按钮簇贴左时留多少边距，
+// 兜底形态下同时是内容区的内缩量，两边保持一致视觉才对得上。
+constexpr int kFramePad = 10;
 
 // 窗口缩放：可抓取的边框厚度，以及最小尺寸的上下限。
 //
@@ -157,8 +311,8 @@ enum FrameHit {
 };
 
 // 框体自绘部分的位置（当前客户区坐标）。皮肤有效时由 frame::Map 把
-// <browser_window> 的位图坐标换算过来（窗口缩放后按钮右锚定、底部行下锚定），
-// 否则按兜底尺寸推算。
+// <browser_window> 的位图坐标换算过来，再把标题栏按钮簇贴左修正（按钮左对齐、
+// 底部行下锚定）；否则按兜底尺寸推算。
 struct FrameLayout {
     bool skinned{};
     RECT content{};
@@ -207,7 +361,7 @@ struct BrowserState {
     BrowserWindowHost host;
     // 发现页（默认）：同一页面按音源分组展示所有可用榜单 / 推荐卡片；
     // 搜索页保留原有搜索功能。两者只是同一批子控件的不同显隐。
-    BrowserMode mode{BrowserMode::kDiscover};
+    BrowserMode mode{BrowserMode::kMusic};
     HWND tab{};
     HWND sheet_list{};      // 发现页卡片网格（owner-draw variable，行内多张卡片）
     HWND tag_combo{};       // 保留但隐藏
@@ -223,10 +377,12 @@ struct BrowserState {
         int group = -1;
         int first = 0;         // 该行第一张卡片在 group.sheets 中的下标
         int count = 0;         // 该行卡片数
+        int section_idx = -1;  // 影视仓式分区标题行：video_home_sections 下标
     };
     std::vector<DiscoverGroup> groups;       // 无数据 / 异常音源不入列
     std::vector<DiscoverRow> discover_rows;  // groups 展开后的绘制行
     int discover_cols = 4;                   // 每行卡片数（随窗口宽度重算）
+    int discover_cols_applied = 0;           // 上次铺行时的列数（变了才重建行）
     int selected_group = -1;
     int selected_sheet = -1;
     // 发现页曲目区是否已展开：首次进入只显示封面卡片，点开歌单后才让出下方
@@ -246,6 +402,83 @@ struct BrowserState {
 
     std::set<std::string> art_requested;   // 已发起封面请求的 url，避免重复
     std::unique_ptr<ArtworkCache> artwork; // 封面异步下载/缓存/解码
+
+    // ---- 视频（影视仓 / TVBox）状态：与发现页完全平行的一套 ----
+    // 视频站点 = 分组、视频条目 = 卡片、选集 = 曲目，复用同一套卡片网格与列表。
+    std::unique_ptr<ttplayer::video::VideoSourceManager> video_mgr;
+    struct VideoGroup {
+        std::string site_key;
+        std::string site_name;
+        std::vector<ttplayer::video::VideoItem> items;
+        // CMS 分类（影视仓式页签）：首页响应的 class 数组；点页签 → FetchCategory。
+        std::vector<ttplayer::video::VideoCategory> categories;
+        std::string active_category;       // 空 = 首页推荐（「全部」）
+        std::wstring active_category_name;
+        bool category_loading = false;
+    };
+    std::vector<VideoGroup> video_groups;       // [0] = 聚合推荐组，其余 = 直播组
+    // 影视仓式首页分区视图：「推荐」页签下，把聚合流按分类名切成多个分区
+    // （热播电影 / 热播剧集 / 动漫 …），每个分区一段海报墙。与 video_groups[0]
+    // 同源（都是聚合流），只是换了一种呈现方式。
+    std::vector<ttplayer::video::VideoItem> video_home_items;  // 分区顺序铺平后的卡片
+    std::vector<VideoHomeSection> video_home_sections;         // 分区标题 + 起止
+    bool video_in_sections = false;                           // 当前是否处于分区视图
+    // 影视仓式聚合推荐：所有 CMS 站点的影片**合并去重、按源轮询交错**成一条
+    // 统一推荐流（video_groups[0].items），不再「每个源一段」。每站原始批次
+    // 留在 agg_batches，批次渐进到达时增量重排；分类切换结果放 cat_batches
+    // （非空时优先于 home 批次参与混排，「推荐」页签清空它即可秒回首页）。
+    struct VideoAggBatch {
+        std::string site_key;
+        std::string site_name;
+        std::vector<ttplayer::video::VideoItem> items;
+    };
+    // 跨站点同名分类合并（影视仓分类页签的聚合版）：一部「电影」在 4 个源里
+    // 是 4 个不同的 class id，点页签时要对每个源各取各的 id。
+    struct VideoAggCategory {
+        std::string name;
+        std::string norm_name;   // 归一化名（去首尾空白 + 小写），仅用于跨源去重
+        std::vector<std::pair<std::string, std::string>> per_site;  // (site_key, cat_id)
+    };
+    std::vector<VideoAggBatch> video_agg_batches;       // 首页各站点原始批次
+    std::vector<VideoAggBatch> video_cat_batches;       // 分类切换后各站点批次
+    std::vector<VideoAggCategory> video_agg_categories; // 聚合分类页签（跨站合并）
+    int video_active_cat = -1;                          // 当前选中页签（-1 = 推荐）
+    int video_cat_expected = 0;                         // 分类聚合还没回来的站点数
+    std::vector<DiscoverRow> video_rows;        // 复用 DiscoverRow（header + first/count）
+    int video_cols = 4;
+    int video_cols_applied = 0;                 // 上次铺行时的列数（变了才重建行）
+    std::map<std::string, int> video_art_retries;   // 封面补抓次数（url → 已重试次数）
+    std::int64_t video_art_retry_at = 0;            // 上次补抓时间（3 秒节流）
+    bool artwork_dirty{false};                      // 有新海报待上屏（250ms 合并重绘）
+    int selected_video_group = -1;
+    int selected_video_item = -1;
+    std::vector<OnlineSearchHit> video_hits;    // 选集（剧集）作为曲目
+    std::wstring video_status;
+    std::wstring video_caption;
+    bool video_tracks_visible = false;
+    std::atomic<bool> video_busy{false};        // 首页 / 搜索等聚合任务
+    // 加载期间用户点过的分类：-2 表示无排队，-1 推荐，>=0 分类索引。
+    // 以前 busy 时直接静默 return，用户会觉得「所有分类都点不动」。
+    std::atomic<int> video_pending_cat{-2};
+    std::atomic<bool> video_detail_busy{false}; // 详情选集加载
+    bool video_loaded = false;
+    bool video_placeholder = false;
+    // 占位卡片上的提示文字：加载中是「正在准备…」，一个源都没有时改成引导用户
+    // 点「导入…」—— 否则空窗口挂着四张「正在准备…」会让人一直等下去。
+    std::wstring video_placeholder_text = L"正在准备…";
+    bool video_sources_ready = false;
+    // 最近一次导入的结果。首页重新聚合完成后状态行会被「已加载 N 个视频源」
+    // 覆盖，导入失败的信息就看不见了；这里存一份，加载完成时优先显示它。
+    std::wstring video_import_note;
+    // 影视仓式外壳：视频页顶部的分类导航行 + 图标功能栏（音乐/搜索页隐藏）。
+    HWND video_navbar = nullptr;
+    HWND video_iconbar = nullptr;
+    int hot_video_icon = -1;   // 图标功能栏的悬停高亮下标（-1 = 无）
+    // 在「视频源」对话框里导入 / 删除源时，首页可能正在后台聚合（站点表是启动
+    // 那一刻的快照）。这里挂个标志，等当前那轮结束再按新表重载，避免两个聚合
+    // 线程同时往 video_groups 里写。
+    bool video_reload_pending = false;
+    std::set<std::string> video_art_requested;
 
     // 返回 true 表示播放器已接受该请求（已入列/已开始播放）。
     std::function<bool(OnlineTrackAction, const OnlineSearchHit&,
@@ -288,7 +521,16 @@ struct BrowserState {
     HFONT link_font{};
     LOGFONTW link_logfont{};
     HBRUSH panel_brush{};
+    HBRUSH video_panel_brush{};  // 视频页深色底（海报墙区域露白时用它）
     std::vector<std::unique_ptr<ChildProbe>> probes;
+
+    // ---- WebView2 页面宿主（音乐窗 WebView2 化 Task 3.2）----
+    // 只有创建成功才非空；创建失败置 webview_failed 熔断（不再反复尝试），
+    // 旧 Win32 控件只隐藏不删除，随时可回退（TTPLAYER_NO_WEBVIEW 强制回退）。
+    std::unique_ptr<ttplayer::musicfree::WebviewHost> webview;     // 页面宿主
+    std::unique_ptr<ttplayer::musicfree::MusicFreeBridge> bridge;  // C++↔页面桥
+    bool webview_failed = false;   // 一旦失败就不再反复尝试创建
+    std::string page_tab;          // 页面 tab.switch 记录的当前页签（后续任务接渲染）
 };
 
 // 搜索线程 → UI 线程的结果负载（含每音源的诊断信息）。
@@ -318,12 +560,40 @@ struct DownloadPayload {
     bool ok{};
 };
 
+// 视频：首页聚合的每站一批内容 / 完成信号。
+struct VideoHomePayload {
+    std::string site_key;
+    std::string site_name;
+    std::vector<ttplayer::video::VideoItem> items;
+    // 首页响应携带的 CMS 分类表（影视仓式页签）。
+    std::vector<ttplayer::video::VideoCategory> categories;
+    // true：分类页签切换的结果，按 site_key 找到已有组替换 items（不再新增组）。
+    bool category_load = false;
+    std::string error;
+    bool finished = false;
+    int total = 0;
+};
+// 视频：详情选集加载结果。
+struct VideoDetailPayload {
+    std::string title;
+    std::string site_name;
+    std::string play_url;   // 站点 play_url 前缀，用于补全选集地址
+    std::vector<ttplayer::video::VideoLine> lines;
+    std::string error;
+    bool live = false;      // 直播源：lines[0] 里装的是频道而不是选集
+};
+// 视频：搜索结果（直接进卡片网格，点击再开详情）。
+struct VideoSearchPayload {
+    std::vector<ttplayer::video::VideoItem> items;
+    int sites_total = 0;
+    int sites_ok = 0;
+    std::string error;
+};
+
 std::shared_ptr<BrowserState> g_browser;
 
-// 所有插件调用（搜索 / 解析 / 发现页加载）串行化：每个 MusicFree 插件持有
-// 独立的 QuickJS runtime，不能同时被两个线程重入。按「一次插件调用」粒度持锁，
-// 发现页逐音源加载时搜索线程仍有机会插队，不会整段被卡住。
-std::mutex g_plugin_io;
+// （g_plugin_io 已移出本匿名命名空间 —— 见文件下方 } // namespace 之后的
+//  「跨编译单元导出符号」区，声明在 musicfree_browser_window.h。）
 
 // ------------------------------------------------ 发现页内容缓存（进程内 + 磁盘）
 //
@@ -482,6 +752,8 @@ void WatchSourcesReady(BrowserState* state) {
     if (!state) return;
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         try { WaitForMusicFreeSources(); } catch (...) {}
         if (auto sp = weak.lock())
             PostMessageW(sp->hwnd, kMsgSourcesReady, 0, 0);
@@ -528,8 +800,10 @@ void SetStatus(BrowserState* state, const std::wstring& text) {
 // LayoutChildren 与 SetBusyUi 都走这里，避免任务结束后把隐藏列表的按钮又点亮。
 void SyncTrackActionButtons(BrowserState* state, bool busy) {
     if (!state) return;
+    const bool tracks_on =
+        IsVideoMode(state) ? state->video_tracks_visible : state->tracks_visible;
     const BOOL enabled =
-        (!busy && (state->mode == BrowserMode::kSearch || state->tracks_visible))
+        (!busy && (state->mode == BrowserMode::kSearch || tracks_on))
             ? TRUE : FALSE;
     if (state->play_button) EnableWindow(state->play_button, enabled);
     if (state->enqueue_button) EnableWindow(state->enqueue_button, enabled);
@@ -538,16 +812,19 @@ void SyncTrackActionButtons(BrowserState* state, bool busy) {
 
 constexpr wchar_t kSheetHint[] =
     L"点击任意封面卡片即可查看曲目（展开后显示歌曲列表）";
+constexpr wchar_t kVideoHint[] =
+    L"点击卡片查看剧集，双击条目开始播放（视频窗口外框与音乐窗一致）";
 
 // 未展开曲目区时，状态条固定显示引导文字。只有文本变化才写控件，避免
 // WM_SIZE 反复触发无谓的 STATIC 重绘。
 void EnsureSheetHint(BrowserState* state) {
     if (!state || !state->tracks_caption) return;
-    wchar_t buf[128]{};
-    GetWindowTextW(state->tracks_caption, buf, 128);
-    if (std::wstring(buf) != kSheetHint) {
-        state->discover_caption = kSheetHint;
-        SetWindowTextW(state->tracks_caption, kSheetHint);
+    const wchar_t* hint = !IsVideoMode(state) ? kSheetHint : kVideoHint;
+    wchar_t buf[256]{};
+    GetWindowTextW(state->tracks_caption, buf, 256);
+    if (std::wstring(buf) != hint) {
+        state->discover_caption = hint;
+        SetWindowTextW(state->tracks_caption, hint);
     }
 }
 
@@ -577,8 +854,6 @@ void SetBusyUi(BrowserState* state, bool busy) {
     if (state->search_button) EnableWindow(state->search_button, !busy);
     SyncTrackActionButtons(state, busy);
     if (state->import_button) EnableWindow(state->import_button, !busy);
-    if (state->load_sheets_button) EnableWindow(state->load_sheets_button, !busy);
-    if (state->open_sheet_button) EnableWindow(state->open_sheet_button, !busy);
     InvalidateFrame(state);
 }
 
@@ -690,6 +965,34 @@ FrameLayout BuildFrameLayout(const RECT& client,
         layout.prev_source = layout.skin.backward;
         layout.next_source = layout.skin.forward;
         layout.refresh = layout.skin.refresh;
+        // 皮肤里的标题栏按钮原本是**右锚定**的（frame::Map 会按窗口加宽量整体
+        // 右移）。窗口被钉在 720px 而位图更窄时，整簇就停在标题栏中间，左边空出
+        // 一大块，鼠标要走很远才点得到 —— 用户反馈「按钮挪到前面去」。
+        // 这里把三连按钮（◀ ▶ 重新搜索）整体平移到标题栏最左侧，**保持皮肤里
+        // 原有的相对间距与按钮尺寸**，只改 X；✕ 仍留在右上角。
+        // ⚠ 不要把三连按钮平移到标题栏最左侧：皮肤位图在 x≈12..100、
+        // y≈5..26 画着「千千音乐窗」标题文字，按钮压过去会把整行字切得只剩
+        // 第一个字的一角，左上角看起来就是一块青色残片（用户反馈的皮肤问题）。
+        //
+        // 现在窗口允许拉宽（见 WM_GETMINMAXINFO / ResizeHitCode）。frame::Map 会把
+        // 标题栏按钮右锚定（X += grow_x），拉宽后整簇会跑到标题栏中间；
+        // 但也不能像旧逻辑那样把它平移到最左 —— 那会切碎「千千音乐窗」文字。
+        // 正确做法：直接减掉 grow_x，取消右锚定，让按钮恒停在皮肤设计位 x≈106
+        // （文字右侧）。✕ 仍保持右锚定贴右上角。
+        {
+            const int natural_width = layout.skin.natural.cx > 0
+                ? layout.skin.natural.cx : (client.right - client.left);
+            const int grow_x = (client.right - client.left) - natural_width;
+            if (grow_x > 0) {
+                RECT* cluster[3] = {&layout.prev_source, &layout.next_source,
+                                    &layout.refresh};
+                for (RECT* rect : cluster) {
+                    if (rect->right <= rect->left) continue;
+                    rect->left -= grow_x;
+                    rect->right -= grow_x;
+                }
+            }
+        }
         layout.check_box = layout.skin.check_box;
         layout.check_label = layout.skin.check_label;
         layout.link_text = layout.skin.link;
@@ -699,9 +1002,9 @@ FrameLayout BuildFrameLayout(const RECT& client,
 
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
-    const int pad = 10;
-    // 标题栏 / 内容面板 / 页脚三段，以及右对齐的导航簇（音源 ◀ ▶ 重新搜索 ✕）。
-    // 标题文字区域由 BuildFrameChrome 裁到导航簇左侧，不会和按钮重叠。
+    const int pad = kFramePad;
+    // 标题栏 / 内容面板 / 页脚三段，以及**左对齐**的导航簇（音源 ◀ ▶ 重新搜索）。
+    // ✕ 仍贴右上角。标题文字跟在导航簇后面，由 BuildFrameChrome 裁好，不会重叠。
     layout.chrome = theme::BuildFrameChrome(client, pad, 30, 30);
     layout.content = layout.chrome.content;
     layout.close = layout.chrome.close;
@@ -733,6 +1036,38 @@ void SizeResultColumns(BrowserState* state) {
                             std::max(38, available - used));
 }
 
+// WebView2 页面接管视觉后，把旧 Win32 子控件整批隐藏（只藏不删，回退路径完整
+// 保留：TTPLAYER_NO_WEBVIEW 或宿主创建失败时本函数不会被调用，旧渲染原样可用）。
+//
+// 隐藏范围 = 内容区 + 顶栏页签 + 底部控制条 + 搜索工具栏：页面已提供同等的
+// 三个页签与播放控制条，Win32 侧只留皮肤边框、标题栏自绘按钮与窗口本身。
+// load_sheets/open_sheet 两个旧按钮已不再创建（句柄恒空，判空即过）。
+void HideLegacyContentControls(BrowserState* state, bool hide) {
+    if (!state) return;
+    const int show = hide ? SW_HIDE : SW_SHOW;
+    HWND* controls[] = {
+        &state->tab,                // 顶栏页签（音乐 / 视频 / 搜索）
+        &state->sheet_list,         // 卡片网格（LBS_OWNERDRAWVARIABLE 自绘）
+        &state->list,               // 曲目 / 搜索结果列表（LVS_OWNERDRAWFIXED）
+        &state->tracks_caption,     // 曲目区状态条
+        &state->status,             // 底部状态行
+        &state->platform,           // 搜索页音源下拉
+        &state->query,              // 搜索输入框
+        &state->search_button,      // 「搜索」按钮（BS_OWNERDRAW）
+        &state->import_button,      // 「导入…」按钮（BS_OWNERDRAW）
+        &state->play_button,        // ┐
+        &state->enqueue_button,     // ├ 底部控制条（页面提供同等控件）
+        &state->download_button,    // ┘
+        &state->tag_combo,          // 保留但常隐的标签下拉
+        &state->load_sheets_button, // 旧「刷新」按钮（现句柄恒空）
+        &state->open_sheet_button,  // 旧「打开歌单」按钮（现句柄恒空）
+        &state->video_navbar,       // 视频页顶部分类导航行（自绘 STATIC）
+        &state->video_iconbar,      // 视频页图标功能栏（自绘 STATIC）
+    };
+    for (HWND* control : controls)
+        if (*control) ShowWindow(*control, show);
+}
+
 void LayoutChildren(BrowserState* state) {
     if (!state || !state->hwnd) return;
     RECT client{};
@@ -762,9 +1097,42 @@ void LayoutChildren(BrowserState* state) {
 
     const bool search = state->mode == BrowserMode::kSearch;
     // 卡片列数随宽度变化（窗口宽度被主窗口钉死，通常是 4 列）。
-    state->discover_cols = std::max(2, std::min(6, static_cast<int>(width) / kCardWidth));
+    // 视频页海报卡更窄，同行能多放一张；行高也按模式各用一套。
+    const int card_w = IsVideoMode(state) ? kVideoCardWidth : kCardWidth;
+    const int card_h = IsVideoMode(state) ? kVideoRowHeight : kCardRowHeight;
+    // 影视仓式海报墙的列数随窗口宽度增加（宽屏右侧不再留大片空白），
+    // 仍设上限防止超宽窗口把卡片行拉得过长。
+    const int cols_max = IsVideoMode(state) ? 8 : 8;
+    const int cols = std::max(2, std::min(cols_max, static_cast<int>(width) / card_w));
+    if (IsVideoMode(state)) state->video_cols = cols;
+    else state->discover_cols = cols;
+    // 列数跨越阈值时重建绘制行：否则拖宽后仍按旧列数拆行，卡片布局不跟随
+    // 窗口缩放（用户反馈「缩放时内容也要跟随显示」）。只在跨越阈值的那一帧
+    // 重建（低频），拖动中同列数的其余帧零开销。
+    if (IsVideoMode(state)) {
+        if (state->video_cols_applied != cols) {
+            state->video_cols_applied = cols;
+            if (state->sheet_list && !state->video_rows.empty())
+                FillVideoList(state);
+        }
+    } else {
+        if (state->discover_cols_applied != cols) {
+            state->discover_cols_applied = cols;
+            if (state->sheet_list && !state->discover_rows.empty())
+                FillDiscoverList(state);
+        }
+    }
+
+    // 状态行统一收到底部：紧贴「下载」按钮右侧，单行、垂直居中，把顶部那一行
+    // 让给内容区（原来顶部有一整行 刷新 / 打开歌单 按钮，纯浪费高度）。
+    const LONG download_right = inner_left + 212 + 70;  // 下载按钮右沿
+    const LONG status_left = download_right + 10;
+    const int status_y = buttons_y + (kButtonHeight - 16) / 2;
 
     if (search) {
+        // 搜索页不显示影视仓外壳条。
+        if (state->video_navbar) ShowWindow(state->video_navbar, SW_HIDE);
+        if (state->video_iconbar) ShowWindow(state->video_iconbar, SW_HIDE);
         const ToolbarLayout toolbar = BuildToolbarLayout(sub);
         MoveWindow(state->platform, toolbar.combo.left, toolbar.combo.top,
                    toolbar.combo.right - toolbar.combo.left, 240, TRUE);
@@ -772,13 +1140,20 @@ void LayoutChildren(BrowserState* state) {
                    toolbar.import.right - toolbar.import.left, kButtonHeight, TRUE);
         MoveWindow(state->search_button, toolbar.search.left, toolbar.search.top,
                    toolbar.search.right - toolbar.search.left, kButtonHeight, TRUE);
+        // 可见性由布局统一决定：先定位再显示，杜绝「停在占位位置」的残影。
+        ShowWindow(state->search_button, SW_SHOW);
         // 输入框缩进一像素，让框体自绘的那圈描边露出来（代替系统的凹陷边）。
         MoveWindow(state->query, toolbar.query.left + 1, toolbar.query.top + 1,
                    std::max<LONG>(40, toolbar.query.right - toolbar.query.left - 2),
                    kButtonHeight - 2, TRUE);
-        const int status_y = top + kButtonHeight + 3;
-        MoveWindow(state->status, inner_left, status_y, width, 16, TRUE);
-        const int list_top = status_y + 20;
+        // 音乐/视频页会把输入框藏起来（那里没有地址栏），回到搜索页要显式显示，
+        // 否则搜索框会一直不出现。
+        ShowWindow(state->query, SW_SHOW);
+        ShowWindow(state->status, SW_SHOW);
+        // 状态行放到底部「下载」右侧；列表从工具栏下方直接开始，纵向多一行结果。
+        MoveWindow(state->status, status_left, status_y,
+                   std::max<LONG>(120, inner_right - status_left), 16, TRUE);
+        const int list_top = top + kButtonHeight + 6;
         const int list_bottom = std::max(list_top + 40, buttons_y - 8);
         MoveWindow(state->list, inner_left, list_top, width,
                    list_bottom - list_top, TRUE);
@@ -786,21 +1161,47 @@ void LayoutChildren(BrowserState* state) {
         ShowWindow(state->tracks_caption, SW_HIDE);
         SizeResultColumns(state);
     } else {
-        // 发现页：所有音源的分组卡片在上、选中歌单的曲目在下，同一个页面里
-        // 既能浏览封面也能直接播放，不需要在音源之间来回切换。
-        MoveWindow(state->load_sheets_button, inner_left, top, 70, kButtonHeight, TRUE);
-        MoveWindow(state->open_sheet_button, inner_left + 76, top, 92,
+        // 发现 / 视频页：取消顶部按钮行（刷新改用标题栏的刷新按钮，单击卡片即可
+        // 打开歌单/视频），导入按钮放到底部最右，状态行夹在「下载」与「导入」之间。
+        // 卡片网格直接从内容区顶部开始，纵向比原来多出一整行按钮的高度。
+        MoveWindow(state->import_button, inner_right - 58, buttons_y, 58,
                    kButtonHeight, TRUE);
-        MoveWindow(state->import_button, inner_right - 58, top, 58,
-                   kButtonHeight, TRUE);
-        const int status_y = top + kButtonHeight + 3;
-        MoveWindow(state->status, inner_left, status_y, width, 16, TRUE);
-        const int list_top = status_y + 20;
-        const int list_bottom = std::max(list_top + 60, buttons_y - 8);
-        // 首次进入尚未点开任何榜单时，曲目列表整块隐藏，卡片网格一直铺到
-        // 状态条上沿；点开歌单后再让出 tracks_h 给曲目列表。显隐统一由这里
-        // 决定，窗口缩放 / 切页 / 后台刷新都不会残留错误布局。
-        const bool expanded = state->tracks_visible;
+        const LONG status_right =
+            std::max<LONG>(status_left + 120, inner_right - 58 - 8);
+        ShowWindow(state->query, SW_HIDE);
+        // 搜索按钮同样要藏：它的 MoveWindow 只写在上面的 search 分支里，
+        // 音乐/视频页没人定位它，会以 10x10 占位尺寸显示在窗口左上角（用户看到的
+        // 「柒」残影）。与输入框保持一致 —— 只有搜索页才有顶部工具栏。
+        ShowWindow(state->search_button, SW_HIDE);
+        ShowWindow(state->status, SW_SHOW);
+        MoveWindow(state->status, status_left, status_y,
+                   status_right - status_left, 16, TRUE);
+
+        // 影视仓式外壳：视频页顶部预留「分类导航行 + 图标功能栏」；音乐页不占。
+        int nav_h = 0, icon_h = 0;
+        if (IsVideoMode(state)) {
+            nav_h = kVideoNavH;
+            icon_h = kVideoIconH;
+            if (state->video_navbar) {
+                MoveWindow(state->video_navbar, inner_left, top + 2, width, nav_h, TRUE);
+                ShowWindow(state->video_navbar, SW_SHOW);
+                InvalidateRect(state->video_navbar, nullptr, FALSE);
+            }
+            if (state->video_iconbar) {
+                MoveWindow(state->video_iconbar, inner_left, top + 2 + nav_h,
+                           width, icon_h, TRUE);
+                ShowWindow(state->video_iconbar, SW_SHOW);
+                InvalidateRect(state->video_iconbar, nullptr, FALSE);
+            }
+        }
+
+        const int list_top = top + 2 + nav_h + icon_h;
+        const int list_bottom = std::max(list_top + 60, buttons_y - 6);
+        // 首次进入尚未点开任何榜单时，曲目列表整块隐藏，卡片网格一直铺到底部
+        // 按钮行；点开歌单后再让出 tracks_h 给曲目列表。显隐统一由这里决定，
+        // 窗口缩放 / 切页 / 后台刷新都不会残留错误布局。
+        const bool expanded = IsVideoMode(state) ? state->video_tracks_visible
+                                                 : state->tracks_visible;
         const int tracks_h = std::min(160, std::max(90, (list_bottom - list_top) / 3));
         int grid_bottom = expanded
             ? std::max(list_top + 80, list_bottom - tracks_h - 6)
@@ -812,12 +1213,18 @@ void LayoutChildren(BrowserState* state) {
         // 高度向下吸附到「分组行 + 若干完整卡片行」。否则窗口边界会正好切在
         // 某一行封面下沿，那一行只剩封面、标题与来源全被裁掉（用户反馈
         // 「封面图文本显示不全」）。省下的高度展开时给曲目列表，未展开时留白。
-        const int full_rows = std::max(1,
-            (grid_h - kGroupRowHeight) / kCardRowHeight);
-        const int snapped_h = kGroupRowHeight + full_rows * kCardRowHeight;
-        if (snapped_h <= grid_h) {
-            grid_h = snapped_h;
-            grid_bottom = list_top + grid_h + caption_h;
+        // ⚠ 视频页例外：影视仓分区视图是「标题行+卡片行」多组连续滚动的内容，
+        // 单组吸附公式会把网格压成「1 组标题 + 1 行卡片」（274px），其余空间
+        // 黑屏（真机实测 rows=19、sheet client=647x274）。滚动内容允许底部
+        // 半截行（影视仓同样如此）；音乐页单组网格继续吸附。
+        if (!IsVideoMode(state)) {
+            const int full_rows = std::max(1,
+                (grid_h - kGroupRowHeight) / card_h);
+            const int snapped_h = kGroupRowHeight + full_rows * card_h;
+            if (snapped_h <= grid_h) {
+                grid_h = snapped_h;
+                grid_bottom = list_top + grid_h + caption_h;
+            }
         }
         MoveWindow(state->sheet_list, inner_left, list_top, width,
                    grid_h, TRUE);
@@ -832,6 +1239,11 @@ void LayoutChildren(BrowserState* state) {
         SizeResultColumns(state);
     }
     SyncTrackActionButtons(state, state->busy.load());
+    // WebView2 接管期间，上面每个分支的 ShowWindow 都会把旧控件重新放出来
+    // （切页 / 缩放 / 展开曲目区全走这里），统一在收尾补一次隐藏；宿主创建
+    // 失败（webview_failed）或运行中报错（Failed）时不藏 —— 旧界面保持显示。
+    if (state->webview && !state->webview_failed && !state->webview->Failed())
+        HideLegacyContentControls(state, true);
 }
 
 void ApplyFrameRegion(BrowserState* state) {
@@ -873,6 +1285,18 @@ SIZE MinFrameSize(const BrowserState* state) {
     return size;
 }
 
+// 视频任务结束：释放 busy 锁，并把加载期间用户点过的分类排到消息循环里执行。
+// 所有 video_busy 的复位都必须走这里 —— 以前散落的 store(false) 中只要漏一处，
+// 分类就会永久卡在「正在加载，请稍候再切换分类」。
+void ReleaseVideoBusy(BrowserState* state) {
+    if (!state) return;
+    state->video_busy = false;   // 故意不用 store()：批量替换时不要命中函数自身
+    const int pending = state->video_pending_cat.exchange(-2);
+    if (pending != -2 && state->hwnd)
+        PostMessageW(state->hwnd, kMsgVideoPendingCat, 0,
+                     static_cast<LPARAM>(pending));
+}
+
 // 换肤 / 缩放后的统一收尾：窗口区域 + 子控件位置 + 重画。
 // reset_size 为 true 时把窗口拉回自然尺寸（只在皮肤变化需要重贴合时用）；
 // 否则保留用户当前的尺寸，只做最小尺寸夹取 —— 音乐窗的宽高因此是「活的」，
@@ -903,7 +1327,15 @@ void ApplyFrameMetrics(BrowserState* state, bool reset_size) {
                             ui::ResolveScaleForWindow(state->hwnd));
     ApplyFrameRegion(state);
     LayoutChildren(state);
-    InvalidateRect(state->hwnd, nullptr, TRUE);
+    // 拖动缩放期间这条每帧都跑：bErase=TRUE 会对每个子控件多安排一次擦底，
+    // 表现为拖动闪烁；主窗自身双缓冲 + WS_EX_COMPOSITED 已覆盖背景，FALSE 足够。
+    InvalidateRect(state->hwnd, nullptr, FALSE);
+
+    // WebView2 内容区跟随重排的统一收口：WM_SIZE / 拖动缩放 / 换肤 / 再次唤出
+    // 都经本函数（BuildFrameLayout 刚刷新过 state->layout）。宿主未就绪或已
+    // 失败时不打扰它；置顶最小化（SIZE_MINIMIZED）根本不会走到这里。
+    if (state->webview && state->webview->Ready())
+        state->webview->Resize(state->layout.content);
 
     state->applying_frame = false;
 }
@@ -917,6 +1349,32 @@ int FrameButtonState(const BrowserState* state, int hit, bool enabled = true) {
     return state->frame_hover == hit ? 1 : 0;
 }
 
+// 拖动下边缩放时把窗口底部吸附到其它 TTPlayer 窗口的底部（容差内对齐），
+// 让音乐窗能与主窗 / 播放列表 / 歌词窗 / 均衡器窗拼成整齐的一列。
+void SnapBrowserBottomEdge(BrowserState* state, RECT& rc) {
+    if (!state || !state->hwnd) return;
+    const wchar_t* classes[] = {L"TTPlayer_PlayerWnd", L"TTPlayer_PlayListWnd",
+                                L"TTPlayer_LyricWnd", L"TTPlayer_EqualizerWnd"};
+    constexpr int kSnapPx = 14;
+    LONG best = 0;
+    LONG best_dist = kSnapPx + 1;
+    for (const wchar_t* cls : classes) {
+        const HWND other = FindWindowW(cls, nullptr);
+        if (!other || other == state->hwnd || !IsWindowVisible(other)) continue;
+        RECT orr{};
+        if (!GetWindowRect(other, &orr)) continue;
+        const LONG dist = orr.bottom - rc.bottom;
+        const LONG ad = dist < 0 ? -dist : dist;
+        if (ad <= kSnapPx && ad < best_dist) {
+            best_dist = ad;
+            best = orr.bottom;
+        }
+    }
+    if (!best) return;
+    const LONG min_height = MinFrameSize(state).cy;
+    if (best - rc.top >= min_height) rc.bottom = best;
+}
+
 void PaintFallbackFrame(BrowserState* state, HDC dc, const RECT& client) {
     (void)client;
     const FrameLayout& layout = state->layout;
@@ -927,7 +1385,12 @@ void PaintFallbackFrame(BrowserState* state, HDC dc, const RECT& client) {
     states.prev_source = FrameButtonState(state, kFrameHitPrevSource);
     states.next_source = FrameButtonState(state, kFrameHitNextSource);
     states.refresh = FrameButtonState(state, kFrameHitRefresh, !state->busy.load());
-    theme::PaintFrameChrome(dc, layout.chrome, L"音乐窗 · MusicFree",
+    // 标题跟着当前页签走：三个页签共用一个窗口，标题写死「音乐窗」在视频页
+    // 会让人以为切错了。
+    const wchar_t* title = state->mode == BrowserMode::kVideo ? L"视频 · 影视仓"
+                          : state->mode == BrowserMode::kSearch ? L"搜索 · MusicFree"
+                          : L"音乐窗 · MusicFree";
+    theme::PaintFrameChrome(dc, layout.chrome, title,
                             state->bold_font, state->ui_font, states);
 }
 
@@ -967,6 +1430,44 @@ void PaintFrame(BrowserState* state, HDC dc) {
         // 变大，所以放大之后的框体和原尺寸下看起来是同一套像素。
         frame::PaintBackground(dc, *browser, state->layout.skin, client);
         const COLORREF transparent = FrameTransparent(state, *browser);
+        // 窗口拉宽后九宫格「顶行中间格」会被横向拉伸，把位图里的
+        // 「千千音乐窗」标题文字拉成变形条。用源位图左上角按 1:1 重画标题区，
+        // 文字保持原像素，右侧渐变继续随窗口拉伸。
+        // ⚠ 重绘宽度必须覆盖三连按钮簇的皮肤设计位（默认皮肤 backward 106、
+        // forward 137、refresh 169..194）：按钮四态贴图是从位图原位抠出来的、
+        // 自带背景；落在 160 之外的按钮（refresh）背景会与拉伸后的渐变对不上
+        // （用户反馈「返回/前进/刷新位置与颜色跟皮肤对不上」）。取簇右边界 +6。
+        {
+            const int natural_w = state->layout.skin.natural.cx;
+            if (natural_w > 0 && (client.right - client.left) > natural_w) {
+                const int cluster_right = std::max(
+                    std::max(browser->backward.bounds.right,
+                             browser->forward.bounds.right),
+                    browser->refresh.bounds.right);
+                const int title_w = std::min(
+                    natural_w, std::max(160, cluster_right + 6));
+                const int title_h = state->layout.skin.resize_rect.top > 0
+                    ? std::min<int>(state->layout.skin.resize_rect.top, 31) : 31;
+                browser->background.image.Draw(
+                    dc, 0, 0, title_w, title_h,
+                    0, 0, title_w, title_h, transparent);
+            }
+        }
+        // ⚠ 这里曾放「盖左上角柒 logo」的代码，两版都失败，根因已查明：
+        //   ① 用 GetPixel 检测青色：内存 DC 上 GetPixel 返回 0，检测恒漏判。
+        //   ② 改用 StretchBlt 从「标题栏右侧列」横向拉伸覆盖：源坐标用的是
+        //      皮肤自然宽度（natural.cx-40），而 dc 是已按窗口缩放后的客户区
+        //      DC，源点取到的是内容区像素 —— 音乐页恰好复制到皮肤色（看不出来），
+        //      视频页复制到别的东西，就在左上角留下一块 10x10 色块（用户看到的
+        //      「柒」）。取样坐标与绘制坐标系不一致，是这两次尝试共同的坑。
+        // 真正的「柒」来源另行定位（见 .workbuddy/memory 日志），此处不再覆盖。
+        {
+            const int natural_w = state->layout.skin.natural.cx;
+            if (natural_w > 0) {
+                // 保留一个空实现锚点，避免后续误加绘制。
+                (void)natural_w;
+            }
+        }
         const bool busy = state->busy.load();
         skin::DrawFrameButton(dc, browser->close, state->layout.close,
                               FrameButtonState(state, kFrameHitClose), transparent);
@@ -979,6 +1480,28 @@ void PaintFrame(BrowserState* state, HDC dc) {
         skin::DrawFrameButton(dc, browser->refresh, state->layout.refresh,
                               FrameButtonState(state, kFrameHitRefresh, !busy),
                               transparent);
+    }
+
+    // 视频页：内容区统一深色底。卡片网格高度吸附后剩下的空间若不填，
+    // 会露出皮肤内容区的浅色位图，看起来像「下半屏什么内容都没有」。
+    if (IsVideoMode(state)) {
+        HBRUSH brush = CreateSolidBrush(kVideoPageBg);
+        FillRect(dc, &state->layout.content, brush);
+        DeleteObject(brush);
+    }
+
+    // WebView2 页面（音乐/视频都走 webui）在控件创建 → 页面首帧之间默认露
+    // **白底**（SDK 没有 DefaultBackgroundColor 接口）。只要页面宿主在用，
+    // 内容区一律先铺深色底 + 「正在加载页面…」字样；WebView 显示后自然会
+    // 盖住这层，用户从头到尾看不到白块。
+    if (state->webview && !state->webview_failed) {
+        HBRUSH brush = CreateSolidBrush(kVideoPageBg);
+        FillRect(dc, &state->layout.content, brush);
+        DeleteObject(brush);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(120, 132, 144));
+        DrawTextW(dc, L"正在加载页面…", -1, &state->layout.content,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     PaintCheckBox(state, dc, browser);
@@ -1207,6 +1730,7 @@ void RefreshPlatformCombo(BrowserState* state) {
 // --------------------------------------------------------------- 后台任务
 
 void StartSearch(BrowserState* state) {
+    if (IsMusicFreeShuttingDown()) return;
     if (!state || !state->mgr) {
         SetStatus(state, L"没有可用的音源管理器");
         return;
@@ -1232,6 +1756,8 @@ void StartSearch(BrowserState* state) {
 
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak, utf8_query, platform, for_search] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         auto* payload = new SearchPayload();
         payload->for_search = for_search;
         std::lock_guard<std::mutex> plugin_lock(g_plugin_io);
@@ -1252,6 +1778,7 @@ void StartSearch(BrowserState* state) {
 }
 
 void StartResolve(BrowserState* state, OnlineTrackAction action) {
+    if (IsMusicFreeShuttingDown()) return;
     if (!state) return;
     const int index = ListView_GetNextItem(state->list, -1, LVNI_SELECTED);
     if (index < 0 || static_cast<size_t>(index) >= state->hits.size()) {
@@ -1270,6 +1797,8 @@ void StartResolve(BrowserState* state, OnlineTrackAction action) {
 
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak, hit, action] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         auto* payload = new ResolvePayload();
         std::lock_guard<std::mutex> plugin_lock(g_plugin_io);
         payload->action = action;
@@ -1343,6 +1872,8 @@ void StartDownload(BrowserState* state) {
 
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak, hit] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         auto* payload = new ResolvePayload();
         std::lock_guard<std::mutex> plugin_lock(g_plugin_io);
         payload->action = OnlineTrackAction::play;  // 此路径只做解析，不使用该字段
@@ -1373,6 +1904,8 @@ void BeginDownloadToFile(BrowserState* state, const OnlineSearchHit& hit,
     const std::wstring target = path;
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak, hit, wide_url, target] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         auto* payload = new DownloadPayload();
         payload->hit = hit;
         payload->path = target;
@@ -1563,8 +2096,27 @@ void InvokeFrameHit(BrowserState* state, int hit) {
         case kFrameHitPrevSource: StepPlatform(state, -1); break;
         case kFrameHitNextSource: StepPlatform(state, 1); break;
         case kFrameHitRefresh:
-            if (state->busy.load()) SetStatus(state, L"正在搜索/解析，请稍候");
-            else StartSearch(state);
+            // WebView2 页面在用时：刷新 = 重新加载页面。reload 完成后宿主的
+            // NavigationCompleted 会重发 bridge.ready，页面握手重新跑 —— 既能
+            // 拉新数据，也能把卡在「正在连接宿主…」的页面拉回来。此前这里
+            // 直接走旧管线函数（StartLoadVideo/StartLoadDiscover），对页面
+            // 完全无效，用户点刷新像没反应。
+            if (state->webview && !state->webview_failed &&
+                state->webview->Ready()) {
+                state->webview->Reload();
+                break;
+            }
+            // 宿主未就绪/已失败（旧 Win32 控件模式）：按页签走旧管线。
+            if (state->mode == BrowserMode::kVideo) {
+                if (state->video_busy.load()) SetVideoStatus(state, L"视频源正在加载，请稍候");
+                else StartLoadVideo(state, true);
+            } else if (state->mode == BrowserMode::kSearch) {
+                if (state->busy.load()) SetStatus(state, L"正在搜索/解析，请稍候");
+                else StartSearch(state);
+            } else {
+                if (state->busy.load()) SetStatus(state, L"正在加载榜单，请稍候");
+                else StartLoadDiscover(state, true);
+            }
             break;
         case kFrameHitTopMost: SetTopMost(state, !state->top_most); break;
         default: break;
@@ -1634,6 +2186,104 @@ void EndDrag(BrowserState* state) {
     }
 }
 
+// ------------------------------------------------------- 子控件光标策略
+// ⚠ 以前这里只有一行「非 ListView 就 IDC_HAND」，于是鼠标进音乐窗几乎到处
+// 是手型：搜索输入框、海报墙的空白与分区标题、状态条、分类行/图标栏里按钮
+// 之间的空隙全是手，用户完全看不出哪里真的能点（反馈「都是手的形状，应该
+// 根据里面的内容改变」）。
+// 现在按「控件类型 + 局部命中」分派：
+//   · 搜索框（EDIT）            → IBeam（可编辑，系统默认就是这个）
+//   · 结果/选集列表（ListView） → 箭头（行是选中不是链接）
+//   · 海报墙（ListBox）：卡片/页签 → 手；标题行、空白、加载占位 → 箭头
+//   · 顶部分类行 / 图标功能栏   → 命中按钮才手，行内空隙箭头
+//   · 其余按钮（搜索/导入/播放/加入/下载…）→ 手（禁用时箭头）
+HCURSOR CursorForChild(ChildProbe* probe, BrowserState* state, HWND control) {
+    const HCURSOR arrow = LoadCursorW(nullptr, IDC_ARROW);
+    const HCURSOR hand = LoadCursorW(nullptr, IDC_HAND);
+    const bool enabled = IsWindowEnabled(control) != FALSE;
+    switch (probe->id) {
+        case kIdQuery:
+            return enabled ? LoadCursorW(nullptr, IDC_IBEAM) : arrow;
+        case kIdTab: {
+            // 页签本身可点（切换音乐 / 视频 / 搜索）：命中页签才手型。
+            // 同进程内 TCM_HITTEST 可以直接取真实命中，不必自己算页签宽度。
+            if (!state || !enabled) return arrow;
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(control, &pt);
+            TCHITTESTINFO info{};
+            info.pt = pt;
+            const int idx = static_cast<int>(SendMessageW(
+                control, TCM_HITTEST, 0, reinterpret_cast<LPARAM>(&info)));
+            return idx >= 0 ? hand : arrow;
+        }
+        case kIdTagCombo:   // 隐藏保留控件；下拉框自身光标由系统处理
+        case kIdList:       // 结果 / 选集列表
+            return arrow;
+        case kIdSheetList: {
+            if (!state || !enabled) return arrow;
+            int g = -1, i = -1;
+            if (IsVideoMode(state)) {
+                if (HitVideoCard(state, &g, &i)) return hand;
+                // 遗留的分组标题页签（音乐页那套）在视频页已不再绘制，
+                // 这里留着是为了与点击路径保持一致。
+                if (HitVideoChip(state, &g, &i)) return hand;
+                return arrow;
+            }
+            return HitDiscoverCard(state, &g, &i) ? hand : arrow;
+        }
+        case kIdVideoNav: {
+            if (!state || !enabled) return arrow;
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(control, &pt);
+            RECT rc{};
+            GetClientRect(control, &rc);
+            const HDC dc = GetDC(control);
+            const int saved = SaveDC(dc);
+            const auto tabs = LayoutVideoNavTabs(dc, state, rc);
+            RestoreDC(dc, saved);
+            ReleaseDC(control, dc);
+            for (const auto& tab : tabs)
+                if (PtInRect(&tab.rect, pt)) return hand;
+            return arrow;
+        }
+        case kIdVideoIcons: {
+            if (!state || !enabled) return arrow;
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(control, &pt);
+            RECT rc{};
+            GetClientRect(control, &rc);
+            const HDC dc = GetDC(control);
+            const int saved = SaveDC(dc);
+            const auto btns = LayoutVideoIconBtns(dc, state, rc);
+            RestoreDC(dc, saved);
+            ReleaseDC(control, dc);
+            for (const auto& btn : btns)
+                if (PtInRect(&btn.rect, pt)) return hand;
+            return arrow;
+        }
+        default:
+            return enabled ? hand : arrow;
+    }
+}
+
+// 只有这些自绘控件需要 hover 高亮。海报墙 / 搜索框 / 状态条 / 组合框不该在
+// 每次鼠标移动时被 InvalidateRect（海报墙整幅重绘代价很高）。
+bool IsHoverButton(int id) {
+    switch (id) {
+        case kIdSearch:
+        case kIdImport:
+        case kIdPlay:
+        case kIdEnqueue:
+        case kIdDownload:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // ------------------------------------------------------- 子控件子类化
 
 LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
@@ -1647,7 +2297,24 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
     switch (message) {
         case WM_MOUSEMOVE: {
             if (state) {
-                if (probe->is_list) {
+                if (probe->id == kIdVideoIcons) {
+                    // 图标功能栏：逐按钮命中，只有当前悬停的按钮高亮。
+                    POINT pt{};
+                    GetCursorPos(&pt);
+                    ScreenToClient(control, &pt);
+                    RECT rc{};
+                    GetClientRect(control, &rc);
+                    HDC dc = GetDC(control);
+                    const auto btns = LayoutVideoIconBtns(dc, state, rc);
+                    ReleaseDC(control, dc);
+                    int hit = -1;
+                    for (size_t i = 0; i < btns.size(); ++i)
+                        if (PtInRect(&btns[i].rect, pt)) { hit = static_cast<int>(i); break; }
+                    if (hit != state->hot_video_icon) {
+                        state->hot_video_icon = hit;
+                        InvalidateRect(control, nullptr, FALSE);
+                    }
+                } else if (probe->is_list) {
                     LVHITTESTINFO info{};
                     info.pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                     const int row = ListView_HitTest(control, &info);
@@ -1656,7 +2323,11 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
                         state->hot_row = hot;
                         InvalidateRect(control, nullptr, FALSE);
                     }
-                } else if (state->hot_button != probe->id) {
+                } else if (IsHoverButton(probe->id) &&
+                           state->hot_button != probe->id) {
+                    // 只有按钮需要 hover 高亮。以前对海报墙 / 搜索框 / 状态条
+                    // 也走这条分支，每次鼠标移动都整幅 InvalidateRect 海报墙
+                    // （双缓冲全墙重绘），既卡又毫无视觉收益。
                     state->hot_button = probe->id;
                     InvalidateRect(control, nullptr, FALSE);
                 }
@@ -1670,7 +2341,12 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
         case WM_MOUSELEAVE:
             probe->tracking_leave = false;
             if (state) {
-                if (probe->is_list) {
+                if (probe->id == kIdVideoIcons) {
+                    if (state->hot_video_icon != -1) {
+                        state->hot_video_icon = -1;
+                        InvalidateRect(control, nullptr, FALSE);
+                    }
+                } else if (probe->is_list) {
                     if (state->hot_row != -1) {
                         state->hot_row = -1;
                         InvalidateRect(control, nullptr, FALSE);
@@ -1682,14 +2358,14 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
             }
             break;
         case WM_SETCURSOR:
-            if (!probe->is_list && LOWORD(lparam) == HTCLIENT &&
-                IsWindowEnabled(control)) {
-                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            // 光标按控件类型与局部命中分派（见 CursorForChild）：不再一律手型。
+            if (LOWORD(lparam) == HTCLIENT) {
+                SetCursor(CursorForChild(probe, state, control));
                 return TRUE;
             }
             break;
         case WM_KEYDOWN:
-            // 搜索框回车即搜索，省得每次都去点按钮。
+            // 搜索框（或视频源地址栏）回车即提交，省得每次都去点按钮。
             if (probe->id == kIdQuery && wparam == VK_RETURN && state &&
                 state->hwnd) {
                 PostMessageW(state->hwnd, WM_COMMAND,
@@ -1710,8 +2386,18 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
             // 封面卡片列表由下面的双缓冲 WM_PAINT 整幅覆盖。系统默认会先擦一遍
             // 纯色背景再逐行自绘，滚动时这一下就是肉眼可见的闪烁。
             if (probe->id == kIdSheetList) return 1;
+            // 影视仓外壳条整幅自绘，跳过系统擦背景。
+            if (probe->id == kIdVideoNav || probe->id == kIdVideoIcons) return 1;
             break;
         case WM_PAINT:
+            if (probe->id == kIdVideoNav && state) {
+                PaintVideoNavbar(state, control);
+                return 0;
+            }
+            if (probe->id == kIdVideoIcons && state) {
+                PaintVideoIconbar(state, control);
+                return 0;
+            }
             if (probe->id == kIdSheetList && state) {
                 PAINTSTRUCT paint{};
                 HDC dc = BeginPaint(control, &paint);
@@ -1726,9 +2412,15 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
                     ? CreateCompatibleBitmap(dc, width, height) : nullptr;
                 if (buffer && canvas) {
                     const HGDIOBJ old = SelectObject(buffer, canvas);
-                    FillRect(buffer, &rc, state->panel_brush
-                        ? state->panel_brush
-                        : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+                    // 视频页是深色海报墙：网格未铺满的剩余区域也用深色底，
+                    // 不然下面会露出一条白色（浅色主题的 panel 底色）。
+                    FillRect(buffer, &rc,
+                             IsVideoMode(state) && state->video_panel_brush
+                                 ? state->video_panel_brush
+                                 : (state->panel_brush
+                                        ? state->panel_brush
+                                        : reinterpret_cast<HBRUSH>(
+                                            COLOR_WINDOW + 1)));
                     const int count = static_cast<int>(
                         SendMessageW(control, LB_GETCOUNT, 0, 0));
                     int first = static_cast<int>(
@@ -1767,6 +2459,18 @@ LRESULT CALLBACK ChildProc(HWND control, UINT message, WPARAM wparam,
             // 上下文由 BrowserState::probes 持有；这里只是摘掉反向引用。
             SetWindowLongPtrW(control, GWLP_USERDATA, 0);
             break;
+        case WM_LBUTTONDOWN: {
+            if (!state) break;
+            if (probe->id == kIdVideoNav) {
+                HandleVideoNavClick(state, control);
+                return 0;
+            }
+            if (probe->id == kIdVideoIcons) {
+                HandleVideoIconClick(state, control);
+                return 0;
+            }
+            break;
+        }
         default:
             break;
     }
@@ -1893,10 +2597,12 @@ void PrefetchAllArtwork(BrowserState* state) {
                 continue;
             state->art_requested.insert(url);
             state->artwork->Request(url, kCardThumb,
-                [weak, target](const std::string&) {
+                [weak, target](const std::string& url) {
                     if (auto sp = weak.lock())
                         if (target && IsWindow(target))
-                            PostMessageW(target, kMsgArtworkReady, 0, 0);
+                            // 只在真的拿到图时才通知重绘；失败静默（补抓轮处理）。
+                            if (sp->artwork && sp->artwork->Peek(url))
+                                PostMessageW(target, kMsgArtworkReady, 0, 0);
                 });
         }
     }
@@ -1904,6 +2610,8 @@ void PrefetchAllArtwork(BrowserState* state) {
 
 void FillDiscoverList(BrowserState* state) {
     if (!state->sheet_list) return;
+    if (IsVideoMode(state)) { FillVideoList(state); return; }
+    state->discover_cols_applied = state->discover_cols;  // 行按当前列数铺，同步基准
     RebuildDiscoverRows(state);
     SendMessageW(state->sheet_list, WM_SETREDRAW, FALSE, 0);
     const int top_index = static_cast<int>(
@@ -1928,6 +2636,7 @@ void FillDiscoverList(BrowserState* state) {
 
 // 封面卡片自绘：分组标题行 / 一行多张竖向封面卡片（封面 + 标题 + 来源）。
 void DrawDiscoverRow(BrowserState* state, const DRAWITEMSTRUCT& item) {
+    if (IsVideoMode(state)) { DrawDiscoverRowVideo(state, item); return; }
     const int row = static_cast<int>(item.itemID);
     if (row < 0 || row >= static_cast<int>(state->discover_rows.size())) return;
     const BrowserState::DiscoverRow& r = state->discover_rows[row];
@@ -2045,6 +2754,7 @@ void DrawDiscoverRow(BrowserState* state, const DRAWITEMSTRUCT& item) {
 // 鼠标位置 → 卡片（group 下标 + sheet 下标）。点在分组行/空白处返回 false。
 bool HitDiscoverCard(BrowserState* state, int* group, int* sheet) {
     if (!state || !state->sheet_list) return false;
+    if (IsVideoMode(state)) return HitVideoCard(state, group, sheet);
     POINT pt{};
     GetCursorPos(&pt);
     ScreenToClient(state->sheet_list, &pt);
@@ -2088,6 +2798,7 @@ void FillHitsFromMusicItems(BrowserState* state,
 // 完成，再逐音源取榜单 + 推荐；每完成一个就投递一批，UI 立刻追加卡片。
 // 不占用 state->busy，因此加载期间「搜索」页依然可以正常用。
 void StartLoadDiscover(BrowserState* state, bool force) {
+    if (IsMusicFreeShuttingDown()) return;
     if (!state || state->discover_busy.exchange(true)) return;
     if (state->discover_loaded && !force) {
         state->discover_busy.store(false);
@@ -2116,6 +2827,8 @@ void StartLoadDiscover(BrowserState* state, bool force) {
 
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         std::vector<std::string> platforms;
         try {
             platforms = ListDiscoverPlatforms();  // 内部等待后台挂载，不阻塞 UI
@@ -2154,6 +2867,7 @@ void StartLoadDiscover(BrowserState* state, bool force) {
 
 // 打开选中的榜单 / 推荐歌单，把曲目灌进下方结果列表（后台 → kMsgSheetTracksReady）。
 void StartOpenSheet(BrowserState* state) {
+    if (IsMusicFreeShuttingDown()) return;
     if (!state || state->selected_group < 0 || state->selected_sheet < 0 ||
         state->selected_group >= static_cast<int>(state->groups.size())) {
         SetSheetProgress(state, L"请先点击一张封面卡片查看曲目",
@@ -2188,6 +2902,8 @@ void StartOpenSheet(BrowserState* state) {
 
     std::weak_ptr<BrowserState> weak = g_browser;
     std::thread([weak, sheet, kind] {
+        BgThreadGuard guard;
+        if (IsMusicFreeShuttingDown()) return;
         auto* payload = new SearchPayload();
         payload->for_search = false;  // 歌单曲目只属于发现页
         try {
@@ -2223,46 +2939,1843 @@ void StartOpenSheet(BrowserState* state) {
     }).detach();
 }
 
+// 根据页签下标推导模式：0=音乐（原发现）/ 1=视频 / 2=搜索。
+BrowserMode TabIndexToMode(int tab_index) {
+    if (tab_index == 2) return BrowserMode::kSearch;
+    if (tab_index == 1) return BrowserMode::kVideo;
+    return BrowserMode::kMusic;
+}
+
+bool IsSearchMode(BrowserState* state) {
+    return state && state->mode == BrowserMode::kSearch;
+}
+bool IsVideoMode(BrowserState* state) {
+    return state && state->mode == BrowserMode::kVideo;
+}
+
+// 把当前正在显示的曲目归到对应页签的存档桶；切页时调用。
+void ArchiveActiveHits(BrowserState* state) {
+    if (!state) return;
+    if (state->mode == BrowserMode::kSearch) state->search_hits = std::move(state->hits);
+    else if (state->mode == BrowserMode::kVideo) state->video_hits = std::move(state->hits);
+    else state->discover_hits = std::move(state->hits);
+}
+void RestoreActiveHits(BrowserState* state) {
+    if (!state) return;
+    if (state->mode == BrowserMode::kSearch) state->hits = std::move(state->search_hits);
+    else if (state->mode == BrowserMode::kVideo) state->hits = std::move(state->video_hits);
+    else state->hits = std::move(state->discover_hits);
+}
+
 // 切换页签：只做显隐与布局，不做任何同步插件 / 网络调用。
 void OnTabChanged(BrowserState* state, int tab_index) {
     if (!state) return;
-    const bool old_search = state->mode == BrowserMode::kSearch;
-    const bool search = tab_index == 1;
-    state->mode = search ? BrowserMode::kSearch : BrowserMode::kDiscover;
-    if (old_search != search) {
-        // 两个页签各有一份曲目：切走时存档，切回时取回。后台任务按
-        // SearchPayload::for_search 路由，即使晚到也不会串页。
-        (old_search ? state->search_hits : state->discover_hits) =
-            std::move(state->hits);
-        state->hits = std::move(search ? state->search_hits
-                                       : state->discover_hits);
+    const BrowserMode old_mode = state->mode;
+    const BrowserMode new_mode = TabIndexToMode(tab_index);
+    state->mode = new_mode;
+    const bool search = new_mode == BrowserMode::kSearch;
+    const bool video = new_mode == BrowserMode::kVideo;
+    if (old_mode != new_mode) {
+        // 三个页签各有一份曲目：切走时存档，切回时取回。后台任务按
+        // 各自的 for_* 路由，即使晚到也不会串页。
+        ArchiveActiveHits(state);
+        RestoreActiveHits(state);
         FillResultList(state);
         // 这里直接写控件：SetStatus 会把文本归到当前页，反而覆盖存档。
-        if (state->status)
-            SetWindowTextW(state->status,
-                (search ? state->search_status : state->discover_status).c_str());
-        if (state->tracks_caption)
-            SetWindowTextW(state->tracks_caption,
-                           state->discover_caption.c_str());
+        if (state->status) {
+            std::wstring text;
+            if (search) text = state->search_status;
+            else if (video) text = state->video_status;
+            else text = state->discover_status;
+            SetWindowTextW(state->status, text.c_str());
+        }
+        if (state->tracks_caption) {
+            std::wstring caption;
+            if (search) caption = L"";
+            else if (video) caption = state->video_caption;
+            else caption = state->discover_caption;
+            SetWindowTextW(state->tracks_caption, caption.c_str());
+        }
     }
     ShowWindow(state->platform, search ? SW_SHOW : SW_HIDE);
-    ShowWindow(state->query, search ? SW_SHOW : SW_HIDE);
-    ShowWindow(state->search_button, search ? SW_SHOW : SW_HIDE);
+    // ⚠ 输入框与搜索按钮的可见性**必须交给 LayoutChildren 统一管**（它负责
+    // 「先 MoveWindow 定位、再 ShowWindow」）。在这里直接 ShowWindow 会让它们
+    // 停在占位创建位置 (0,0,10,10)：视频页没有顶部工具栏，search 分支的
+    // MoveWindow 不会执行，于是 10x10 的搜索按钮顶在窗口左上角，按钮里的
+    // 「搜」字被裁成一小团笔画 —— 用户看到的就是一个「柒」。
+    // 视频页要搜索请用图标功能栏里的「搜索」入口（会跳到搜索页）。
     ShowWindow(state->sheet_list, search ? SW_HIDE : SW_SHOW);
     ShowWindow(state->tracks_caption, search ? SW_HIDE : SW_SHOW);
-    ShowWindow(state->load_sheets_button, search ? SW_HIDE : SW_SHOW);
-    ShowWindow(state->open_sheet_button, search ? SW_HIDE : SW_SHOW);
     ShowWindow(state->tag_combo, SW_HIDE);
     ShowWindow(state->import_button, SW_SHOW);
     if (search) RefreshSourceComboForMode(state);
     ApplyFrameMetrics(state, false);
-    if (!search && !state->discover_loaded && !state->discover_busy.load())
+    // 切页首帧整窗重绘一次：只刷 sheet_list 时，tab 左缘 / 标题栏下沿这些
+    // 皮肤区域可能残留上一页像素（用户反馈「第一次切到视频左上角有问题」）。
+    if (state->hwnd) InvalidateRect(state->hwnd, nullptr, TRUE);
+    // 卡片网格（sheet_list）是音乐/视频页共用的 ListBox：切走时会被另一页重填，
+    // 切回来必须按当前页重建，否则切到视频再切回音乐会变成空白，只能靠「刷新」
+    // 重新拉取。groups / video_groups 一直留在 state 里，这里只是重新铺一遍卡片
+    // 行，不触发任何网络请求。放在 ApplyFrameMetrics 之后，列数已按新页算好。
+    if (!search) FillDiscoverList(state);
+    // 每次切进视频页都发一次，由 kMsgVideoStart 判断是否需要重新聚合：
+    // 以前这里要求 !video_loaded，一旦早期用空站点表跑完一轮把
+    // video_loaded 置 true，之后就永远不再加载，视频页一直停在占位卡片。
+    if (video)
+        PostMessageW(state->hwnd, kMsgVideoStart, 0, 0);
+    if (!search && old_mode != BrowserMode::kVideo &&
+        !state->discover_loaded && !state->discover_busy.load())
         PostMessageW(state->hwnd, kMsgDiscoverStart, 0, 0);
 }
 
 // 初始进入窗口时布置为发现页（第 0 个页签）。
 void ApplyMode(BrowserState* state) {
     if (state) OnTabChanged(state, 0);
+}
+
+// ============================================================ 视频（影视仓 / TVBox）
+// 视频站点 = 分组、视频条目 = 卡片、选集 = 曲目，复用发现页的卡片网格与列表。
+void SetVideoStatus(BrowserState* state, const std::wstring& text) {
+    if (!state) return;
+    state->video_status = text;
+    if (state->status && IsVideoMode(state))
+        SetWindowTextW(state->status, text.c_str());
+}
+void SetVideoSheetCaption(BrowserState* state, const std::wstring& text) {
+    if (!state) return;
+    state->video_caption = text;
+    if (state->tracks_caption && IsVideoMode(state))
+        SetWindowTextW(state->tracks_caption, text.c_str());
+}
+
+// 直接播放视频页结果列表里选中的一行（选集 / 频道）。
+// 双击列表行和「播放所选」按钮共用这条路：播放地址在 raw["url"] 里，
+// 不再绕 ResolvePlayUrl（那是给音乐源插件用的）。
+void PlaySelectedVideoHit(BrowserState* state) {
+    if (!state) return;
+    int sel = static_cast<int>(
+        ListView_GetNextItem(state->list, -1, LVNI_SELECTED));
+    // 未选中时默认播第一集（影视仓式习惯：点「播放所选」通常就是想接着看）。
+    if (sel < 0 && !state->hits.empty()) sel = 0;
+    TraceImport("play_hit sel=%d hits=%zu video=%d list=%p", sel,
+                state->hits.size(), IsVideoMode(state) ? 1 : 0,
+                reinterpret_cast<void*>(state->list));
+    if (sel < 0 || sel >= static_cast<int>(state->hits.size())) {
+        SetVideoSheetCaption(state, L"请先在下方列表中选择一行");
+        return;
+    }
+    const OnlineSearchHit& hit = state->hits[static_cast<std::size_t>(sel)];
+    std::string url;
+    std::map<std::string, std::string> headers;
+    if (hit.raw.is_object()) {
+        if (hit.raw.contains("url") && hit.raw["url"].is_string())
+            url = hit.raw["url"].get<std::string>();
+        if (hit.raw.contains("headers") && hit.raw["headers"].is_object())
+            for (auto it = hit.raw["headers"].begin();
+                 it != hit.raw["headers"].end(); ++it)
+                if (it.value().is_string())
+                    headers[it.key()] = it.value().get<std::string>();
+    }
+    if (url.empty()) {
+        TraceImport("play_hit url empty sel=%d", sel);
+        SetVideoSheetCaption(state, L"该选集没有可播放地址");
+        return;
+    }
+    TraceImport("play_hit opening url=%s", url.substr(0, 80).c_str());
+    // 同集的其它线路（切换源按钮的数据）：raw["sources"] = [{url,name},...]
+    std::vector<ttplayer::video::VideoPlayerSource> sources;
+    if (hit.raw.is_object() && hit.raw.contains("sources") &&
+        hit.raw["sources"].is_array()) {
+        for (const auto& s : hit.raw["sources"]) {
+            if (!s.is_object() || !s.contains("url") || !s["url"].is_string())
+                continue;
+            ttplayer::video::VideoPlayerSource src;
+            src.url = Utf8ToWideString(s["url"].get<std::string>());
+            if (s.contains("name") && s["name"].is_string())
+                src.name = Utf8ToWideString(s["name"].get<std::string>());
+            sources.push_back(std::move(src));
+        }
+    }
+    // 线路名要传当前 hit 所属线路（raw["line"]），不是站点名 hit.platform；
+    // 否则播放窗标题栏把「站点」当「线路」显示，切源后更易混淆。
+    ttplayer::video::ShowVideoPlayer(
+        state->hwnd, Utf8ToWideString(url),
+        Utf8ToWideString(hit.title),
+        Utf8ToWideString(hit.raw.value("line", hit.platform)),
+        ActiveSkin(state), headers, sources,
+        state->video_mgr ? state->video_mgr->AllParses()
+                         : std::vector<ttplayer::video::VideoParse>());
+}
+
+// （FriendlySectionTitle / SectionPriority 已移出本匿名命名空间 —— 见文件
+//  下方 } // namespace 之后的「跨编译单元导出符号」区，声明见
+//  musicfree_browser_window.h；此处的调用点（BuildVideoHomeSections）经该
+//  头文件声明仍可正常解析。）
+
+// 把「推荐」聚合流按分类名（type_name）切成多个影视仓式分区：热播电影 / 热播剧集 /
+// 动漫 … 每个分区一段海报墙。结果写入 state->video_home_items（铺平）+ sections。
+// ⚠ 必须先按 key 分桶再整桶铺平：聚合流是按站点轮询交错的，同一分区的 items
+// 散布在整条流里；以前「首次出现下标 + 累计总数」当区间用，各分区区间互相
+// 重叠错位（trace: section[0] start=0 count=14 / section[1] start=4）——不仅
+// 海报张冠李戴，行结构与数据也对不上。
+void BuildVideoHomeSections(BrowserState* state) {
+    if (!state) return;
+    state->video_home_items.clear();
+    state->video_home_sections.clear();
+    BrowserState::VideoGroup* agg = nullptr;
+    for (auto& g : state->video_groups)
+        if (g.site_key == "agg:") { agg = &g; break; }
+    if (!agg) { state->video_in_sections = false; return; }
+    const auto& items = agg->items;
+    std::vector<std::wstring> order;             // 首次出现顺序（按友好标题去重）
+    std::map<std::wstring, std::vector<const ttplayer::video::VideoItem*>> buckets;
+    for (const auto& it : items) {
+        // ⚠ 按「友好标题」分桶，而不是原始 type_name：不同源对同一直观分类用了
+        // 不同原始名（电影 / 最新电影 / 热播电影 / 电影推荐 …），但它们经
+        // FriendlySectionTitle 都归一成「热播电影」。以前按原始名分桶，导致同一个
+        // 「热播电影」标题在页面上被拆成好几段、重复出现（用户反馈「分类明显重复」）。
+        const std::wstring title = FriendlySectionTitle(
+            it.type_name.empty() ? std::string("推荐") : it.type_name);
+        if (buckets.find(title) == buckets.end()) order.push_back(title);
+        buckets[title].push_back(&it);
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&](const std::wstring& a, const std::wstring& b) {
+                         return SectionPriority(a) < SectionPriority(b);
+                     });
+    for (const auto& title : order) {
+        VideoHomeSection sec;
+        sec.title = title;
+        sec.start = static_cast<int>(state->video_home_items.size());
+        sec.count = static_cast<int>(buckets[title].size());
+        for (const auto* p : buckets[title])
+            state->video_home_items.push_back(*p);
+        state->video_home_sections.push_back(sec);
+    }
+    state->video_in_sections = !state->video_home_sections.empty();
+}
+
+// video_groups → 绘制行（复刻 RebuildDiscoverRows）。
+void RebuildVideoRows(BrowserState* state) {
+    state->video_rows.clear();
+    const int cols = std::max(1, state->video_cols);
+    // —— 影视仓式分区首页（「推荐」页签）：每个分区 = 标题行 + 若干卡片行 ——
+    if (state->video_in_sections && !state->video_home_sections.empty()) {
+        for (size_t si = 0; si < state->video_home_sections.size(); ++si) {
+            const auto& sec = state->video_home_sections[si];
+            BrowserState::DiscoverRow hdr;
+            hdr.header = true; hdr.group = -3; hdr.section_idx = static_cast<int>(si);
+            state->video_rows.push_back(hdr);
+            for (int first = 0; first < sec.count; first += cols) {
+                BrowserState::DiscoverRow cards;
+                cards.group = -2; cards.first = sec.start + first;
+                cards.count = std::min(cols, sec.count - first);
+                state->video_rows.push_back(cards);
+            }
+        }
+        // 直播等其余分组照旧垫底（聚合组已用分区呈现，跳过）。
+        for (int g = 0; g < static_cast<int>(state->video_groups.size()); ++g) {
+            const auto& group = state->video_groups[g];
+            if (group.site_key == "agg:") continue;
+            if (group.items.empty()) continue;
+            BrowserState::DiscoverRow hdr;
+            hdr.header = true; hdr.group = g;
+            state->video_rows.push_back(hdr);
+            const int total = static_cast<int>(group.items.size());
+            for (int first = 0; first < total; first += cols) {
+                BrowserState::DiscoverRow cards;
+                cards.group = g; cards.first = first;
+                cards.count = std::min(cols, total - first);
+                state->video_rows.push_back(cards);
+            }
+        }
+        return;
+    }
+    // —— 原有扁平 / 分类视图（video_groups）——
+    // 聚合组永远存在（哪怕 items 为空），骨架占位改成「一张卡片都没有」判断。
+    bool any_cards = false;
+    for (const auto& group : state->video_groups)
+        if (!group.items.empty()) { any_cards = true; break; }
+    // 加载中 / 全部源失败时也必须留一行占位卡片：否则 ListBox 一行都没有，
+    // 双缓冲只铺 kVideoPageBg 纯黑底，用户看到的就是「内容图片全都没显示」。
+    // 以前这里还要求 video_placeholder，而 StartLoadVideo 一开头就把它设成
+    // false，于是首页聚合期间（几十秒）整块内容区恒为纯黑。
+    if (!any_cards) {
+        BrowserState::DiscoverRow skeleton;
+        skeleton.header = true; skeleton.group = -1; skeleton.count = 1;
+        state->video_rows.push_back(skeleton);
+        return;
+    }
+    for (int g = 0; g < static_cast<int>(state->video_groups.size()); ++g) {
+        const auto& group = state->video_groups[g];
+        if (group.items.empty()) continue;
+        BrowserState::DiscoverRow header; header.header = true; header.group = g;
+        state->video_rows.push_back(header);
+        const int total = static_cast<int>(group.items.size());
+        for (int first = 0; first < total; first += cols) {
+            BrowserState::DiscoverRow cards;
+            cards.group = g; cards.first = first;
+            cards.count = std::min(cols, total - first);
+            state->video_rows.push_back(cards);
+        }
+    }
+}
+
+// 统计「已请求过但缓存里仍无图」的视频封面数（下载失败批次的特征）。
+int CountMissingVideoArtwork(BrowserState* state) {
+    if (!state || !state->artwork) return 0;
+    int missing = 0;
+    const auto check = [&](const std::string& url) {
+        if (url.empty() || !state->video_art_requested.count(url)) return;
+        const auto it = state->video_art_retries.find(url);
+        if (it != state->video_art_retries.end() &&
+            it->second >= kVideoArtMaxRetries) return;
+        if (!state->artwork->Peek(url)) ++missing;
+    };
+    for (const auto& item : state->video_home_items) check(item.pic);
+    for (const auto& group : state->video_groups)
+        for (const auto& item : group.items) check(item.pic);
+    return missing;
+}
+
+// 把失败封面的请求重新入队（video_art_requested erase 后 Request 可重入），
+// 次数记进 video_art_retries 封顶，避免图床真挂时无限风暴。
+void RetryMissingVideoArtwork(BrowserState* state) {
+    if (!state || !state->artwork) return;
+    const HWND target = state->hwnd;
+    std::weak_ptr<BrowserState> weak = g_browser;
+    const auto retry = [&](const std::string& url) {
+        if (url.empty() || !state->video_art_requested.count(url)) return;
+        int& tries = state->video_art_retries[url];
+        if (tries >= kVideoArtMaxRetries) return;
+        if (state->artwork->Peek(url)) return;  // 已到图
+        ++tries;
+        state->video_art_requested.erase(url);  // 允许重新入队
+        state->artwork->Request(url, kVideoPosterH,
+            [weak, target](const std::string& url) {
+                if (auto sp = weak.lock())
+                    if (target && IsWindow(target))
+                        // 只在真的拿到图时才通知重绘；失败静默（由 3 秒节流的
+                        // 补抓轮处理），否则失败风暴会高频重绘海报墙。
+                        if (sp->artwork && sp->artwork->Peek(url))
+                            PostMessageW(target, kMsgArtworkReady, 0, 0);
+            });
+    };
+    for (const auto& item : state->video_home_items) retry(item.pic);
+    for (const auto& group : state->video_groups)
+        for (const auto& item : group.items) retry(item.pic);
+}
+
+void PrefetchVideoArtwork(BrowserState* state) {
+    if (!state || !state->artwork) return;
+    HWND target = state->hwnd;
+    std::weak_ptr<BrowserState> weak = g_browser;
+    for (const auto& group : state->video_groups) {
+        for (const auto& item : group.items) {
+            const std::string& url = item.pic;
+            if (url.empty() ||
+                state->video_art_requested.find(url) != state->video_art_requested.end())
+                continue;
+            state->video_art_requested.insert(url);
+            // 海报是竖版 2:3，请求高度作为 max_edge，避免缩略图模糊。
+            state->artwork->Request(url, kVideoPosterH,
+                [weak, target](const std::string& url) {
+                    if (auto sp = weak.lock())
+                        if (target && IsWindow(target))
+                            // 只在真的拿到图时才通知重绘；失败静默（补抓轮处理）。
+                            if (sp->artwork && sp->artwork->Peek(url))
+                                PostMessageW(target, kMsgArtworkReady, 0, 0);
+                });
+        }
+    }
+    // 影视仓式分区视图的卡片封面（与 video_groups 同源，去重集合会挡掉重复）。
+    for (const auto& item : state->video_home_items) {
+        const std::string& url = item.pic;
+        if (url.empty() ||
+            state->video_art_requested.find(url) != state->video_art_requested.end())
+            continue;
+        state->video_art_requested.insert(url);
+        state->artwork->Request(url, kVideoPosterH,
+            [weak, target](const std::string& url) {
+                if (auto sp = weak.lock())
+                    if (target && IsWindow(target))
+                        // 只在真的拿到图时才通知重绘；失败静默（由 3 秒节流的
+                        // 补抓轮处理），否则失败风暴会高频重绘海报墙。
+                        if (sp->artwork && sp->artwork->Peek(url))
+                            PostMessageW(target, kMsgArtworkReady, 0, 0);
+            });
+    }
+}
+
+void FillVideoList(BrowserState* state) {
+    if (!state->sheet_list) return;
+    state->video_cols_applied = state->video_cols;  // 行按当前列数铺，同步基准
+    // 影视仓式分区首页：仅在「推荐」页签且非搜索时，把聚合流切成分类分区。
+    if (state->video_active_cat == -1 && !IsSearchMode(state))
+        BuildVideoHomeSections(state);
+    else
+        state->video_in_sections = false;
+    RebuildVideoRows(state);
+    SendMessageW(state->sheet_list, WM_SETREDRAW, FALSE, 0);
+    const int top_index = static_cast<int>(
+        SendMessageW(state->sheet_list, LB_GETTOPINDEX, 0, 0));
+    ListBox_ResetContent(state->sheet_list);
+    for (size_t i = 0; i < state->video_rows.size(); ++i)
+        ListBox_AddString(state->sheet_list, L"");
+    for (size_t i = 0; i < state->video_rows.size(); ++i) {
+        const auto& row = state->video_rows[i];
+        // 骨架占位（group==-1）用整行高度；标题行（站点/分区，group>=0 或 -3）用分组高；
+        // 卡片行用卡片高度。
+        const int h = (row.header && row.group == -1)
+                          ? kVideoRowHeight
+                          : (row.header ? kGroupRowHeight : kVideoRowHeight);
+        SendMessageW(state->sheet_list, LB_SETITEMHEIGHT,
+                     static_cast<WPARAM>(i), static_cast<LPARAM>(h));
+    }
+    SendMessageW(state->sheet_list, LB_SETTOPINDEX, top_index, 0);
+    SendMessageW(state->sheet_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(state->sheet_list, nullptr, FALSE);
+    PrefetchVideoArtwork(state);
+}
+
+// ---- 视频页配色在文件头部定义（sheet_list 自绘底色也要用）--------------
+
+// 分类页签：cat_index = -1 表示「全部」（恢复首页推荐）。
+struct VideoChip {
+    RECT rect;
+    int cat_index;
+};
+
+// 计算一个分组标题行里的分类 chips（跟在标题文字后面从左往右排，放不下丢弃）。
+// 绘制与命中测试共用同一份几何，必须完全确定 —— 只依赖字体和文本。
+std::vector<VideoChip> LayoutVideoChips(HDC dc, BrowserState* state,
+                                        const RECT& rc, int group_index) {
+    std::vector<VideoChip> out;
+    if (!state || group_index < 0 ||
+        group_index >= static_cast<int>(state->video_groups.size()))
+        return out;
+    const auto& group = state->video_groups[group_index];
+    if (group.site_key == "live:") return out;  // 直播组没有分类
+    // 标题宽（决定 chips 起点）
+    std::wstring title = Utf8ToWideString(group.site_name);
+    const bool is_agg = group.site_key == "agg:";
+    if (is_agg) {
+        // 聚合推荐组：一条统一推荐流的统计，而不是站点名。
+        const auto& batches = state->video_cat_batches.empty()
+                                  ? state->video_agg_batches
+                                  : state->video_cat_batches;
+        title = group.active_category_name.empty()
+                    ? L"推荐"
+                    : group.active_category_name;
+        title += L"   ·   " + std::to_wstring(group.items.size()) +
+                 L" 部影片   ·   " + std::to_wstring(batches.size()) +
+                 L" 个片源";
+    }
+    if (title.empty()) title = L"未命名视频源";
+    if (!is_agg)
+        title += L"   ·   " + std::to_wstring(group.items.size()) + L" 个内容";
+    SIZE tsz{};
+    const HGDIOBJ old_font = SelectObject(dc, state->bold_font);
+    GetTextExtentPoint32W(dc, title.c_str(),
+                          static_cast<int>(title.size()), &tsz);
+    SelectObject(dc, old_font);
+    int x = rc.left + 14 + tsz.cx + 14;
+    if (group.category_loading) x += 64;  // 给「加载中…」留位
+    const int ch = 20;
+    const int y = rc.top + (kGroupRowHeight - ch) / 2;
+    SelectObject(dc, state->small_font);
+    const auto place = [&](int cat_index, const std::wstring& label) {
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, label.c_str(),
+                              static_cast<int>(label.size()), &sz);
+        const int w = sz.cx + 20;
+        if (x + w > rc.right - 6) return;
+        out.push_back({{x, y, x + w, y + ch}, cat_index});
+        x += w + 6;
+    };
+    place(-1, is_agg ? L"推荐" : L"全部");
+    if (is_agg) {
+        // 聚合页签（跨站点同名分类合并，按共有站点数排序）。
+        const int max_cats =
+            std::min<int>(state->video_agg_categories.size(), 10);
+        for (int i = 0; i < max_cats; ++i)
+            place(i, Utf8ToWideString(state->video_agg_categories[i].name));
+    } else {
+        const int max_cats = std::min<int>(group.categories.size(), 14);
+        for (int i = 0; i < max_cats; ++i)
+            place(i, Utf8ToWideString(group.categories[i].name));
+    }
+    SelectObject(dc, old_font);
+    return out;
+}
+
+std::wstring VideoChipLabel(BrowserState* state, int group_index,
+                            const VideoChip& chip) {
+    if (chip.cat_index < 0) {
+        const bool is_agg =
+            group_index >= 0 &&
+            group_index < static_cast<int>(state->video_groups.size()) &&
+            state->video_groups[group_index].site_key == "agg:";
+        return is_agg ? L"推荐" : L"全部";
+    }
+    if (group_index < 0 ||
+        group_index >= static_cast<int>(state->video_groups.size()))
+        return L"?";
+    const auto& group = state->video_groups[group_index];
+    if (group.site_key == "agg:") {
+        if (chip.cat_index >=
+            static_cast<int>(state->video_agg_categories.size()))
+            return L"?";
+        return Utf8ToWideString(
+            state->video_agg_categories[chip.cat_index].name);
+    }
+    const auto& cats = group.categories;
+    if (chip.cat_index >= static_cast<int>(cats.size())) return L"?";
+    return Utf8ToWideString(cats[chip.cat_index].name);
+}
+
+void DrawDiscoverRowVideo(BrowserState* state, const DRAWITEMSTRUCT& item) {
+    const int row = static_cast<int>(item.itemID);
+    if (row < 0 || row >= static_cast<int>(state->video_rows.size())) return;
+    const BrowserState::DiscoverRow& r = state->video_rows[row];
+    HDC dc = item.hDC;
+    RECT rc = item.rcItem;
+    FillSolidRect(dc, rc, kVideoPageBg);
+    if (r.header && r.group == -1) {
+        // 骨架占位：深色海报框 + 引导文字（与音乐页同职责，配色独立）。
+        for (int c = 0; c < state->video_cols; ++c) {
+            RECT card = {rc.left + c * kVideoCardWidth + 4, rc.top + 3,
+                         rc.left + (c + 1) * kVideoCardWidth - 4, rc.bottom - 3};
+            const RECT poster = {card.left + 10, card.top + 4,
+                                 card.right - 10, card.top + 4 + kVideoPosterH};
+            DrawRoundedBox(dc, poster, kVideoCardBg, kVideoCardLine, 6);
+            DrawTextIn(dc,
+                       {card.left, poster.bottom + 6, card.right,
+                        poster.bottom + 26},
+                       state->video_placeholder_text.c_str(), kVideoSubTx,
+                       state->small_font,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        return;
+    }
+    if (r.group == -3) {
+        // 影视仓式分区标题行（热播电影 / 热播剧集 / 动漫 …）。
+        const auto& sec = state->video_home_sections[r.section_idx];
+        FillSolidRect(dc, {rc.left + 4, rc.top + 6, rc.left + 7, rc.bottom - 6},
+                      kVideoSelLine);
+        DrawTextIn(dc, {rc.left + 14, rc.top, rc.right - 60, rc.bottom},
+                   sec.title.c_str(), kVideoTitleTx, state->bold_font,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const std::wstring more = L"更多 ›";
+        DrawTextIn(dc, {rc.right - 56, rc.top, rc.right - 6, rc.bottom},
+                   more.c_str(), kVideoSubTx, state->small_font,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        return;
+    }
+    // group == -2（分区卡片行）是合法值，必须放行到下面的 section_card 分支。
+    // 以前这里写成 `r.group < 0 return`，-2 在进入分区绘制前就被吞掉——
+    // 分区标题行能画（-3 在前面处理），卡片行却整块黑屏（死代码）。
+    if (r.group < -2 || r.group >= static_cast<int>(state->video_groups.size())) return;
+    if (r.header) {
+        // 分组标题行：聚合统计（或站点名）+ 分类页签（影视仓式）。
+        const auto& group = state->video_groups[r.group];
+        const bool is_agg = group.site_key == "agg:";
+        FillSolidRect(dc, {rc.left + 4, rc.top + 6, rc.left + 7, rc.bottom - 6},
+                      kVideoSelLine);
+        std::wstring title = Utf8ToWideString(group.site_name);
+        if (is_agg) {
+            const auto& batches = state->video_cat_batches.empty()
+                                      ? state->video_agg_batches
+                                      : state->video_cat_batches;
+            title = group.active_category_name.empty()
+                        ? L"推荐"
+                        : group.active_category_name;
+            title += L"   ·   " + std::to_wstring(group.items.size()) +
+                     L" 部影片   ·   " + std::to_wstring(batches.size()) +
+                     L" 个片源";
+        }
+        if (title.empty()) title = L"未命名视频源";
+        if (!is_agg)
+            title += L"   ·   " + std::to_wstring(group.items.size()) +
+                     L" 个内容";
+        DrawTextIn(dc, {rc.left + 14, rc.top, rc.right - 6, rc.bottom},
+                   title.c_str(), kVideoTitleTx, state->bold_font,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (group.category_loading) {
+            SIZE tsz{};
+            const HGDIOBJ old_font = SelectObject(dc, state->bold_font);
+            GetTextExtentPoint32W(dc, title.c_str(),
+                                  static_cast<int>(title.size()), &tsz);
+            SelectObject(dc, old_font);
+            DrawTextIn(dc, {rc.left + 14 + tsz.cx + 14, rc.top,
+                            rc.right - 6, rc.bottom},
+                       L"加载中…", kVideoSubTx, state->small_font,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        // ⚠ 不再在分组标题行里画第二排分类 chips：顶部导航行（video_navbar）
+        // 已经有同一组分类，两处重复既挤又容易误点（用户反馈「下方会出现第
+        // 二条分类」）。分类入口只保留顶部导航行。
+        return;
+    }
+    const bool section_card = (r.group == -2);
+    for (int c = 0; c < r.count; ++c) {
+        const int index = r.first + c;
+        if (section_card) {
+            if (index >= static_cast<int>(state->video_home_items.size())) break;
+        } else {
+            if (r.group < 0 ||
+                r.group >= static_cast<int>(state->video_groups.size())) break;
+            if (index >= static_cast<int>(state->video_groups[r.group].items.size()))
+                break;
+        }
+        const ttplayer::video::VideoItem& s = section_card
+            ? state->video_home_items[index]
+            : state->video_groups[r.group].items[index];
+        RECT card = {rc.left + c * kVideoCardWidth + 4, rc.top + 3,
+                     rc.left + (c + 1) * kVideoCardWidth - 4, rc.bottom - 3};
+        const bool selected = section_card
+            ? (state->selected_video_group == -2 &&
+               state->selected_video_item == index)
+            : (state->selected_video_group == r.group &&
+               state->selected_video_item == index);
+        const RECT poster = {card.left + 10, card.top + 4,
+                             card.right - 10, card.top + 4 + kVideoPosterH};
+        HBITMAP bmp = state->artwork ? state->artwork->Peek(s.pic) : nullptr;
+        if (bmp) {
+            BITMAP bm{};
+            GetObjectW(bmp, sizeof(bm), &bm);
+            HDC src = CreateCompatibleDC(dc);
+            const HGDIOBJ old = SelectObject(src, bmp);
+            // 海报缩放明显（原图 ~400px → 196px），HALFTONE 比 COLORONCOLOR 平滑。
+            const int prev_mode = SetStretchBltMode(dc, HALFTONE);
+            StretchBlt(dc, poster.left, poster.top,
+                       poster.right - poster.left,
+                       poster.bottom - poster.top, src, 0, 0, bm.bmWidth,
+                       bm.bmHeight, SRCCOPY);
+            SetStretchBltMode(dc, prev_mode);
+            SelectObject(src, old);
+            DeleteDC(src);
+            DrawRoundedBox(dc, poster, CLR_INVALID,
+                           selected ? kVideoSelLine : kVideoCardLine, 6);
+        } else {
+            unsigned int hash = 2166136261u;
+            for (unsigned char c : s.title) { hash ^= c; hash *= 16777619u; }
+            static const COLORREF kPlaceholderColors[] = {
+                RGB(0x3E, 0x44, 0x66), RGB(0x5A, 0x3E, 0x5C),
+                RGB(0x2E, 0x54, 0x66), RGB(0x35, 0x5C, 0x50),
+                RGB(0x66, 0x50, 0x36), RGB(0x46, 0x3E, 0x66),
+                RGB(0x2C, 0x56, 0x5E), RGB(0x60, 0x3C, 0x3C),
+            };
+            const COLORREF bg = kPlaceholderColors[
+                hash % (sizeof(kPlaceholderColors) / sizeof(kPlaceholderColors[0]))];
+            DrawRoundedBox(dc, poster, bg, kVideoCardLine, 6);
+            const std::wstring wtitle = Utf8ToWideString(s.title);
+            const std::wstring initial =
+                wtitle.empty() ? L"\u25B6" : wtitle.substr(0, 1);
+            DrawTextIn(dc, poster, initial.c_str(), RGB(235, 240, 246),
+                       state->bold_font,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        // 海报右下角备注角标（「更新至12集」「HD」…），影视仓同款位置。
+        if (!s.remarks.empty()) {
+            std::wstring rem = Utf8ToWideString(s.remarks);
+            if (rem.size() > 12) rem = rem.substr(0, 12) + L"…";
+            SIZE sz{};
+            SelectObject(dc, state->small_font);
+            GetTextExtentPoint32W(dc, rem.c_str(),
+                                  static_cast<int>(rem.size()), &sz);
+            const RECT badge = {poster.right - sz.cx - 14, poster.bottom - 22,
+                                poster.right - 4, poster.bottom - 6};
+            if (badge.left > poster.left) {
+                DrawRoundedBox(dc, badge, RGB(8, 10, 14), CLR_INVALID, 4);
+                DrawTextIn(dc, badge, rem.c_str(), RGB(196, 210, 224),
+                           state->small_font,
+                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+        }
+        // 来源标签（左上角）+ 评分（右上角）：影视仓同款角标。来源取站点名
+        // （最多 5 字）；评分仅当 CMS 返回了 score 字段才画（金色）。
+        {
+            SelectObject(dc, state->small_font);
+            std::wstring src = Utf8ToWideString(s.site_name);
+            if (src.size() > 5) src = src.substr(0, 5);
+            if (!src.empty()) {
+                SIZE sz{};
+                GetTextExtentPoint32W(dc, src.c_str(),
+                                      static_cast<int>(src.size()), &sz);
+                const int bw = sz.cx + 12;
+                const RECT badge = {poster.left + 4, poster.top + 4,
+                                    poster.left + 4 + bw, poster.top + 4 + 18};
+                DrawRoundedBox(dc, badge, RGB(8, 10, 14), CLR_INVALID, 4);
+                DrawTextIn(dc, badge, src.c_str(), RGB(196, 210, 224),
+                           state->small_font,
+                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            if (!s.score.empty()) {
+                std::wstring sc = Utf8ToWideString(s.score);
+                if (sc.size() > 4) sc = sc.substr(0, 4);
+                SIZE sz{};
+                GetTextExtentPoint32W(dc, sc.c_str(),
+                                      static_cast<int>(sc.size()), &sz);
+                const int bw = sz.cx + 12;
+                const RECT badge = {poster.right - 4 - bw, poster.top + 4,
+                                    poster.right - 4, poster.top + 4 + 18};
+                DrawRoundedBox(dc, badge, RGB(40, 30, 6), CLR_INVALID, 4);
+                DrawTextIn(dc, badge, sc.c_str(), RGB(245, 196, 80),
+                           state->small_font,
+                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+        }
+        // 海报下方：片名（白）+ 类型/年份（灰）
+        const int title_top = poster.bottom + 3;
+        DrawTextIn(dc,
+                   {card.left + 6, title_top, card.right - 6, title_top + 19},
+                   Utf8ToWideString(s.title).c_str(), kVideoTitleTx,
+                   state->ui_font,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                       DT_NOPREFIX);
+        std::string sub_raw = s.year;
+        if (!s.type_name.empty()) {
+            if (!sub_raw.empty()) sub_raw += " ";
+            sub_raw += s.type_name;
+        }
+        if (sub_raw.empty()) sub_raw = s.site_name;
+        const std::wstring sub = Utf8ToWideString(sub_raw);
+        DrawTextIn(dc,
+                   {card.left + 6, title_top + 20, card.right - 6,
+                    title_top + 36},
+                   sub.c_str(), kVideoSubTx, state->small_font,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                       DT_NOPREFIX);
+    }
+}
+
+bool HitVideoCard(BrowserState* state, int* group, int* item) {
+    if (!state || !state->sheet_list) return false;
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(state->sheet_list, &pt);
+    const LRESULT hit = SendMessageW(state->sheet_list, LB_ITEMFROMPOINT, 0,
+                                     MAKELPARAM(pt.x, pt.y));
+    const int row = LOWORD(hit);
+    if (HIWORD(hit) || row < 0 ||
+        row >= static_cast<int>(state->video_rows.size())) return false;
+    const BrowserState::DiscoverRow& r = state->video_rows[row];
+    if (r.header) return false;  // 标题行（站点 / 分区）不可点
+    const int col = std::max(0, static_cast<int>(pt.x) / kVideoCardWidth);
+    const int index = r.first + col;
+    if (r.group == -2) {  // 影视仓式分区卡片：下标落在 video_home_items
+        if (col >= r.count ||
+            index >= static_cast<int>(state->video_home_items.size()))
+            return false;
+        *group = -2;
+        *item = index;
+        return true;
+    }
+    if (r.group < 0 ||
+        r.group >= static_cast<int>(state->video_groups.size())) return false;
+    if (col >= r.count ||
+        index >= static_cast<int>(state->video_groups[r.group].items.size()))
+        return false;
+    *group = r.group;
+    *item = index;
+    return true;
+}
+
+// 点击落在分组标题行的分类页签上：返回 true 并回传组下标与页签下标
+// （-1 = 「全部」）。与绘制共用 LayoutVideoChips，几何完全一致。
+bool HitVideoChip(BrowserState* state, int* group, int* cat_index) {
+    if (!state || !state->sheet_list) return false;
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(state->sheet_list, &pt);
+    const LRESULT hit = SendMessageW(state->sheet_list, LB_ITEMFROMPOINT, 0,
+                                     MAKELPARAM(pt.x, pt.y));
+    const int row = LOWORD(hit);
+    if (HIWORD(hit) || row < 0 ||
+        row >= static_cast<int>(state->video_rows.size())) return false;
+    const BrowserState::DiscoverRow& r = state->video_rows[row];
+    if (!r.header || r.group < 0 ||
+        r.group >= static_cast<int>(state->video_groups.size())) return false;
+    RECT rc{};
+    if (!SendMessageW(state->sheet_list, LB_GETITEMRECT, row,
+                      reinterpret_cast<LPARAM>(&rc)))
+        return false;
+    HDC dc = GetDC(state->sheet_list);
+    const std::vector<VideoChip> chips =
+        LayoutVideoChips(dc, state, rc, r.group);
+    ReleaseDC(state->sheet_list, dc);
+    for (const VideoChip& chip : chips) {
+        if (PtInRect(&chip.rect, pt)) {
+            *group = r.group;
+            *cat_index = chip.cat_index;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- 影视仓式外壳：顶部分类导航行 + 图标功能栏 ------------------------------
+//
+// 分类导航行：推荐 + video_agg_categories（跨站合并，≤10）。图标功能栏：历史/直播/
+// 搜索/配置/线路/网盘/收藏/推送/设置；直播→导入源对话框、搜索→切到搜索页，其余先占位。
+// 几何只依赖字体与文本，绘制与命中测试共用同一份 Layout，保证完全一致。
+
+std::vector<VideoNavTab> LayoutVideoNavTabs(HDC dc, BrowserState* state,
+                                           const RECT& rc) {
+    std::vector<VideoNavTab> out;
+    if (!state) return out;
+    const int ch = kVideoNavH - 8;
+    const int y = rc.top + (kVideoNavH - ch) / 2;
+    int x = rc.left + 8;
+    SelectObject(dc, state->small_font);
+    auto place = [&](int cat_index, const std::wstring& label) {
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, label.c_str(),
+                              static_cast<int>(label.size()), &sz);
+        const int w = sz.cx + 20;
+        if (x + w > rc.right - 4) return;
+        out.push_back({{x, y, x + w, y + ch}, cat_index});
+        x += w + 6;
+    };
+    place(-1, L"推荐");
+    const int max_cats = std::min<int>(state->video_agg_categories.size(), 10);
+    for (int i = 0; i < max_cats; ++i)
+        place(i, Utf8ToWideString(state->video_agg_categories[i].name));
+    return out;
+}
+
+// 自绘 STATIC（分类导航行 / 图标功能栏）的双缓冲包装：整幅画进兼容位图后
+// 一次 BitBlt 上屏。以前直接画到屏幕，拖动缩放时每帧先露底色再画内容，
+// 两条自绘条是肉眼可见的闪烁源。
+template <typename Fn>
+void PaintBuffered(HWND control, Fn&& paint) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(control, &ps);
+    if (!dc) return;
+    RECT rc{};
+    GetClientRect(control, &rc);
+    const int width = std::max<LONG>(1, rc.right - rc.left);
+    const int height = std::max<LONG>(1, rc.bottom - rc.top);
+    const HDC buffer = CreateCompatibleDC(dc);
+    const HBITMAP canvas =
+        buffer ? CreateCompatibleBitmap(dc, width, height) : nullptr;
+    if (buffer && canvas) {
+        const HGDIOBJ old = SelectObject(buffer, canvas);
+        paint(buffer, rc);
+        BitBlt(dc, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, old);
+    }
+    if (canvas) DeleteObject(canvas);
+    if (buffer) DeleteDC(buffer);
+    EndPaint(control, &ps);
+}
+
+void PaintVideoNavbar(BrowserState* state, HWND control) {
+    PaintBuffered(control, [state](HDC dc, const RECT& rc) {
+        FillSolidRect(dc, rc, kVideoPageBg);
+        // 底部分隔线
+        FillSolidRect(dc, {rc.left, rc.bottom - 1, rc.right, rc.bottom},
+                      kVideoCardLine);
+        const auto tabs = LayoutVideoNavTabs(dc, state, rc);
+        for (const auto& tab : tabs) {
+            const bool active = tab.cat_index == state->video_active_cat;
+            if (active)
+                DrawRoundedBox(dc, tab.rect, kVideoSelLine, CLR_INVALID, 9);
+            else
+                DrawRoundedBox(dc, tab.rect, kVideoChipBg, kVideoChipLine, 9);
+            const std::wstring label = tab.cat_index < 0 ? L"推荐"
+                : Utf8ToWideString(state->video_agg_categories[tab.cat_index].name);
+            DrawTextIn(dc, tab.rect, label.c_str(),
+                       active ? RGB(255, 255, 255) : kVideoSubTx,
+                       state->small_font,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    });
+}
+
+void HandleVideoNavClick(BrowserState* state, HWND control) {
+    if (!state) return;
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(control, &pt);
+    RECT rc{};
+    GetClientRect(control, &rc);
+    HDC dc = GetDC(control);
+    const auto tabs = LayoutVideoNavTabs(dc, state, rc);
+    ReleaseDC(control, dc);
+    for (const auto& tab : tabs) {
+        if (PtInRect(&tab.rect, pt)) {
+            StartLoadAggVideoCategory(state, tab.cat_index);
+            InvalidateRect(control, nullptr, FALSE);
+            return;
+        }
+    }
+}
+
+std::vector<VideoIconBtn> LayoutVideoIconBtns(HDC dc, BrowserState* state,
+                                              const RECT& rc) {
+    std::vector<VideoIconBtn> out;
+    const int n = static_cast<int>(sizeof(kVideoIconLabels) /
+                                   sizeof(kVideoIconLabels[0]));
+    const int bw = (rc.right > rc.left) ? (rc.right - rc.left) / n : 40;
+    const int bh = kVideoIconH - 12;
+    const int y = rc.top + 6;
+    for (int i = 0; i < n; ++i) {
+        const int x = rc.left + i * bw + 4;
+        out.push_back({{x, y, x + bw - 8, y + bh}, i});
+    }
+    return out;
+}
+
+void PaintVideoIconbar(BrowserState* state, HWND control) {
+    PaintBuffered(control, [state](HDC dc, const RECT& rc) {
+        FillSolidRect(dc, rc, kVideoPageBg);
+        // 顶部分隔线
+        FillSolidRect(dc, {rc.left, rc.top, rc.right, rc.top + 1},
+                      kVideoCardLine);
+        SelectObject(dc, state->small_font);
+        const auto btns = LayoutVideoIconBtns(dc, state, rc);
+        for (size_t i = 0; i < btns.size(); ++i) {
+            const auto& b = btns[i];
+            const bool hot = state->hot_video_icon == static_cast<int>(i);
+            DrawRoundedBox(dc, b.rect,
+                           hot ? kVideoSelLine : kVideoChipBg,
+                           hot ? CLR_INVALID : kVideoChipLine, 8);
+            DrawTextIn(dc, b.rect, kVideoIconLabels[i],
+                       hot ? RGB(255, 255, 255) : kVideoTitleTx,
+                       state->small_font,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    });
+}
+
+void HandleVideoIconClick(BrowserState* state, HWND control) {
+    if (!state) return;
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(control, &pt);
+    RECT rc{};
+    GetClientRect(control, &rc);
+    HDC dc = GetDC(control);
+    const auto btns = LayoutVideoIconBtns(dc, state, rc);
+    ReleaseDC(control, dc);
+    for (size_t i = 0; i < btns.size(); ++i) {
+        if (PtInRect(&btns[i].rect, pt)) {
+            switch (static_cast<VideoIconId>(i)) {
+                case VideoIconId::kLive:
+                    OpenVideoSourceDialog(state);
+                    break;
+                case VideoIconId::kSearch:
+                    TabCtrl_SetCurSel(state->tab, 2);
+                    OnTabChanged(state, 2);
+                    break;
+                default: {
+                    const std::wstring name = kVideoIconLabels[i];
+                    SetVideoStatus(state, L"「" + name +
+                                           L"」功能即将上线，敬请期待");
+                    break;
+                }
+            }
+            InvalidateRect(control, nullptr, FALSE);
+            return;
+        }
+    }
+}
+
+// ---- 多源聚合推荐（影视仓式）----------------------------------------------
+//
+// 影视仓首页是「一条统一的推荐流」：分类页签 + 海报网格，从不按源分段。
+// 这里把所有 CMS 站点的内容合并成一条流：各站点轮询交错（每轮每站取一条，
+// 保证每个源均匀出现而不是「源 A 全部 + 源 B 全部」），同名同年影片只留
+// 第一份（跨源重复片在 CMS 生态里极其常见）。卡片自带 site_key，点击详情
+// 时各回各的源，聚合只影响展示层。
+
+// （NormalizeVideoTitle 已移出本匿名命名空间 —— 见文件下方 } // namespace
+//  之后的「跨编译单元导出符号」区，声明见 musicfree_browser_window.h。）
+
+// 用当前批次表重建聚合组（video_groups[0]）的混排列表。
+// cat_batches 非空（分类页签激活）时优先用它；否则用首页批次。
+void RebuildAggregatedVideoItems(BrowserState* state) {
+    if (!state) return;
+    BrowserState::VideoGroup* agg = nullptr;
+    for (auto& g : state->video_groups)
+        if (g.site_key == "agg:") { agg = &g; break; }
+    if (!agg) return;
+    const auto& batches = state->video_cat_batches.empty()
+                              ? state->video_agg_batches
+                              : state->video_cat_batches;
+    std::set<std::string> seen;
+    std::vector<ttplayer::video::VideoItem> out;
+    std::vector<size_t> cur(batches.size(), 0);
+    bool added = true;
+    while (added) {
+        added = false;
+        for (size_t i = 0; i < batches.size(); ++i) {
+            if (cur[i] >= batches[i].items.size()) continue;
+            added = true;
+            const ttplayer::video::VideoItem& it = batches[i].items[cur[i]++];
+            if (it.title.empty()) continue;
+            const std::string key = NormalizeVideoTitle(it.title, it.year);
+            if (!key.empty() && !seen.insert(key).second) continue;
+            out.push_back(it);
+        }
+    }
+    agg->items = std::move(out);
+}
+
+// 分类名归一化：去首尾空白、转小写，用于跨源同名去重。不同源常把同一分类
+// 写成 "电影" / "电影 " / "MOVIE"，不归一就会在顶部分类页签里出现"同名两条"。
+static std::string NormalizeCategoryName(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e) {
+        const unsigned char c = static_cast<unsigned char>(s[b]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v')
+            ++b;
+        else
+            break;
+    }
+    while (e > b) {
+        const unsigned char c = static_cast<unsigned char>(s[e - 1]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v')
+            --e;
+        else
+            break;
+    }
+    std::string out = s.substr(b, e - b);
+    for (char& c : out) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 'A' && u <= 'Z') c = static_cast<char>(u - 'A' + 'a');
+    }
+    return out;
+}
+
+// 把一个站点刚取回的分类表并进聚合页签：同名分类合并 per_site（替换式，
+// 站点重复刷新不会累积旧条目）。本函数只做"累积 / 去重"，不排序、不裁剪——
+// 排序与裁剪统一在 FinalizeAggVideoCategories 里、所有站点到齐后做一次，
+// 否则每到一个站点就重排，顶部分类页签会实时跳动、还把后到的挤掉（用户反馈
+// "顺序一直变 + 同名分类重复出现"）。
+void MergeAggVideoCategories(BrowserState* state, const std::string& site_key,
+                             const std::vector<ttplayer::video::VideoCategory>& cats) {
+    for (const auto& cat : cats) {
+        if (cat.id.empty() || cat.name.empty()) continue;
+        const std::string key = NormalizeCategoryName(cat.name);
+        if (key.empty()) continue;
+        BrowserState::VideoAggCategory* found = nullptr;
+        for (auto& agg : state->video_agg_categories)
+            if (agg.norm_name == key) { found = &agg; break; }
+        if (!found) {
+            BrowserState::VideoAggCategory fresh;
+            fresh.name = cat.name;
+            fresh.norm_name = key;
+            state->video_agg_categories.push_back(std::move(fresh));
+            found = &state->video_agg_categories.back();
+        }
+        auto& per = found->per_site;
+        per.erase(std::remove_if(per.begin(), per.end(),
+                                 [&](const std::pair<std::string, std::string>& p) {
+                                     return p.first == site_key;
+                                 }),
+                  per.end());
+        per.emplace_back(site_key, cat.id);
+    }
+}
+
+// 所有站点首页到齐后，按"共有站点数"稳定排序并把页签裁剪到 ≤10。
+// 只在此处做一次，顶部分类页签不会再中途乱跳 / 反复出现同名。
+void FinalizeAggVideoCategories(BrowserState* state) {
+    std::stable_sort(state->video_agg_categories.begin(),
+                     state->video_agg_categories.end(),
+                     [](const BrowserState::VideoAggCategory& a,
+                        const BrowserState::VideoAggCategory& b) {
+                         return a.per_site.size() > b.per_site.size();
+                     });
+    if (state->video_agg_categories.size() > 10)
+        state->video_agg_categories.resize(10);
+}
+
+// 批次并入/替换（静默刷新时同站点新数据直接覆盖旧批次，界面无缝更新）。
+void UpsertAggBatch(std::vector<BrowserState::VideoAggBatch>& batches,
+                    VideoHomePayload* payload) {
+    BrowserState::VideoAggBatch batch;
+    batch.site_key = payload->site_key;
+    batch.site_name = payload->site_name;
+    batch.items = std::move(payload->items);
+    for (auto& b : batches) {
+        if (b.site_key == batch.site_key) {
+            b.site_name = batch.site_name;
+            b.items = std::move(batch.items);
+            return;
+        }
+    }
+    batches.push_back(std::move(batch));
+}
+
+void StartLoadAggVideoCategory(BrowserState* state, int cat_index);
+
+// 视频首页聚合：并发抓取所有 CMS 站点的首页内容，UI 端合并成一条
+// 「多源推荐流」（影视仓式统一推荐网格），批次到达即渐进填充，不按站点分段。
+// 软件启动后自动刷新一次已导入的 TVBox 源。配置源随时会换内容、换加密方式，
+// 这里走的是与「首次导入」完全相同的下载 + 自动解密链，成功才写回缓存。
+//
+// 线程安全要点：后台线程不碰窗口状态（窗口可能随时关闭），而是用复制出来的
+// 目录与网络配置另建一个独立管理器；写盘完成后只 PostMessage 一个 HWND。
+// 进程内只触发一次，避免每次打开音乐窗都重新联网。
+void MaybeRefreshVideoSources(BrowserState* state) {
+    static std::atomic<bool> s_started{false};
+    if (!state || !state->video_mgr) return;
+    if (s_started.exchange(true)) return;
+    const HWND hwnd = state->hwnd;
+    const std::filesystem::path dir = state->video_mgr->cache_dir();
+    const auto net = state->video_mgr->network();
+    std::thread([hwnd, dir, net]() {
+        try {
+            ttplayer::video::VideoSourceManager mgr(dir);
+            mgr.SetNetworkConfig(net);
+            mgr.LoadCached();
+            const auto rep = mgr.RefreshAll();
+            if (rep.updated > 0)
+                PostMessageW(hwnd, kMsgVideoSourcesRefreshed, 0, 0);
+        } catch (...) {
+            // 网络异常 / 源失效：保留旧缓存，下一轮启动再试。
+        }
+    }).detach();
+}
+
+void StartLoadVideo(BrowserState* state, bool force) {
+    if (!state) return;
+    // 懒创建兜底：窗口创建期的 video_mgr 初始化可能被更早的启动消息抢先，
+    // 也可能因宿主状态没就绪而整段跳过。视频页真正要取数据时再补一次，
+    // 保证 StartLoadVideo 不会因为 mgr 为空而静默 return（表现为永远占位）。
+    if (!state->video_mgr) {
+        std::wstring exe_w(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, exe_w.data(),
+                                           static_cast<DWORD>(exe_w.size()));
+        if (n > 0) {
+            exe_w.resize(n);
+            const std::filesystem::path exe_dir =
+                std::filesystem::path(exe_w).parent_path();
+            state->video_mgr =
+                std::make_unique<ttplayer::video::VideoSourceManager>(
+                    exe_dir / "video");
+            ttplayer::musicfree::NetworkConfig net;
+            if (state->mgr) net = state->mgr->network();
+            if (net.user_agent.empty())
+                net.user_agent = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 L"AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 L"Chrome/124.0.0.0 Safari/537.36";
+            state->video_mgr->SetNetworkConfig(std::move(net));
+            state->video_mgr->LoadCached();
+            state->video_sources_ready = true;
+            TraceImport("video_mgr lazy-created");
+        }
+    }
+    TraceImport("StartLoadVideo mgr=%d busy=%d force=%d",
+                state->video_mgr ? 1 : 0,
+                state->video_busy.load() ? 1 : 0, force ? 1 : 0);
+    if (!state->video_mgr) return;
+    if (state->video_busy.exchange(true)) return;
+    if (state->video_loaded && !force) {
+        ReleaseVideoBusy(state);
+        return;
+    }
+    state->selected_video_group = -1;
+    state->selected_video_item = -1;
+    state->video_art_requested.clear();
+    state->video_loaded = false;
+    state->video_agg_batches.clear();
+    state->video_cat_batches.clear();
+    state->video_agg_categories.clear();
+    state->video_active_cat = -1;
+    state->video_cat_expected = 0;
+    // 聚合推荐组永远在最前（影视仓首页 = 推荐流优先），直播卡片垫底。
+    state->video_groups.clear();
+    state->video_rows.clear();
+    BrowserState::VideoGroup agg;
+    agg.site_key = "agg:";
+    agg.site_name = "推荐";
+    state->video_groups.push_back(std::move(agg));
+    // 直播源卡片先铺上（纯本地数据，不发请求）。就算所有 CMS 站点都取不到
+    // 内容，页面上至少有「直播源」卡片可点，不再是一排空占位。
+    AddLiveSourceCards(state);
+    state->video_placeholder = false;
+    state->video_placeholder_text = L"正在准备…";
+    FillVideoList(state);
+    SetVideoStatus(state, L"正在聚合各视频源的推荐内容…窗口现在即可操作");
+
+    std::weak_ptr<BrowserState> weak = g_browser;
+    // 视频后台线程不得持有裸 video_mgr：窗口销毁时 BrowserState（连同
+    // video_mgr）立即析构，线程再访问就是 use-after-free（PageHeap 实测在
+    // AllSites/network() 的内部锁上触发 AppVerifier stop，随后保存配置时
+    // abort）。改为每个访问点 weak.lock() 保活 BrowserState，并纳入退出
+    // 协调计数，程序关闭时随 ShutdownMusicFree 一起被等待。
+    std::thread([weak] {
+        BgThreadGuard guard;
+        auto sp = weak.lock();
+        if (!sp || !sp->video_mgr || IsMusicFreeShuttingDown()) return;
+        auto* mgr = sp->video_mgr.get();
+        std::vector<ttplayer::video::VideoSite> sites;
+        try { sites = mgr->AllSites(); } catch (...) { return; }
+        // 每站点独立线程并发抓取（影视仓的爬虫也是 spThreadPool 并发跑）：
+        // 串行 4 站要 4 倍时间，聚合流会被最慢的源拖住。
+        std::vector<std::thread> workers;
+        for (const auto& site : sites) {
+            workers.emplace_back([weak, site] {
+                BgThreadGuard worker_guard;
+                auto* batch = new VideoHomePayload();
+                batch->site_key = site.key.empty() ? site.name : site.key;
+                batch->site_name = site.name;
+                try {
+                    auto alive = weak.lock();
+                    if (!alive || !alive->video_mgr ||
+                        IsMusicFreeShuttingDown()) {
+                        batch->error = "正在退出";
+                    } else {
+                        ttplayer::video::VideoListing listing =
+                            ttplayer::video::FetchHome(
+                                site, alive->video_mgr->network());
+                        batch->items = std::move(listing.items);
+                        batch->categories = std::move(listing.categories);
+                        batch->error = listing.error;
+                    }
+                } catch (const std::exception& e) {
+                    batch->error = e.what();
+                } catch (...) {
+                    batch->error = "未知错误";
+                }
+                TraceImport("home site=%s items=%zu err=%s", batch->site_key.c_str(),
+                            batch->items.size(), batch->error.c_str());
+                auto poster = weak.lock();
+                if (!poster) { delete batch; return; }
+                if (!PostMessageW(poster->hwnd, kMsgVideoHomeReady, 0,
+                                  reinterpret_cast<LPARAM>(batch)))
+                    delete batch;
+            });
+        }
+        for (auto& t : workers) t.join();
+        auto* done = new VideoHomePayload();
+        done->finished = true;
+        done->total = static_cast<int>(sites.size());
+        auto done_poster = weak.lock();
+        if (!done_poster) { delete done; return; }
+        if (!PostMessageW(done_poster->hwnd, kMsgVideoHomeReady, 0,
+                          reinterpret_cast<LPARAM>(done)))
+            delete done;
+    }).detach();
+}
+
+// 分类页签点击（聚合版）：cat_index = -1 是「推荐」，本地重算混排秒回首页；
+// 其它页签对每个有该分类的站点并发拉第一页，批次到齐后重排聚合流。
+void StartLoadAggVideoCategory(BrowserState* state, int cat_index) {
+    if (!state || !state->video_mgr) return;
+    if (cat_index < -1 ||
+        cat_index >= static_cast<int>(state->video_agg_categories.size()))
+        return;
+    if (cat_index == state->video_active_cat) return;  // 重复点击当前页签
+    if (state->video_busy.exchange(true)) {
+        // 不再静默丢弃：记下用户点的分类，当前任务结束（ReleaseVideoBusy）
+        // 后自动执行。以前首页聚合动辄几十秒，期间所有分类点了都没反应。
+        state->video_pending_cat.store(cat_index);
+        // 立即给可见反馈：清掉首页渐进数据、整块网格换成「加载中」骨架——
+        // 用户点了分类立刻看到切换动作，而不是对着旧内容干等几十秒。
+        // 首页聚合剩余批次到达时会照常走 finished 分支复位 busy 并执行本分类。
+        for (auto& g : state->video_groups) {
+            if (g.site_key != "agg:") continue;
+            g.items.clear();
+            g.active_category_name.clear();
+            break;
+        }
+        state->video_agg_batches.clear();
+        state->video_active_cat = cat_index;
+        state->video_placeholder = true;
+        state->video_placeholder_text =
+            cat_index < 0 ? L"正在返回推荐流…" : L"正在加载所选分类…";
+        state->video_loaded = false;
+        FillVideoList(state);
+        SetVideoStatus(state, L"正在加载，已记下分类切换，完成后自动执行…");
+        return;
+    }
+    BrowserState::VideoGroup* agg = nullptr;
+    for (auto& g : state->video_groups)
+        if (g.site_key == "agg:") { agg = &g; break; }
+    if (!agg) { ReleaseVideoBusy(state); return; }  // 搜索中聚合组被暂替
+    state->video_active_cat = cat_index;
+    state->video_cat_batches.clear();
+    if (cat_index < 0) {
+        // 「推荐」：首页批次还在内存里，直接重排，不联网。
+        agg->category_loading = false;
+        agg->active_category.clear();
+        agg->active_category_name = L"推荐";
+        RebuildAggregatedVideoItems(state);
+        FillVideoList(state);
+        SetVideoStatus(state, L"已恢复多源推荐流");
+        ReleaseVideoBusy(state);
+        return;
+    }
+    const BrowserState::VideoAggCategory& target =
+        state->video_agg_categories[cat_index];
+    agg->category_loading = true;
+    agg->active_category = target.name;
+    agg->active_category_name = Utf8ToWideString(target.name);
+    RebuildAggregatedVideoItems(state);   // 批次清空 → 先展示空网格
+    FillVideoList(state);
+    if (state->video_navbar)
+        InvalidateRect(state->video_navbar, nullptr, FALSE);  // 高亮当前页签
+    SetVideoStatus(state, L"正在聚合「" + agg->active_category_name +
+                              L"」分类（" +
+                              std::to_wstring(target.per_site.size()) +
+                              L" 个片源）…");
+
+    // 复制站点表快照：后台线程各取各的 id，互不依赖。
+    std::vector<std::pair<ttplayer::video::VideoSite, std::string>> jobs;
+    try {
+        for (const auto& s : state->video_mgr->AllSites()) {
+            const std::string key = s.key.empty() ? s.name : s.key;
+            for (const auto& [site_key, cat_id] : target.per_site)
+                if (site_key == key) { jobs.emplace_back(s, cat_id); break; }
+        }
+    } catch (...) {}
+    state->video_cat_expected = static_cast<int>(jobs.size());
+    if (jobs.empty()) {
+        agg->category_loading = false;
+        SetVideoStatus(state, L"该分类没有可用的片源");
+        ReleaseVideoBusy(state);
+        return;
+    }
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::vector<std::thread> workers;
+    for (const auto& [site, cat_id] : jobs) {
+        workers.emplace_back([weak, site, cat_id] {
+            BgThreadGuard guard;
+            auto* batch = new VideoHomePayload();
+            batch->category_load = true;
+            batch->site_key = site.key.empty() ? site.name : site.key;
+            batch->site_name = site.name;
+            try {
+                auto alive = weak.lock();
+                if (!alive || !alive->video_mgr || IsMusicFreeShuttingDown()) {
+                    batch->error = "正在退出";
+                } else {
+                    ttplayer::video::VideoListing listing =
+                        ttplayer::video::FetchCategory(
+                            site, cat_id, 1, alive->video_mgr->network());
+                    batch->items = std::move(listing.items);
+                    batch->error = listing.error;
+                }
+            } catch (const std::exception& e) {
+                batch->error = e.what();
+            } catch (...) {
+                batch->error = "未知错误";
+            }
+            TraceImport("category site=%s cat=%s items=%zu err=%s",
+                        batch->site_key.c_str(), cat_id.c_str(),
+                        batch->items.size(), batch->error.c_str());
+            auto poster = weak.lock();
+            if (!poster) { delete batch; return; }
+            if (!PostMessageW(poster->hwnd, kMsgVideoHomeReady, 0,
+                              reinterpret_cast<LPARAM>(batch)))
+                delete batch;
+        });
+    }
+    for (auto& t : workers) t.detach();   // 批次各自回帖，最后一个到时复位 busy
+}
+
+// 直播源卡片：一个 live 源一张卡，全部是本地数据、不联网，点开才去拉频道表。
+//
+// 为什么必须放进首页：现在大量 TVBox 仓库整站都是 SPIDER（api 写成
+// csp_XxxGuard 这种类名，要 TVBox 的 JS/Java 运行库才能跑），本程序一个都取不到
+// 内容；这类配置里唯一真能播的就是 lives（m3u / txt）。以前首页只剩四张
+// 「点击「导入…」」的占位卡，导入明明成功了却像什么都没发生。
+void AddLiveSourceCards(BrowserState* state) {
+    if (!state || !state->video_mgr) return;
+    for (const auto& group : state->video_groups)
+        if (group.site_key == "live:") return;   // 已经铺过
+    std::vector<ttplayer::video::VideoLive> lives;
+    try { lives = state->video_mgr->AllLives(); } catch (...) { return; }
+    if (lives.empty()) return;
+    BrowserState::VideoGroup group;
+    group.site_key = "live:";
+    group.site_name = "直播源";
+    for (std::size_t i = 0; i < lives.size(); ++i) {
+        ttplayer::video::VideoItem item;
+        item.id = std::to_string(i);
+        item.site_key = "live:" + lives[i].url;   // 前缀标记：点击走直播分支
+        item.site_name = lives[i].name;
+        item.title = lives[i].name;
+        item.remarks = lives[i].group.empty() ? "直播源" : lives[i].group;
+        group.items.push_back(std::move(item));
+    }
+    state->video_groups.push_back(std::move(group));
+}
+
+// 打开直播源卡片：拉频道表（m3u / txt），把频道当成「选集」灌进下方列表，
+// 双击任意频道由视频窗口直接播放（地址本身就是可播的 m3u8 / flv / ts）。
+void StartOpenVideoLive(BrowserState* state, const ttplayer::video::VideoItem& item) {
+    if (!state || !state->video_mgr) return;
+    const std::string want = item.site_key.size() > 5 ? item.site_key.substr(5)
+                                                      : std::string();
+    ttplayer::video::VideoLive live;
+    try {
+        for (const auto& l : state->video_mgr->AllLives())
+            if (l.url == want) { live = l; break; }
+    } catch (...) {}
+    if (live.url.empty()) {
+        SetVideoSheetCaption(state, L"找不到这个直播源，可能已被删除；点「导入…」可重新添加");
+        return;
+    }
+    if (!state->video_tracks_visible) {
+        state->video_tracks_visible = true;
+        LayoutChildren(state);
+    }
+    if (state->video_detail_busy.exchange(true)) return;
+    state->video_hits.clear();
+    FillResultList(state);
+    SetBusyUi(state, true);
+    SetVideoSheetCaption(state, L"直播源「" + Utf8ToWideString(live.name) +
+                                   L"」· 正在读取频道表…");
+
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::thread([weak, live] {
+        BgThreadGuard guard;
+        auto* payload = new VideoDetailPayload();
+        payload->title = live.name;
+        payload->site_name = live.name;
+        payload->live = true;
+        try {
+            auto alive = weak.lock();
+            if (!alive || !alive->video_mgr || IsMusicFreeShuttingDown()) {
+                payload->error = "正在退出";
+            } else {
+                ttplayer::video::LiveListing listing =
+                    ttplayer::video::FetchLive(
+                        live, alive->video_mgr->network());
+                payload->error = listing.error;
+                ttplayer::video::VideoLine line;
+                line.name = live.group.empty() ? "直播" : live.group;
+                for (auto& channel : listing.channels) {
+                    ttplayer::video::VideoEpisode ep;
+                    ep.name = channel.name.empty() ? channel.url : channel.name;
+                    ep.url = channel.url;
+                    line.episodes.push_back(std::move(ep));
+                }
+                if (!line.episodes.empty()) payload->lines.push_back(std::move(line));
+            }
+        } catch (const std::exception& e) {
+            payload->error = e.what();
+        } catch (...) {
+            payload->error = "直播频道读取异常";
+        }
+        auto poster = weak.lock();
+        if (!poster) { delete payload; return; }
+        if (!PostMessageW(poster->hwnd, kMsgVideoDetailReady, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 打开选中的视频卡片：取详情（多路线路选集）→ 灌进下方结果列表。
+void StartOpenVideoItem(BrowserState* state) {
+    if (!state || !state->video_mgr) return;
+    if (state->selected_video_item < 0) {
+        SetVideoSheetCaption(state, L"请先点击一张视频卡片查看选集");
+        return;
+    }
+    const ttplayer::video::VideoItem* pitem = nullptr;
+    if (state->selected_video_group == -2) {  // 影视仓式分区卡片
+        if (state->selected_video_item <
+            static_cast<int>(state->video_home_items.size()))
+            pitem = &state->video_home_items[state->selected_video_item];
+    } else if (state->selected_video_group >= 0 &&
+               state->selected_video_group <
+                   static_cast<int>(state->video_groups.size())) {
+        const auto& items = state->video_groups[state->selected_video_group].items;
+        if (state->selected_video_item < static_cast<int>(items.size()))
+            pitem = &items[state->selected_video_item];
+    }
+    if (!pitem) {
+        SetVideoSheetCaption(state, L"请先点击一张视频卡片查看选集");
+        return;
+    }
+    ttplayer::video::VideoItem item = *pitem;
+    if (item.site_key.rfind("live:", 0) == 0) {
+        StartOpenVideoLive(state, item);
+        return;
+    }
+    ttplayer::video::VideoSite site;
+    for (const auto& s : state->video_mgr->AllSites())
+        if ((s.key.empty() ? s.name : s.key) == item.site_key) { site = s; break; }
+    if (!state->video_tracks_visible) {
+        state->video_tracks_visible = true;
+        LayoutChildren(state);
+    }
+    if (state->video_detail_busy.exchange(true)) return;
+    state->video_hits.clear();
+    FillResultList(state);
+    SetBusyUi(state, true);
+    const std::wstring title = Utf8ToWideString(item.title);
+    SetVideoSheetCaption(state, L"视频「" + title + L"」· 正在加载选集（多路线路）…");
+
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::thread([weak, item, site] {
+        BgThreadGuard guard;
+        auto* payload = new VideoDetailPayload();
+        payload->title = item.title;
+        payload->site_name = site.name;
+        payload->play_url = site.play_url;
+        try {
+            auto alive = weak.lock();
+            if (!alive || !alive->video_mgr || IsMusicFreeShuttingDown()) {
+                payload->error = "正在退出";
+            } else {
+                ttplayer::video::VideoDetail detail =
+                    ttplayer::video::FetchDetail(
+                        site, item, alive->video_mgr->network());
+                payload->title = detail.title;
+                payload->lines = std::move(detail.lines);
+            }
+        } catch (const std::exception& e) {
+            payload->error = e.what();
+        } catch (...) {
+            payload->error = "详情读取异常";
+        }
+        auto poster = weak.lock();
+        if (!poster) { delete payload; return; }
+        if (!PostMessageW(poster->hwnd, kMsgVideoDetailReady, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 视频搜索：跨站点 FetchSearch 聚合，结果直接进卡片网格。
+void StartVideoSearch(BrowserState* state) {
+    if (!state || !state->video_mgr) return;
+    const std::wstring q = WindowText(state->query);
+    if (q.empty()) { SetVideoStatus(state, L"请输入要搜索的影视名称"); return; }
+    const std::string keyword = core::WideToUtf8(q);
+    if (state->video_busy.exchange(true)) {
+        SetVideoStatus(state, L"视频搜索进行中，请稍候");
+        return;
+    }
+    state->video_groups.clear();
+    state->video_rows.clear();
+    state->video_active_cat = -1;
+    state->video_cat_batches.clear();
+    state->video_placeholder = false;
+    FillVideoList(state);
+    SetBusyUi(state, true);
+    SetVideoStatus(state, L"正在跨视频源搜索：「" + q + L"」…");
+
+    std::weak_ptr<BrowserState> weak = g_browser;
+    std::thread([weak, keyword] {
+        BgThreadGuard guard;
+        auto* payload = new VideoSearchPayload();
+        std::vector<ttplayer::video::VideoSite> sites;
+        try {
+            auto alive = weak.lock();
+            if (alive && alive->video_mgr && !IsMusicFreeShuttingDown())
+                sites = alive->video_mgr->AllSites();
+        } catch (...) {}
+        payload->sites_total = static_cast<int>(sites.size());
+        for (const auto& site : sites) {
+            try {
+                auto alive = weak.lock();
+                if (!alive || !alive->video_mgr || IsMusicFreeShuttingDown())
+                    break;
+                ttplayer::video::VideoListing listing =
+                    ttplayer::video::FetchSearch(site, keyword, 1,
+                                                 alive->video_mgr->network());
+                for (auto& it : listing.items) {
+                    it.site_key = site.key.empty() ? site.name : site.key;
+                    it.site_name = site.name;
+                    payload->items.push_back(std::move(it));
+                }
+                if (listing.items.empty() && listing.error.empty())
+                    payload->sites_ok++;
+                else
+                    payload->sites_ok++;
+            } catch (...) {}
+        }
+        auto poster = weak.lock();
+        if (!poster) { delete payload; return; }
+        if (!PostMessageW(poster->hwnd, kMsgVideoSearchReady, 0,
+                          reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 紧凑模态输入框（无需 RC 资源）：用于粘贴影视仓 / TVBox 配置地址。
+//
+// ⚠ 已停用（2026-11-07）：这个自建窗口类在本进程里 CreateWindowExW 恒失败，
+// 返回 NULL + GetLastError=1400（ERROR_INVALID_WINDOW_HANDLE）—— 已确认类注册
+// 成功（GetClassInfoEx 能查到）、同一时刻建系统类 STATIC 窗口正常、换样式/换
+// owner/owner=nullptr 都一样失败。表现就是点了「导入…」毫无反应。视频源导入
+// 因此改成**不新建窗口**的方案：把底部状态行临时变成地址输入栏。
+#if 0
+namespace {
+struct InputBoxCtx {
+    HWND edit = nullptr;
+    std::wstring value;
+    std::wstring prompt;
+    bool confirmed = false;
+};
+LRESULT CALLBACK InputBoxProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+    auto* ctx = reinterpret_cast<InputBoxCtx*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCCREATE: {
+            ctx = reinterpret_cast<InputBoxCtx*>(
+                reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+            return DefWindowProcW(hwnd, msg, w, l);
+        }
+        case WM_CREATE: {
+            HWND label = CreateWindowW(L"STATIC", ctx->prompt.c_str(),
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 12, 396, 24, hwnd, nullptr,
+                nullptr, nullptr);
+            if (label)
+                SendMessageW(label, WM_SETFONT,
+                             reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            ctx->edit = CreateWindowW(L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                12, 40, 396, 26, hwnd, reinterpret_cast<HMENU>(1), nullptr, nullptr);
+            if (ctx->edit) {
+                SendMessageW(ctx->edit, WM_SETFONT,
+                             reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+                SetWindowTextW(ctx->edit, ctx->value.c_str());
+                SetFocus(ctx->edit);
+            }
+            CreateWindowW(L"BUTTON", L"确定",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 232, 92, 86, 28, hwnd,
+                reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"取消",
+                WS_CHILD | WS_VISIBLE, 326, 92, 86, 28, hwnd,
+                reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(w) == IDOK) {
+                wchar_t b[4096]{};
+                if (ctx->edit) GetWindowTextW(ctx->edit, b, 4096);
+                ctx->value = b;
+                ctx->confirmed = true;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(w) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, w, l);
+}
+} // namespace
+
+bool GetInputText(HWND owner, const std::wstring& caption,
+                 const std::wstring& prompt, wchar_t* out, size_t out_len) {
+    InputBoxCtx ctx;
+    ctx.prompt = prompt;
+    static const wchar_t* cls = L"TTPlayerInputBox";
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = InputBoxProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = cls;
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        if (RegisterClassExW(&wc) ||
+            GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
+            reg = true;
+        else {
+            TraceImport("GetInputText register class failed err=%lu", GetLastError());
+            return false;
+        }
+    }
+    if (owner) EnableWindow(owner, FALSE);
+
+    // 居中到 owner。原来固定放在 (0,0)：窗口会跑到屏幕左上角，离音乐窗很远，
+    // 用户很容易以为「没反应」。
+    RECT anchor{0, 0, 0, 0};
+    if (owner) GetWindowRect(owner, &anchor);
+    const int w = 420, h = 170;
+    const int x = anchor.left + ((anchor.right - anchor.left) - w) / 2;
+    const int y = anchor.top + ((anchor.bottom - anchor.top) - h) / 2;
+
+    // 先试「带标题栏的对话框外观」。★ 这里**不能**用 WS_EX_TOPMOST：
+    // CreateWindowEx 的扩展样式里没有这一项（置顶要用 SetWindowPos），带上它
+    // 会让窗口创建直接失败（GetLastError 返回 1400），于是点了「导入」毫无反应。
+    // 万一某些系统上带标题栏的 popup 也建不出来，再退回无边框样式，保证可用。
+    const auto create_with = [&](DWORD style, DWORD ex_style, HWND parent) {
+        ctx.edit = nullptr;
+        SetLastError(0);
+        HWND handle = CreateWindowExW(ex_style, cls, caption.c_str(), style,
+                                      x, y, w, h, parent, nullptr,
+                                      GetModuleHandleW(nullptr), &ctx);
+        TraceImport("GetInputText create style=%08lx ex=%08lx parent=%p -> %p err=%lu",
+                    style, ex_style, parent, handle, GetLastError());
+        return handle;
+    };
+    TraceImport("GetInputText owner=%p iswindow=%d hinst=%p", owner,
+                (owner && IsWindow(owner)) ? 1 : 0, GetModuleHandleW(nullptr));
+    {
+        WNDCLASSEXW info{sizeof(info)};
+        const BOOL have = GetClassInfoExW(GetModuleHandleW(nullptr), cls, &info);
+        SetLastError(0);
+        HWND probe = CreateWindowExW(0, L"STATIC", L"probe",
+                                     WS_POPUP | WS_VISIBLE, 0, 0, 20, 20,
+                                     nullptr, nullptr, GetModuleHandleW(nullptr),
+                                     nullptr);
+        TraceImport("probe: class_registered=%d err_info=%lu system_class_hwnd=%p err=%lu",
+                    have ? 1 : 0, GetLastError(), probe, GetLastError());
+        if (probe) DestroyWindow(probe);
+    }
+    HWND hwnd = create_with(WS_POPUP | WS_CLIPCHILDREN | WS_CAPTION | WS_SYSMENU,
+                            WS_EX_TOOLWINDOW, owner);
+    if (!hwnd)
+        hwnd = create_with(WS_POPUP | WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, owner);
+    if (!hwnd)
+        hwnd = create_with(WS_POPUP | WS_CLIPCHILDREN | WS_CAPTION | WS_SYSMENU,
+                           WS_EX_TOOLWINDOW, nullptr);
+    if (!hwnd) { if (owner) EnableWindow(owner, TRUE); return false; }
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+    MSG m;
+    while (IsWindow(hwnd) && GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    if (owner && IsWindow(owner)) EnableWindow(owner, TRUE);
+    if (ctx.confirmed && out && out_len > 0) {
+        wcsncpy_s(out, out_len, ctx.value.c_str(), _TRUNCATE);
+        return true;
+    }
+    return false;
+}
+#endif  // 停用的自建模态输入框
+
+// ------------------------------------------------- 视频源导入（模态对话框）
+//
+// 与音乐侧「导入音源」完全同款：点「导入…」弹出一个和音乐窗同一个皮肤外框的
+// 模态窗口（ttplayer::video::ShowVideoSourceDialog），里面既能粘贴影视仓 /
+// TVBox 地址导入，也能看到**已经导入过的**每一份配置及其站点清单（点一行即
+// 显示详情），还能复选删除。
+//
+// 早前为了绕开自建窗口创建失败（GetLastError=1400）改成过「把底部状态行临时
+// 变成输入框」的页面内方案，那样既看不到已导入的源、也没法删。视频源对话框
+// 复用音乐导入窗那套已在真机验证过的建窗方式（WS_POPUP + WS_EX_TOOLWINDOW），
+// 因此回到对话框形态。
+
+void OpenVideoSourceDialog(BrowserState* state) {
+    if (!state || !state->video_mgr) return;
+    // ★ 这里**不再**因为首页 / 详情正在加载就拒绝打开：管理器内部用互斥锁保护
+    // imported_，AllSites() 返回的是值拷贝，并发读写是安全的；而「点了导入却没
+    // 反应」正是这类静默早退造成的。真正的并发写（video_groups）用
+    // video_reload_pending 推迟到当前聚合结束后再做。
+    TraceImport("ShowVideoSourceDialog enter busy=%d detail=%d",
+                state->video_busy.load() ? 1 : 0,
+                state->video_detail_busy.load() ? 1 : 0);
+    const bool changed = ttplayer::video::ShowVideoSourceDialog(
+        state->hwnd, state->video_mgr.get(), state->host.skin);
+    TraceImport("ShowVideoSourceDialog leave changed=%d", changed ? 1 : 0);
+    if (changed) {
+        // 站点集合变了：首页要按新表重新聚合。
+        state->video_loaded = false;
+        if (state->video_busy.load()) {
+            state->video_reload_pending = true;
+            SetVideoStatus(state, L"已更新视频源，正在按新源重新加载首页…");
+        } else {
+            StartLoadVideo(state, true);
+        }
+        return;
+    }
+    // 没改动也把源情况写回状态行：用户可能只是打开看了一眼已导入的源。
+    // 按「真能取到内容的东西」分情况说清楚 —— 全 SPIDER 的仓库说「点卡片查看
+    // 剧集」就是在误导，那几张卡片是直播源。
+    const auto sources = state->video_mgr->ListSources();
+    const size_t count = sources.size();
+    if (!count) {
+        SetVideoStatus(state, L"尚未导入视频源，点「导入…」添加影视仓 / TVBox 地址");
+        return;
+    }
+    int cms = 0, native = 0, spider = 0, lives = 0;
+    for (const auto& src : sources) {
+        lives += static_cast<int>(src.lives.size());
+        for (const auto& s : src.sites) {
+            if (s.kind == ttplayer::video::VideoSourceKind::kCms) ++cms;
+            else if (s.kind == ttplayer::video::VideoSourceKind::kNativeSpider) ++native;
+            else if (s.kind == ttplayer::video::VideoSourceKind::kSpider) ++spider;
+        }
+    }
+    if (cms > 0 || native > 0) {
+        SetVideoStatus(state, L"已导入 " + std::to_wstring(count) +
+            L" 个视频源，点卡片查看剧集");
+    } else if (lives > 0) {
+        SetVideoStatus(state, L"已导入 " + std::to_wstring(count) + L" 个视频源：" +
+            std::to_wstring(lives) + L" 个直播源可点开观看" +
+            (spider > 0 ? L"（SPIDER 站点需 TVBox 运行库，暂不支持）" : L""));
+    } else if (spider > 0) {
+        SetVideoStatus(state, L"已导入 " + std::to_wstring(count) + L" 个视频源，但 " +
+            std::to_wstring(spider) +
+            L" 个站点全是 SPIDER 类型，本程序取不到内容；请换含 CMS 接口（provide/vod）的源");
+    } else {
+        SetVideoStatus(state, L"已导入 " + std::to_wstring(count) +
+            L" 个视频源，但未识别到可播放站点；请检查配置里的 api 是否有效");
+    }
+}
+
+
+// ------------------------------------------- WebView2 页面承载 / 运行库自动安装
+//
+// 以前「系统没装 Runtime」就静默回退旧 Win32 控件，用户永远看不到 WebUI。
+// 现在按系统版本选 Runtime（见 webview2_runtime.h），缺失时后台下载官方
+// Bootstrapper 静默安装：Win10+ 装最新版，Win7/8/8.1 自动装 109.0.1518.78；
+// 装完 PostMessage(kMsgWebView2Installed) 回来重试，本次会话就能切到 WebUI。
+void TryAttachWebview(HWND hwnd, BrowserState* state) {
+    if (!state) return;
+    static const bool kNoWv =
+        GetEnvironmentVariableW(L"TTPLAYER_NO_WEBVIEW", nullptr, 0) > 0;
+    if (kNoWv || state->webview_failed) return;
+
+    if (!ttplayer::musicfree::WebviewHost::RuntimeAvailable()) {
+        // 进程内只启动一次；XP 上 Plan 判为不支持，完全不会下载。
+        ttplayer::musicfree::EnsureWebView2RuntimeAsync(hwnd,
+                                                        kMsgWebView2Installed);
+        return;
+    }
+
+    const std::wstring root = ttplayer::musicfree::PrepareWebuiRoot();
+    if (root.empty()) return;
+    state->bridge = std::make_unique<ttplayer::musicfree::MusicFreeBridge>();
+    state->bridge->Register(
+        "tab.switch",
+        [st = state](const nlohmann::json& payload,
+                     ttplayer::musicfree::MusicFreeBridge::ReplyFn reply) {
+            if (payload.is_object()) {
+                if (const auto it = payload.find("tab");
+                    it != payload.end() && it->is_string())
+                    st->page_tab = it->get<std::string>();
+            }
+            reply(true, nlohmann::json::object(), std::string());
+        });
+    ttplayer::musicfree::RegisterMusicCommands(*state->bridge);
+    ttplayer::musicfree::RegisterVideoCommands(*state->bridge);
+    ttplayer::musicfree::RegisterMiscCommands(*state->bridge);
+    state->webview = std::make_unique<ttplayer::musicfree::WebviewHost>();
+    if (state->webview->Create(hwnd, state->layout.content, root.c_str(),
+                               state->bridge.get())) {
+        HideLegacyContentControls(state, true);  // 页面接管视觉，旧控件只藏不删
+    } else {
+        state->webview_failed = true;
+        state->webview.reset();
+        state->bridge.reset();
+    }
 }
 
 // ---------------------------------------------------------------- 窗口过程
@@ -2273,6 +4786,12 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
     switch (message) {
+        case kMsgWebView2Installed: {
+            // WebView2 运行库后台装好：重新按系统版本选一次并挂载 WebUI，
+            // 无需用户重启程序。旧 Win32 控件仍在，失败时原样保留。
+            if (state && !state->webview_failed) TryAttachWebview(hwnd, state);
+            return 0;
+        }
         case WM_NCCREATE: {
             auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
             state = static_cast<BrowserState*>(create->lpCreateParams);
@@ -2286,6 +4805,7 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
         case WM_CREATE: {
             if (!state) return -1;
             state->panel_brush = CreateSolidBrush(kPanel);
+            state->video_panel_brush = CreateSolidBrush(kVideoPageBg);
             // 底部提示行：告诉用户在线结果可以直接下载（右键菜单与「下载」按钮
             // 走的是同一条路径）。提示文字不用符号字符，界面字体没有那些字形。
             state->link_text = L"右键结果可下载";
@@ -2300,8 +4820,14 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdQuery), nullptr,
                 nullptr);
+            // ⚠ 搜索按钮**故意不带 WS_VISIBLE**：本文件所有子控件的占位创建
+            // 位置都是 (0,0,10,10)，靠后续 MoveWindow 定位后再显示。搜索按钮
+            // 只在搜索页出现，若带着 WS_VISIBLE 又在别页被 ShowWindow，就没人
+            // 定位它 —— 它会以 10x10 的占位尺寸停在窗口左上角，「搜」字被裁成
+            // 一小团笔画，看着就是一个「柒」（用户反馈的左上角残影）。
+            // 改成创建即隐藏，可见性统一由 LayoutChildren 负责（先定位后显示）。
             state->search_button = CreateWindowW(L"BUTTON", L"搜索",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                WS_CHILD | BS_OWNERDRAW | WS_TABSTOP,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdSearch), nullptr,
                 nullptr);
             state->import_button = CreateWindowW(L"BUTTON", L"导入…",
@@ -2320,13 +4846,16 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdDownload), nullptr,
                 nullptr);
+            // 状态行宽度受「下载 / 导入」按钮挤压，长文案会正好被矩形硬裁在
+            // 半个字上（没有省略号，看起来像渲染坏了）。加 SS_ENDELLIPSIS 让它
+            // 自己收尾成「…」。
             state->status = CreateWindowW(L"STATIC", L"",
-                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdStatus), nullptr,
                 nullptr);
             state->tracks_caption = CreateWindowW(
                 L"STATIC", kSheetHint,
-                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS,
                 0, 0, 10, 10, hwnd,
                 reinterpret_cast<HMENU>(kIdTracksCaption), nullptr, nullptr);
             state->list = CreateWindowExW(0, WC_LISTVIEWW, L"",
@@ -2377,19 +4906,13 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             state->tag_combo = CreateWindowW(L"COMBOBOX", L"",
                 WS_CHILD | WS_VSCROLL | CBS_DROPDOWNLIST | WS_TABSTOP,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdTagCombo), nullptr, nullptr);
-            state->load_sheets_button = CreateWindowW(L"BUTTON", L"刷新",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdLoadSheets), nullptr, nullptr);
-            state->open_sheet_button = CreateWindowW(L"BUTTON", L"打开歌单",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(kIdOpenSheet), nullptr, nullptr);
             if (!state->tab || !state->sheet_list) return -1;
 
-            // 两个页签：发现（默认，所有音源同页）/ 搜索（原有功能）
+            // 三个页签：音乐（原发现，默认）/ 视频 / 搜索
             TCITEMW ti{};
             ti.mask = TCIF_TEXT;
-            const wchar_t* tab_titles[] = {L"发现", L"搜索"};
-            for (int i = 0; i < 2; ++i) {
+            const wchar_t* tab_titles[] = {L"音乐", L"视频", L"搜索"};
+            for (int i = 0; i < 3; ++i) {
                 ti.pszText = const_cast<wchar_t*>(tab_titles[i]);
                 TabCtrl_InsertItem(state->tab, i, &ti);
             }
@@ -2397,10 +4920,29 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                          reinterpret_cast<WPARAM>(state->ui_font), TRUE);
             TabCtrl_SetCurSel(state->tab, 0);
 
-            TrackControl(state, state->load_sheets_button, kIdLoadSheets, false);
-            TrackControl(state, state->open_sheet_button, kIdOpenSheet, false);
             TrackControl(state, state->sheet_list, kIdSheetList, false);
             TrackControl(state, state->tag_combo, kIdTagCombo, false);
+            TrackControl(state, state->load_sheets_button, kIdLoadSheets, false);
+            TrackControl(state, state->open_sheet_button, kIdOpenSheet, false);
+            TrackControl(state, state->tab, kIdTab, false);
+
+            // 影视仓式外壳：视频页顶部的分类导航行 + 图标功能栏（仅视频页显示，
+            // 音乐/搜索页由 LayoutChildren 隐藏）。两者都是自绘 STATIC，走 ChildProc。
+            // ⚠ 必须带 SS_NOTIFY：无此样式的 STATIC 对 WM_NCHITTEST 返回
+            // HTTRANSPARENT，真实鼠标点击会穿透到父窗口，HandleVideoNavClick
+            // 永远收不到 WM_LBUTTONDOWN（表现为「分类无法点击」）。
+            state->video_navbar = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_NOTIFY, 0, 0, 10, 10, hwnd,
+                reinterpret_cast<HMENU>(kIdVideoNav), nullptr, nullptr);
+            state->video_iconbar = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_NOTIFY, 0, 0, 10, 10, hwnd,
+                reinterpret_cast<HMENU>(kIdVideoIcons), nullptr, nullptr);
+            if (state->video_navbar)
+                TrackControl(state, state->video_navbar, kIdVideoNav, false);
+            if (state->video_iconbar)
+                TrackControl(state, state->video_iconbar, kIdVideoIcons, false);
+            ShowWindow(state->video_navbar, SW_HIDE);
+            ShowWindow(state->video_iconbar, SW_HIDE);
 
             // 封面异步下载 / 解码助手（缓存目录 <exe>/musicfree/artcache）
             if (state->mgr) {
@@ -2412,6 +4954,41 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                     const std::filesystem::path dir =
                         std::filesystem::path(exe).parent_path() / "musicfree" / "artcache";
                     state->artwork = std::make_unique<ArtworkCache>(dir, state->mgr->network());
+                }
+            }
+
+            // 视频源管理器（影视仓 / TVBox）：与音乐源完全独立，用户手动导入，
+            // 不内置任何视频源。
+            //
+            // ⚠ 不能依赖 state->mgr：MusicFree 管理器由后台线程挂载，窗口创建
+            // 早期可能还没就绪。以前整个创建被 if (state->mgr) 包住，结果
+            // video_mgr 为空，StartLoadVideo 直接 return，视频页永远只剩
+            // 「正在准备…」占位卡片（trace: video_start ... groups=0）。
+            {
+                std::wstring exe_w(32768, L'\0');
+                const DWORD n2 = GetModuleFileNameW(nullptr, exe_w.data(),
+                                                   static_cast<DWORD>(exe_w.size()));
+                if (n2 > 0) {
+                    exe_w.resize(n2);
+                    const std::filesystem::path exe_dir =
+                        std::filesystem::path(exe_w).parent_path();
+                    state->video_mgr =
+                        std::make_unique<ttplayer::video::VideoSourceManager>(
+                            exe_dir / "video");
+                    // 视频源请求换浏览器 UA：默认的
+                    // "Mozilla/5.0 (compatible; TTPlayerMusicFree/0.1)" 会被不少
+                    // 直播源 / CMS 站直接 403（实测 gh.927223.xyz）。
+                    {
+                        ttplayer::musicfree::NetworkConfig net;
+                        if (state->mgr) net = state->mgr->network();
+                        if (net.user_agent.empty())
+                            net.user_agent = L"Mozilla/5.0 (Windows NT 10.0; "
+                                             L"Win64; x64) AppleWebKit/537.36 "
+                                             L"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+                        state->video_mgr->SetNetworkConfig(std::move(net));
+                    }
+                    state->video_mgr->LoadCached();
+                    state->video_sources_ready = true;
                 }
             }
 
@@ -2547,15 +5124,29 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             if (FrameHitTest(state, point) != kFrameHitNone) return HTCLIENT;
             return ResizeHitTest(state, point);
         }
+        case WM_SIZING: {
+            // 拖动缩放中：拖下边时把底部吸附到其它 TTPlayer 窗口的底部，
+            // 与播放列表 / 主窗拼齐（用户反馈「下方缩放要跟其他窗口底部对齐」）。
+            // 返回 TRUE 表示已处理（lparam 指向的 RECT 即新窗口矩形）。
+            if (state && lparam) {
+                auto* rc = reinterpret_cast<RECT*>(lparam);
+                const int edge = static_cast<int>(wparam);
+                if (edge == WMSZ_BOTTOM || edge == WMSZ_BOTTOMLEFT ||
+                    edge == WMSZ_BOTTOMRIGHT)
+                    SnapBrowserBottomEdge(state, *rc);
+                return TRUE;
+            }
+            break;
+        }
         case WM_GETMINMAXINFO: {
             if (!state) break;
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
             const SIZE minimum = MinFrameSize(state);
-            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.x = minimum.cx;   // 皮肤自然宽度：只允许拉宽
             info->ptMinTrackSize.y = minimum.cy;
-            // 宽度钉死：最小 == 最大 == 自然宽度，横向彻底不可缩放（避免标题栏被拉糊）。
-            // 高度不约束上限，保留默认的「随拖拽长高」能力。
-            info->ptMaxTrackSize.x = minimum.cx;
+            // 不设 ptMaxTrackSize.x：用户可自由拖宽 / 拖高窗口。
+            // 宽度下限保留在自然宽度，避免把标题栏「千千音乐窗」压变形；
+            // 拉宽时的文字变形由 PaintFrame 的 1:1 标题区重绘消除。
             return 0;
         }
         case WM_SIZE: {
@@ -2659,8 +5250,16 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
         case WM_COMMAND: {
             if (!state) break;
             switch (LOWORD(wparam)) {
-                case kIdSearch: StartSearch(state); return 0;
+                case kIdSearch:
+                    if (IsVideoMode(state)) StartVideoSearch(state);
+                    else StartSearch(state);
+                    return 0;
                 case kIdPlay:
+                    if (IsVideoMode(state)) {
+                        // 视频页的播放地址在 raw["url"]，不走音乐源插件解析。
+                        PlaySelectedVideoHit(state);
+                        return 0;
+                    }
                     StartResolve(state, OnlineTrackAction::play);
                     return 0;
                 case kIdEnqueue:
@@ -2670,6 +5269,13 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                     StartDownload(state);
                     return 0;
                 case kIdImport: {
+                    TraceImport("kIdImport video=%d video_busy=%d",
+                                IsVideoMode(state) ? 1 : 0,
+                                state->video_busy.load() ? 1 : 0);
+                    if (IsVideoMode(state)) {
+                        OpenVideoSourceDialog(state);
+                        return 0;
+                    }
                     // 音源集合在导入时会被改写，而搜索线程正在遍历插件表；
                     // 两者不能并发，否则可能出现悬垂指针。
                     if (state->busy.load() || state->discover_busy.load()) {
@@ -2696,22 +5302,45 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                     return 0;
                 }
                 case kIdLoadSheets:
-                    StartLoadDiscover(state, true);
+                    if (IsVideoMode(state)) StartLoadVideo(state, true);
+                    else StartLoadDiscover(state, true);
                     return 0;
                 case kIdOpenSheet:
-                    StartOpenSheet(state);
+                    if (IsVideoMode(state)) StartOpenVideoItem(state);
+                    else StartOpenSheet(state);
                     return 0;
                 case kIdSheetList: {
                     const int code = HIWORD(wparam);
                     if (code == LBN_SELCHANGE || code == LBN_DBLCLK) {
+                        // 视频页：先看是否点在分组标题行的分类页签上（页签点击
+                        // 也会触发列表选中变化，所以必须在卡片命中之前判断）。
+                        if (IsVideoMode(state)) {
+                            int cg = -1, cc = -2;
+                            if (HitVideoChip(state, &cg, &cc) && cc >= -1) {
+                                // 现在只有聚合组有页签（直播组/搜索组不画 chips）。
+                                if (state->video_groups[cg].site_key == "agg:")
+                                    StartLoadAggVideoCategory(state, cc);
+                                return 0;
+                            }
+                        }
                         int g = -1, s = -1;
                         if (HitDiscoverCard(state, &g, &s)) {
-                            state->selected_group = g;
-                            state->selected_sheet = s;
+                            if (IsVideoMode(state)) {
+                                state->selected_video_group = g;
+                                state->selected_video_item = s;
+                            } else {
+                                state->selected_group = g;
+                                state->selected_sheet = s;
+                            }
                             InvalidateRect(state->sheet_list, nullptr, FALSE);
                             // 单击即打开：点了封面卡片就该看到曲目，不再要求双击。
-                            // 双击的第二次通知落在 busy 上，不会重复发起请求。
-                            if (!state->busy.load()) {
+                            if (IsVideoMode(state)) {
+                                if (!state->video_detail_busy.load())
+                                    StartOpenVideoItem(state);
+                                else
+                                    SetVideoSheetCaption(state,
+                                        L"上一个视频仍在加载选集，请稍候");
+                            } else if (!state->busy.load()) {
                                 StartOpenSheet(state);
                             } else {
                                 SetSheetCaption(state,
@@ -2732,6 +5361,10 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             auto* header = reinterpret_cast<NMHDR*>(lparam);
             if (!header) break;
             if (header->hwndFrom == state->list && header->code == NM_DBLCLK) {
+                if (IsVideoMode(state)) {
+                    PlaySelectedVideoHit(state);
+                    return 0;
+                }
                 StartResolve(state, OnlineTrackAction::play);
                 return 0;
             }
@@ -2947,6 +5580,11 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             if (state) {
                 state->sources_ready = true;
                 RefreshSourceComboForMode(state);
+                state->video_sources_ready = true;
+                // 若正处于视频页且尚未加载，后台挂载完成后才开始聚合首页。
+                if (IsVideoMode(state) && !state->video_loaded &&
+                    !state->video_busy.load())
+                    PostMessageW(state->hwnd, kMsgVideoStart, 0, 0);
             }
             return 0;
         case kMsgSheetsReady: {
@@ -3022,6 +5660,263 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             SetStatusFor(state, false, text);
             return 0;
         }
+
+        // ---- 视频：首页/分类聚合批次到达 ----
+        case kMsgVideoHomeReady: {
+            auto* payload = reinterpret_cast<VideoHomePayload*>(lparam);
+            if (!state || !payload) { delete payload; return 0; }
+            auto find_agg = [state]() -> BrowserState::VideoGroup* {
+                for (auto& g : state->video_groups)
+                    if (g.site_key == "agg:") return &g;
+                return nullptr;
+            };
+            if (payload->finished) {
+                TraceImport("video finished batches=%zu busy_before=1",
+                            state->video_agg_batches.size());
+                state->video_loaded = true;
+                ReleaseVideoBusy(state);
+                // 所有站点到齐：聚合分类页签只在这里统一排序 + 裁剪一次，
+                // 顶部分类页签不再中途乱跳 / 反复出现同名（用户反馈的体验问题）。
+                FinalizeAggVideoCategories(state);
+                if (state->video_navbar)
+                    InvalidateRect(state->video_navbar, nullptr, FALSE);
+                state->video_cat_expected = 0;
+                if (BrowserState::VideoGroup* agg = find_agg())
+                    agg->category_loading = false;
+                if (state->video_reload_pending) {
+                    // 这一轮聚合开始时站点表还是旧的，期间用户在「视频源」对话框里
+                    // 导入 / 删除了源：本轮结果作废，立刻按新表重来一次。
+                    state->video_reload_pending = false;
+                    state->video_loaded = false;
+                    delete payload;
+                    StartLoadVideo(state, true);
+                    return 0;
+                }
+                if (state->video_pending_cat.load() != -2) {
+                    // 用户已排队了分类切换（ReleaseVideoBusy 刚把它排进消息队列），
+                    // 马上由 pending 执行接管并自己铺「加载中」网格；这里不要再
+                    // FillVideoList，否则「点击导入…」占位会闪一下又换内容。
+                    delete payload;
+                    return 0;
+                }
+                BrowserState::VideoGroup* agg = find_agg();
+                // 一个源都没取到内容时，占位卡片改成「去导入」的指引；否则空窗口
+                // 挂着四张「正在准备…」会让人误以为还在加载、一直干等。
+                const bool has_cards = agg && !agg->items.empty();
+                state->video_placeholder = !has_cards;
+                state->video_placeholder_text = L"点击「导入…」";
+                FillVideoList(state);
+                if (!state->video_import_note.empty()) {
+                    // 刚导入完：优先显示导入结果（成功/失败的站点统计），否则
+                    // 这条有用的信息会被下面的统计文案直接盖掉。
+                    SetVideoStatus(state, state->video_import_note);
+                    state->video_import_note.clear();
+                } else if (!agg || state->video_agg_batches.empty()) {
+                    SetVideoStatus(state, L"尚未导入视频源，点「导入…」添加影视仓 / TVBox 配置");
+                } else if (!has_cards) {
+                    // 有直播卡但没有 CMS 内容：把原因讲清楚，别让用户对着占位卡猜。
+                    int cms = 0, native = 0, spider = 0;
+                    try {
+                        for (const auto& src : state->video_mgr->ListSources())
+                            for (const auto& s : src.sites) {
+                                if (s.kind == ttplayer::video::VideoSourceKind::kCms) ++cms;
+                                else if (s.kind == ttplayer::video::VideoSourceKind::kNativeSpider) ++native;
+                                else if (s.kind == ttplayer::video::VideoSourceKind::kSpider) ++spider;
+                            }
+                    } catch (...) {}
+                    std::wstring msg = L"视频页：";
+                    if (cms == 0 && native == 0 && spider > 0)
+                        msg += L"已导入的 " + std::to_wstring(spider) +
+                               L" 个站点全是 SPIDER 类型（需 TVBox 运行库），取不到影视内容；";
+                    else
+                        msg += L"已查询 " + std::to_wstring(cms + native) +
+                               L" 个站点（CMS " + std::to_wstring(cms) +
+                               L"，原生 " + std::to_wstring(native) +
+                               L"），均未取到内容（可能已失效）；";
+                    msg += L"直播源卡片可以点开观看";
+                    SetVideoStatus(state, msg);
+                } else {
+                    SetVideoStatus(state,
+                        L"已聚合 " + std::to_wstring(agg->items.size()) +
+                        L" 部影片（来自 " +
+                        std::to_wstring(state->video_agg_batches.size()) +
+                        L" 个片源，重复片名已合并），点击卡片查看选集");
+                }
+                delete payload;
+                return 0;
+            }
+            // 分类页签的返回：并入分类批次表，批次到齐后重排聚合流。
+            if (payload->category_load) {
+                UpsertAggBatch(state->video_cat_batches, payload);
+                RebuildAggregatedVideoItems(state);
+                FillVideoList(state);
+                BrowserState::VideoGroup* agg = find_agg();
+                if (state->video_cat_expected > 0 &&
+                    --state->video_cat_expected == 0) {
+                    if (agg) agg->category_loading = false;
+                    ReleaseVideoBusy(state);
+                    if (agg && !agg->items.empty())
+                        SetVideoStatus(state,
+                            L"已聚合「" + agg->active_category_name +
+                            L"」分类 " + std::to_wstring(agg->items.size()) +
+                            L" 部影片（来自 " +
+                            std::to_wstring(state->video_cat_batches.size()) +
+                            L" 个片源），点击卡片查看选集");
+                    else if (agg)
+                        SetVideoStatus(state, L"分类「" +
+                            agg->active_category_name + L"」暂无内容，点「推荐」返回");
+                }
+                delete payload;
+                return 0;
+            }
+            // 首页批次：并入批次表 + 合并分类页签，重排聚合流（渐进填充）。
+            if (payload->error.empty() && !payload->items.empty()) {
+                UpsertAggBatch(state->video_agg_batches, payload);
+                MergeAggVideoCategories(state, payload->site_key,
+                                        payload->categories);
+                // 分类页签随各站点首页数据逐步到达，到了就刷新顶部导航行。
+                if (state->video_navbar)
+                    InvalidateRect(state->video_navbar, nullptr, FALSE);
+            }
+            RebuildAggregatedVideoItems(state);
+            FillVideoList(state);
+            delete payload;
+            return 0;
+        }
+        // ---- 视频：详情选集加载完成 ----
+        case kMsgVideoDetailReady: {
+            auto* payload = reinterpret_cast<VideoDetailPayload*>(lparam);
+            if (!state || !payload) { delete payload; return 0; }
+            std::vector<OnlineSearchHit> hits;
+            for (size_t li = 0; li < payload->lines.size(); ++li) {
+                const auto& line = payload->lines[li];
+                for (size_t ei = 0; ei < line.episodes.size(); ++ei) {
+                    const auto& ep = line.episodes[ei];
+                    OnlineSearchHit hit;
+                    hit.platform = payload->site_name;
+                    hit.title = ep.name;
+                    std::string final_url = ep.url;
+                    if (!payload->play_url.empty() &&
+                        final_url.find("://") == std::string::npos)
+                        final_url = payload->play_url + final_url;
+                    hit.raw = nlohmann::json::object(
+                        {{"url", final_url}, {"line", line.name},
+                         {"line_idx", static_cast<int>(li)},
+                         {"ep_idx", static_cast<int>(ei)}});
+                    hits.push_back(std::move(hit));
+                }
+            }
+            // 影视仓式多线路：把同一集在各线路的对应地址打包进每个 hit 的
+            // raw["sources"]，播放窗口的「切换源」按钮据此循环切换线路。
+            for (auto& h : hits) {
+                if (!h.raw.is_object()) continue;
+                const int li = h.raw.value("line_idx", -1);
+                const int ei = h.raw.value("ep_idx", -1);
+                if (li < 0 || ei < 0) continue;
+                // ⚠ 必须包含**当前线路**：以前只装「其它线路」，播放窗在
+                // sources 里找不到当前 hit 的 url 时会把第 0 项的 url 覆盖成当前
+                // 地址，造成「线路名 ffm3u8 却播着 feifan 的网页地址」的错位
+                // （用户截图里网页线路播不了的真根因）。
+                nlohmann::json arr = nlohmann::json::array();
+                for (size_t li2 = 0; li2 < payload->lines.size(); ++li2) {
+                    const auto& ln = payload->lines[li2];
+                    if (ei >= static_cast<int>(ln.episodes.size())) continue;
+                    std::string u = ln.episodes[ei].url;
+                    if (!payload->play_url.empty() &&
+                        u.find("://") == std::string::npos)
+                        u = payload->play_url + u;
+                    arr.push_back(nlohmann::json::object(
+                        {{"url", u}, {"name", ln.name}}));
+                }
+                if (!arr.empty()) h.raw["sources"] = std::move(arr);
+            }
+            state->video_hits = std::move(hits);
+            state->video_detail_busy.store(false);
+            SetBusyUi(state, false);
+            if (IsVideoMode(state)) {
+                state->hits = state->video_hits;
+                FillResultList(state);
+            }
+            const int n = static_cast<int>(state->video_hits.size());
+            const wchar_t* unit = payload->live ? L"个频道" : L"个选集";
+            if (!payload->error.empty()) {
+                SetVideoSheetCaption(state, L"加载选集失败：" +
+                    Utf8ToWideString(payload->error));
+            } else {
+                SetVideoStatus(state, (payload->live ? L"已加载频道：" : L"已加载选集：") +
+                    std::to_wstring(n) + L" " + unit + L"，双击任意一行即可播放");
+                if (n > 0)
+                    SetVideoSheetCaption(state,
+                        (payload->live ? L"直播「" : L"视频「") +
+                        Utf8ToWideString(payload->title) + L"」· " +
+                        std::to_wstring(n) + L" " + unit + L"（双击播放）");
+                else
+                    SetVideoSheetCaption(state, payload->live
+                        ? L"这个直播源暂时没有可用频道"
+                        : L"该视频暂无可播放选集");
+            }
+            delete payload;
+            return 0;
+        }
+        // ---- 视频：搜索结果到达 ----
+        case kMsgVideoSearchReady: {
+            auto* payload = reinterpret_cast<VideoSearchPayload*>(lparam);
+            if (!state || !payload) { delete payload; return 0; }
+            ReleaseVideoBusy(state);
+            SetBusyUi(state, false);
+            state->video_groups.clear();
+            if (!payload->items.empty()) {
+                BrowserState::VideoGroup g;
+                g.site_key = "";
+                g.site_name = "搜索结果";
+                g.items = std::move(payload->items);
+                state->video_groups.push_back(std::move(g));
+            }
+            state->video_rows.clear();
+            FillVideoList(state);
+            const int n = state->video_groups.empty()
+                ? 0 : static_cast<int>(state->video_groups[0].items.size());
+            if (n > 0)
+                SetVideoStatus(state, L"找到 " + std::to_wstring(n) +
+                    L" 个视频，点击卡片查看选集");
+            else
+                SetVideoStatus(state, L"没有找到相关视频（已查询 " +
+                    std::to_wstring(payload->sites_total) + L" 个视频源）");
+            delete payload;
+            return 0;
+        }
+        // ---- 视频：窗口显示后再启动首页加载 ----
+        case kMsgVideoStart: {
+            if (state && IsVideoMode(state)) {
+                bool empty = true;
+                for (const auto& g : state->video_groups)
+                    if (!g.items.empty()) { empty = false; break; }
+                TraceImport("video_start busy=%d loaded=%d empty=%d groups=%zu",
+                            state->video_busy.load() ? 1 : 0,
+                            state->video_loaded ? 1 : 0, empty ? 1 : 0,
+                            state->video_groups.size());
+                // 聚合组一张卡片都没有就重跑。若 busy 因异常路径卡在 true，
+                // 先复位再启动 —— 否则视频页会永远停在「正在准备…」占位卡片。
+                if (empty) {
+                    if (state->video_busy.load()) state->video_busy = false;
+                    StartLoadVideo(state, true);
+                }
+            }
+            MaybeRefreshVideoSources(state);
+            return 0;
+        }
+        case kMsgVideoSourcesRefreshed:
+            // 后台已把最新配置（含自动解密结果）写进 index.json，UI 线程重新
+            // 载入并强制重跑首页聚合，用户看到的就是最新站点内容。
+            if (state && state->video_mgr) {
+                state->video_mgr->Reload();
+                StartLoadVideo(state, true);
+            }
+            return 0;
+        case kMsgVideoPendingCat:
+            // 首页 / 分类加载期间被记下的分类切换，busy 释放后在这里补执行。
+            StartLoadAggVideoCategory(state, static_cast<int>(lparam));
+            return 0;
         case kMsgSheetTracksReady: {
             auto* payload = reinterpret_cast<SearchPayload*>(lparam);
             if (!state || !payload) { delete payload; return 0; }
@@ -3064,9 +5959,33 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             return 0;
         }
         case kMsgArtworkReady: {
-            if (state && state->sheet_list)
-                InvalidateRect(state->sheet_list, nullptr, FALSE);
+            // 海报到位：只置脏 + 250ms 合并重绘。逐张 InvalidateRect 会在
+            // 并发下载时把海报墙刷成每秒十几次的全量重绘（用户看到的
+            // 「加载图片时疯狂闪烁」）。
+            if (state && state->sheet_list && !state->artwork_dirty) {
+                state->artwork_dirty = true;
+                SetTimer(hwnd, kArtworkRepaintTimerId, 250, nullptr);
+            }
             return 0;
+        }
+        case WM_TIMER: {
+            if (wparam == kArtworkRepaintTimerId) {
+                KillTimer(hwnd, kArtworkRepaintTimerId);
+                if (state) {
+                    state->artwork_dirty = false;
+                    if (state->sheet_list)
+                        InvalidateRect(state->sheet_list, nullptr, FALSE);
+                    // 下载失败（彩色骨架常驻）的封面：3 秒节流后统一补抓一轮。
+                    const std::int64_t now = GetTickCount64();
+                    if (CountMissingVideoArtwork(state) > 0 &&
+                        now - state->video_art_retry_at >= 3000) {
+                        state->video_art_retry_at = now;
+                        RetryMissingVideoArtwork(state);
+                    }
+                }
+                return 0;
+            }
+            break;
         }
         case WM_CONTEXTMENU: {
             if (!state) break;
@@ -3086,9 +6005,17 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            TraceImport("browser WM_DESTROY enter");
             // 子控件在这里之后才会被销毁，它们的子类化上下文必须留到那之后，
             // 因此只释放本窗口自己的 GDI 资源。
             if (state) {
+                // WebView2 页面宿主：先 Destroy 宿主（排空在途回调）→ 再放桥 →
+                // 最后放宿主实例，顺序不能颠倒（桥要活到宿主回调全部落地）。
+                if (state->webview) {
+                    state->webview->Destroy();
+                    state->bridge.reset();
+                    state->webview.reset();
+                }
                 if (state->host.store_bounds) {
                     RECT bounds{};
                     GetWindowRect(hwnd, &bounds);
@@ -3104,12 +6031,16 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                 state->on_track = nullptr;
             }
             // 这里不能 PostQuitMessage：本窗口不是进程的主窗口。
+            TraceImport("browser WM_DESTROY leave");
             return 0;
         case WM_NCDESTROY: {
+            TraceImport("browser WM_NCDESTROY enter");
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             const bool owns = g_browser && g_browser->hwnd == hwnd;
             const LRESULT result = DefWindowProcW(hwnd, message, wparam, lparam);
+            TraceImport("browser WM_NCDESTROY defproc done owns=%d", owns ? 1 : 0);
             if (owns) g_browser.reset();
+            TraceImport("browser WM_NCDESTROY reset done");
             return result;
         }
         default:
@@ -3169,12 +6100,107 @@ RECT InitialBrowserBounds(HWND owner, int width, int height) {
 
 } // namespace
 
+// ─────────────────── 跨编译单元导出符号（bridge_cmds_* 复用）──────────────────
+// 下列符号原在上方匿名命名空间内（内部链接），bridge_cmds_video.cpp /
+// bridge_cmds_misc.cpp 需要**同源**复用（分区归一 / 排序 / 跨源去重 / 插件
+// 串行锁 / 当前皮肤），故移出匿名命名空间改为外部链接 —— 实现原样未改。
+// 声明见 include/ttplayer/musicfree/musicfree_browser_window.h。
+// 位置说明：必须在匿名命名空间闭合之后定义，才能访问其中的 g_browser /
+// ActiveLegacySkin / Utf8ToWideString（匿名命名空间成员对外层可见）。
+
+// 所有插件调用（搜索 / 解析 / 发现页加载）串行化：每个 MusicFree 插件持有
+// 独立的 QuickJS runtime，不能同时被两个线程重入。按「一次插件调用」粒度持锁，
+// 发现页逐音源加载时搜索线程仍有机会插队，不会整段被卡住。
+std::mutex g_plugin_io;
+
+// 把 CMS 分类名美化成影视仓式分区标题（常见分类加「热播」前缀）。
+std::wstring FriendlySectionTitle(const std::string& type_name) {
+    std::string t = type_name;
+    const size_t a = t.find_first_not_of(" \t\r\n");
+    const size_t b = t.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return L"推荐";
+    t = t.substr(a, b - a + 1);
+    if (t.empty()) return L"推荐";
+    auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
+    auto ends_with = [&](const char* suffix) {
+        const std::string s(suffix);
+        return t.size() >= s.size() &&
+               t.compare(t.size() - s.size(), s.size(), s) == 0;
+    };
+    if (has("纪录片")) return L"热播纪录片";
+    if (has("动漫") || has("动画")) return L"热播动漫";
+    if (has("短剧")) return L"热播短剧";
+    if (has("电影")) return L"热播电影";
+    if (has("综艺")) return L"热播综艺";
+    if (has("剧"))   return L"热播剧集";
+    // 动作片 / 喜剧片 / 爱情片 / 科幻片 / 战争片 … 都是电影分类，统一并入
+    // 「热播电影」（以前只认「电影」二字，这些类型会各自成一个零散分区）。
+    if (ends_with("片")) return L"热播电影";
+    return Utf8ToWideString(t);  // 少儿 / 体育 / 其他 等原样
+}
+
+// 分区优先级：电影/剧集/动漫/综艺/纪录片/短剧 排前面，其余靠后（同优先级保持出现顺序）。
+// 入参是「友好标题」（FriendlySectionTitle 的归一名），与分桶 key 保持一致。
+int SectionPriority(const std::wstring& t) {
+    if (t.find(L"电影") != std::wstring::npos) return 0;
+    if (t.find(L"剧")   != std::wstring::npos) return 1;
+    if (t.find(L"动漫") != std::wstring::npos || t.find(L"动画") != std::wstring::npos) return 2;
+    if (t.find(L"综艺") != std::wstring::npos) return 3;
+    if (t.find(L"纪录片") != std::wstring::npos) return 4;
+    if (t.find(L"短剧") != std::wstring::npos) return 5;
+    return 9;
+}
+
+// 跨源同名同年去重键：去空白 + 转小写，同名不同年不算重复。
+std::string NormalizeVideoTitle(const std::string& title, const std::string& year) {
+    std::string key;
+    key.reserve(title.size() + 8);
+    for (char c : title) {
+        if (static_cast<unsigned char>(c) <= ' ') continue;  // 空白全去掉
+        key += static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!year.empty()) { key += "@"; key += year; }  // 同名不同年不算重复
+    return key;
+}
+
+// 当前音乐窗的皮肤薄封装：等价 ActiveLegacySkin(g_browser.get())，供视频命令域
+//（ShowVideoPlayer / ShowVideoSourceDialog）取与音乐窗 state->host.skin 同口径
+// 的外框；音乐窗未创建时 g_browser 为空 → 返回 nullptr（按无皮肤形态绘制）。
+const skin::LegacySkin* MusicFreeBrowserLegacySkin() {
+    return ActiveLegacySkin(g_browser.get());
+}
+
 bool IsMusicFreeBrowserVisible() {
     return g_browser && g_browser->hwnd && IsWindowVisible(g_browser->hwnd);
 }
 
 HWND MusicFreeBrowserWindow() {
     return g_browser ? g_browser->hwnd : nullptr;
+}
+
+// 打开「导入音源」对话框 —— 与 Win32 界面「导入…」按钮（kIdImport 音乐分支）
+// 走完全相同的实现：同一个模态对话框、同一套导入后刷新（重建音源下拉框、
+// 失效发现页缓存并重新加载）。WebView 页面经 bridge 的 music.import 调用它。
+// 返回 false 表示音乐窗未创建或正在加载（与按钮禁用态同口径）。
+bool MusicFreeOpenImportDialog() {
+    if (!g_browser || !g_browser->hwnd) return false;
+    BrowserState* state = g_browser.get();
+    // 音源集合在导入时会被改写，而搜索线程正在遍历插件表，两者不能并发。
+    if (state->busy.load() || state->discover_busy.load()) return false;
+    ShowMusicFreeImportDialog(state->hwnd, state->mgr, state->host.skin);
+    RefreshSourceComboForMode(state);
+    if (state->mgr) {
+        const size_t count = state->mgr->ListPlugins().size();
+        SetStatus(state, count
+            ? L"已导入音源：" + std::to_wstring(count) +
+                  L" 个，可以开始搜索"
+            : L"尚未导入任何音源，请再次点击「导入音源」");
+    }
+    // 音源集合可能已变化：缓存立刻失效，后台强制重建并重写缓存。
+    state->discover_cache_fresh = false;
+    StartLoadDiscover(state, true);
+    return true;
 }
 
 void CloseMusicFreeBrowser() {
@@ -3259,6 +6285,10 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
     // 「背景偏 / 被压扁」。当前用的是 WS_POPUP + WS_EX_TOOLWINDOW（delta=0），
     // 这层换算只是防止以后有人改样式时静默退化的保险。
     const DWORD frame_style = WS_POPUP;
+    // ⚠ 不要加 WS_EX_COMPOSITED：它与 owner-draw ListView / 公共控件组合会
+    // 触发全窗口软件合成，窗口越大越卡、列表区域反复失效重绘（用户实测
+    // 「选集列表非常卡、闪烁明显」）。拖动闪烁已由各重绘路径自身的双缓冲
+    // 解决（主窗 WM_PAINT、海报墙 LB、导航行/图标栏 PaintBuffered）。
     const DWORD frame_ex_style = WS_EX_TOOLWINDOW;
     RECT frame_rect{0, 0, width, height};
     AdjustWindowRectEx(&frame_rect, frame_style, FALSE, frame_ex_style);
@@ -3285,6 +6315,12 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
                                  : "0"));
     }
     TraceResizeBands(g_browser.get());
+
+    // WebView2 页面承载：此处 CreateWindowExW 已返回（创建期 WM_SIZE 已跑过
+    // ApplyFrameMetrics，state->layout.content 就是皮肤内容区），窗口尚未显示。
+    // Runtime 缺失时 TryAttachWebview 会启动后台自动安装，装好后再重试一次；
+    // 任何失败仍回退旧 Win32 控件，绝不阻塞启动。
+    TryAttachWebview(hwnd, state.get());
 
     if (g_browser->top_most)
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,

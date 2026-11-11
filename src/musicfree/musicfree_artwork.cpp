@@ -59,7 +59,7 @@ struct ArtworkCache::Impl : std::enable_shared_from_this<ArtworkCache::Impl> {
     // 数据一到位就把几十张封面全部投进来，若每个 url 各起一个 WinHTTP 线程，
     // 32 位进程的栈空间与 CDN 并发都会吃不消。这里限制同时在跑的任务数，
     // 队列按调用顺序启动（首屏卡片自然排在前面），完成一个立刻补一个。
-    static constexpr int kMaxParallel = 8;
+    static constexpr int kMaxParallel = 16;
     struct Job { std::string url; int max_edge; };
     std::deque<Job> queued;
     int active = 0;
@@ -110,6 +110,10 @@ struct ArtworkCache::Impl : std::enable_shared_from_this<ArtworkCache::Impl> {
         }
         std::lock_guard<std::mutex> lock(mutex);
         // 多个并发等待者可能都已下载完毕：以先写入者为准。
+        // ⚠ 失败（下载 / 解码为空）**不写入** nullptr 占位：占位会让 Peek 永远
+        // 返回空、调用方以为「已请求过」而不再重试，封面永远停在彩色骨架。
+        // 失败时只把 inflight 移除，后续重试可重新入队。
+        if (!bitmap) return nullptr;
         auto it = memory.find(url);
         if (it == memory.end()) {
             memory.emplace(url, bitmap);
@@ -119,7 +123,7 @@ struct ArtworkCache::Impl : std::enable_shared_from_this<ArtworkCache::Impl> {
             it->second = bitmap;
             return bitmap;
         }
-        if (bitmap) DeleteObject(bitmap); // 已有别的副本，丢弃重复
+        DeleteObject(bitmap); // 已有别的副本，丢弃重复
         return it->second;
     }
 

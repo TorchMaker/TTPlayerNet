@@ -3118,8 +3118,13 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         case kOpen: ChooseFiles(); return 0;
         case kPrevious: SelectRelative(false); return 0;
         case kPlayPause:
+            // ★ 在线曲目「已入列、后台取链中」时没有打开任何音源，旧代码看到
+            //   paused 就 Resume()，对一个空引擎毫无作用 —— 用户实测「点播放
+            //   软件没反应」。无源 / pending 时必须重新走 PlayCurrent。
             if (audio_->State() == audio::PlaybackState::playing) audio_->Pause();
-            else if (audio_->State() == audio::PlaybackState::paused) audio_->Resume();
+            else if (audio_->State() == audio::PlaybackState::paused &&
+                     playback_source_open_ && !pending_online_resolve_)
+                audio_->Resume();
             else PlayCurrent();
             RefreshPlaybackUi();
             return 0;
@@ -6493,17 +6498,14 @@ bool PlayerWindow::PlayCurrent() {
         std::filesystem::path local;
         if (ResolveOnlineTrackLocalCopy(requested_track, local)) {
             play_path = local;
-            musicfree::TraceDiagnostic("PLAYLIST_PLAY_LOCAL",
-                "local=" + core::WideToUtf8(local.wstring()));
+            musicfree::AppendPlayLog("PLAYLIST local_copy hit");
         } else {
             std::string platform, song_id;
             std::optional<musicfree::MediaSource> src;
-            std::string err;
-            const auto source_raw =
-                musicfree::RestoreSourceRaw(requested_track.metadata);
-            if (OnlineTrackIdentity(requested_track, &platform, &song_id) &&
-                (src = musicfree::ResolvePlayUrlEx(platform, song_id, &err,
-                                                   &source_raw))) {
+            // 只查缓存，绝不在 UI 线程联网取链（实测 28.7s 会冻结整个界面）。
+            if (OnlineTrackIdentity(requested_track, &platform, &song_id))
+                src = musicfree::PeekResolveCache(platform, song_id);
+            if (src && !src->url.empty()) {
                 const bool is_hls = src->url.size() >= 5 &&
                     _stricmp(src->url.c_str() + src->url.size() - 5, ".m3u8") == 0;
                 audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{
@@ -6512,19 +6514,40 @@ bool PlayerWindow::PlayCurrent() {
                 // 播放的同时后台落盘到本地缓存：下次再点这条就走本地优先（零网络）。
                 StartOnlineTrackBackgroundCache(requested_track, src->url,
                                                 src->headers, src->user_agent);
-                musicfree::TraceDiagnostic("PLAYLIST_PLAY_STREAM",
-                    "url=" + src->url +
-                    " headers=" + std::to_string(src->headers.size()) +
-                    " hls=" + std::to_string(is_hls));
+                musicfree::AppendPlayLog("PLAYLIST stream cache_hit=1 hls=" +
+                                         std::to_string(is_hls));
             } else {
+                // ★ 第五轮（2026-11-10）：旧实现在这里 return true 就什么都不做，
+                //   既没打开音源也没记状态。结果：列表里有了但没声音；用户点
+                //   「播放」时 kPlayPause 看到 paused 就调 Resume()，对一个没有
+                //   源的引擎自然毫无反应；而 PlayCurrent 被定时器/UI 反复调用又
+                //   会重复启动后台解析，serial 一变，先完成的结果就被判过期丢弃。
+                //   现在：明确标记 pending、记住 opened_track_（后续 same_item
+                //   才不会反复换引擎），播放状态如实置为「未打开」，解析由
+                //   StartOnlineTrackResolveAndPlay 内部按曲目去重，完成后带 URL
+                //   回 UI 线程直接起播，不再靠「重选同一行 + 查缓存」碰运气。
+                pending_online_resolve_ = true;
+                opened_track_ = requested_track;
+                playback_source_open_ = false;
+                playback_was_active_ = false;
                 const size_t pi = playback_playlist_index
                     ? *playback_playlist_index : playlists_.ActiveIndex();
+                musicfree::AppendPlayLog(
+                    "PLAYLIST resolve miss platform=" + platform +
+                    " id=" + song_id + " pending=1");
                 StartOnlineTrackResolveAndPlay(pi, *current_, requested_track);
-                return true;  // 延迟到解析/下载完成后再真正播放
+                RefreshPlaybackUi();
+                return true;
             }
         }
     }
-    if (!audio_->Play(play_path, requested_track.subtrack)) {
+    // 走到这里说明已有真实可播源，pending 结束。
+    pending_online_resolve_ = false;
+    const bool play_ok = audio_->Play(play_path, requested_track.subtrack);
+    musicfree::AppendPlayLog(std::string("PLAYLIST audio_play ok=") +
+                             (play_ok ? "1" : "0") + " network=" +
+                             (play_path.wstring().rfind(L"http", 0) == 0 ? "1" : "0"));
+    if (!play_ok) {
         // 流式打开失败（如 HLS 系统不支持、链接已失效）→ 回退阻塞下载后本地播放。
         if (requested_track.path.wstring().rfind(L"http", 0) == 0 &&
             play_path.wstring().rfind(L"http", 0) == 0) {

@@ -4,6 +4,7 @@
 #include "ttplayer/app/runtime.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/musicfree/musicfree_app.h"
+#include "ttplayer/musicfree/musicfree_http.h"  // MusicFreeNetworkShutdown
 #include "ttplayer/settings/settings.h"
 #include "ttplayer/ui/player_window.h"
 #include "ttplayer/ui/player_runtime_policy.h"
@@ -248,6 +249,12 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
     _Module.RemoveMessageLoop();
     // 回收后台音源加载线程，避免 CRT 静态析构时还有线程在跑。
     musicfree::FinishMusicFreeSourcesLoading();
+    // 优雅退出 MusicFree 层：置「关闭中」标志让搜索 / 解析 / 发现页 / 歌单等
+    // 后台线程入口与循环点早退，排空网络层在飞请求，等待所有这些 detached
+    // 线程计数归零后，再确定性地销毁 g_manager（引擎 / 插件）。否则它们在
+    // 进程进入 DLL / CRT 静态析构、g_manager 被销毁时仍访问引擎，会触发
+    // "abnormal program termination" 崩溃。
+    musicfree::ShutdownMusicFree();
     single_instance.PublishWindow(nullptr);
     // A geometry regression is only useful if CI can see it: fail the process
     // when any High-DPI invariant broke, even though the UI itself is fine.

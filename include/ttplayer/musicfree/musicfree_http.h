@@ -17,6 +17,7 @@
 //
 // 安全：与歌词子系统一致，绝不禁用 TLS 校验。
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -76,7 +77,8 @@ private:
     bool active_ = false;
 };
 
-std::string DownloadText(const std::string& url, const NetworkConfig& cfg);
+std::string DownloadText(const std::string& url, const NetworkConfig& cfg,
+                         const std::map<std::string, std::string>& headers = {});
 
 // 下载二进制资源（音频文件）的原始字节。与 DownloadText 走同一条 WinHTTP 链路
 // （自动跟随 301/302 重定向、走 NetworkConfig 里的代理与超时）。失败抛
@@ -85,5 +87,17 @@ std::string DownloadText(const std::string& url, const NetworkConfig& cfg);
 std::vector<std::uint8_t> DownloadBinary(const std::string& url,
                                          const NetworkConfig& cfg,
                                          const std::map<std::string, std::string>& headers = {});
+
+// 优雅退出：进程退出、CRT / DLL 拆卸之前调用，禁止新的 MusicFree 网络请求
+// 并有界等待所有在飞请求干净完成，避免仍有线程卡在 WinHTTP 阻塞调用时
+// 进程开始拆卸 DLL 导致其内部 abort（"abnormal program termination"）。
+//   Begin*  只置「关闭中」标志，不再发起新请求（可尽早调用）。
+//   Wait*   阻塞等待在飞请求计数归零（或超时）。
+//   Shutdown 一步到位：置标志 + 有界等待。
+// 默认超时 20s，与 WinHTTP 的最大超时对齐，保证在飞请求必然先完成。
+void BeginMusicFreeNetworkShutdown() noexcept;
+void WaitMusicFreeNetworkDrain(std::chrono::milliseconds timeout) noexcept;
+void MusicFreeNetworkShutdown(
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(20000)) noexcept;
 
 } // namespace ttplayer::musicfree

@@ -135,22 +135,28 @@ inline constexpr int kResizeBand = 6;
 // 纯算术、不碰 HWND —— 这样「哪条边认不认」可以在 --mf-selftest 里用几个合成尺寸
 // 直接算出来核对，不必真的去拖窗口。
 //
-// ★ **宽度锁定：只允许高度方向缩放**。音乐窗的皮肤标题栏与关闭/换音源按钮都是
-// 固定宽度的像素图，一旦横向拉伸就会糊成变形条、文字错位；所以左右边与四个角一律
-// 返回 HTCLIENT（即不认横向缩放）。只有上边 HTTOP / 下边 HTBOTTOM 可以抓，四个角
-// 也被归到上/下边（拖角只改高度，不横向拉宽）。宽度方向再用 WM_GETMINMAXINFO 把
-// ptMinTrackSize.x 与 ptMaxTrackSize.x 同时钉在皮肤自然宽度上兜底 —— 即便鼠标没停
-// 在边上，双击标题栏之类的系统行为也无法把窗口拉宽。
+// 四向缩放：上/下/左/右四条边与四个角都返回对应的 HT*，用户可自由拖大小。
+//
+// 宽度**只允许放大**：WM_GETMINMAXINFO 把 ptMinTrackSize.x 钉在皮肤自然宽度，
+// 不再设 ptMaxTrackSize.x。缩到比位图窄会让标题栏文字被压缩变形，拉宽则由
+// PaintFrame 用原尺寸切片重绘标题区来保持「千千音乐窗」清晰（见
+// musicfree_browser_window.cpp 的 PaintFrame）。
 //
 // band 必须**小于**皮肤边框厚度，否则会把内容区（尤其列表右侧滚动条）的点击抢走。
 inline int ResizeHitCode(SIZE client, int band, POINT point) {
     if (client.cx <= 0 || client.cy <= 0 || band <= 0) return HTCLIENT;
     const bool top = point.y < band;
     const bool bottom = point.y >= client.cy - band;
-    // 仅高度方向可缩放：上/下边抓到返回 HTTOP/HTBOTTOM，四个角也归到上/下边；
-    // 左/右方向一律当作客户区，窗口宽度由 WM_GETMINMAXINFO 钉死，永不改变。
+    const bool left = point.x < band;
+    const bool right = point.x >= client.cx - band;
+    if (top && left) return HTTOPLEFT;
+    if (top && right) return HTTOPRIGHT;
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
     if (top) return HTTOP;
     if (bottom) return HTBOTTOM;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
     return HTCLIENT;
 }
 

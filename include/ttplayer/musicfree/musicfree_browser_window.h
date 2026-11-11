@@ -18,6 +18,7 @@
 // 勾选框 + 底部提示行）。包内没有这一段时退化成自绘浅色框体，搜索功能不受影响。
 
 #include <functional>
+#include <mutex>
 #include <string>
 
 #include <windows.h>
@@ -88,5 +89,30 @@ void CloseMusicFreeBrowser();
 
 // 换肤后按新皮肤重新贴合外框（尺寸 / 窗口区域 / 控件位置）。窗口未创建时是空操作。
 void RefreshMusicFreeBrowserFrame();
+
+// ──────── 跨编译单元导出符号（定义在 src/musicfree/musicfree_browser_window.cpp）───
+// 以下符号原位于该实现文件的匿名命名空间内（内部链接），WebView2 化的命令域
+// 模块（bridge_cmds_video.cpp / bridge_cmds_misc.cpp）需要复用同一份实现，
+// 故移出匿名命名空间改为外部链接（实现未改），并在本头声明。
+
+// 所有插件调用（搜索 / 解析 / 发现页加载）的串行锁：每个 MusicFree 插件持有
+// 独立的 QuickJS runtime，不能被两个线程同时重入（见实现文件定义处注释）。
+extern std::mutex g_plugin_io;
+
+// CMS 分类名 → 影视仓式友好分区标题（电影 / 剧集 / 动漫 / 综艺 / 纪录片 / 短剧）。
+std::wstring FriendlySectionTitle(const std::string& type_name);
+// 友好分区标题 → 分区优先级（数字越小越靠前，其余为 9）。
+int SectionPriority(const std::wstring& title);
+// 跨源同名同年去重键：去空白 + 转小写 + 可选年份后缀。
+std::string NormalizeVideoTitle(const std::string& title, const std::string& year);
+// 当前音乐窗的皮肤外框（等价 ActiveLegacySkin(g_browser.get())）；音乐窗
+// 未创建时返回 nullptr。供视频命令域给 ShowVideoPlayer / ShowVideoSourceDialog
+// 传外框，口径与音乐窗自身 state->host.skin 一致。
+const skin::LegacySkin* MusicFreeBrowserLegacySkin();
+
+// 打开「导入音源」对话框（与 Win32 界面「导入…」按钮同一实现）。
+// WebView 页面经 bridge 的 music.import 命令调用。返回 false = 音乐窗未创建
+// 或正在加载音源（此时按钮本身也是禁用态）。
+bool MusicFreeOpenImportDialog();
 
 } // namespace ttplayer::musicfree

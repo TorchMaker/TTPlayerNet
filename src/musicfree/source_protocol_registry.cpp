@@ -605,7 +605,19 @@ ProtocolResolveResult SourceProtocolRegistry::ResolveFallback(
     std::lock_guard<std::mutex> lock(impl_->mutex);
     ProtocolResolveResult out;
     std::vector<std::string> failures;
+    // 对齐原版 MusicFree：getByName(platform) 只取「来源平台」的解析器，
+    // 不遍历所有音源。此前这里遍历全部协议音源（洛雪 kw/kg/tx/wy/mg + REST）
+    // 逐个 ResolveUrl，串行累积 28 个请求、16~29s，是取链慢的根因。
+    // 现在只尝试「声明支持该来源平台」的协议源（info.sources 命中），
+    // 洛雪/REST 各自只被调用一次，杜绝跨音源串行试探。
+    std::string want = MapToLxSource(track.platform);
+    if (want.empty()) want = track.platform;
     for (const auto& e : impl_->entries) {
+        bool supports = false;
+        for (const auto& s : e->info.sources) {
+            if (s == want || s == track.platform) { supports = true; break; }
+        }
+        if (!supports) continue;
         ProtocolResolveResult r;
         try {
             if (e->lx && e->info.can_resolve)

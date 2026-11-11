@@ -5,6 +5,7 @@
 // 把 MusicFreeSourceManager 的创建/缓存目录推导/依赖库部署收敛到一处，供 UI
 // 层（player_window / 菜单）调用，避免各处重复推导路径。
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -54,6 +55,37 @@ void FinishMusicFreeSourcesLoading();
 
 // 供 LoadCached() 在插件之间检查取消请求；进程正在退出时提前收工。
 bool ShouldStopMusicFreeLoading();
+
+// ---- 优雅退出：让所有 MusicFree 后台线程干净退场 -------------------------
+//
+// 进程退出时，发现页 / 搜索 / 解析 / 歌单等后台线程仍可能通过 g_manager 访问
+// QuickJS 引擎与插件；而 g_manager 是命名空间级 unique_ptr，会在 CRT / DLL 静态
+// 析构时被销毁。若这些 detached 线程在析构竞态里继续跑，就会触发
+// "abnormal program termination"。协调方式：
+//   * IsMusicFreeShuttingDown  供后台线程在入口 / 循环点早退，不再触碰 g_manager。
+//   * BgThreadGuard            每个后台线程的 RAII 计数，析构时通知等待方。
+//   * WaitMusicFreeBackgroundThreads  有界等待计数归零。
+//   * ShutdownMusicFree        置标志 → 排空网络 → 等所有后台线程 → 销毁 g_manager。
+bool IsMusicFreeShuttingDown() noexcept;
+
+namespace detail {
+// BgThreadGuard 的计数实现（引用 .cpp 内的全局计数与条件变量）。
+void MusicFreeBgThreadEnter() noexcept;
+void MusicFreeBgThreadLeave() noexcept;
+}
+
+struct BgThreadGuard {
+    BgThreadGuard() { detail::MusicFreeBgThreadEnter(); }
+    ~BgThreadGuard() { detail::MusicFreeBgThreadLeave(); }
+    BgThreadGuard(const BgThreadGuard&) = delete;
+    BgThreadGuard& operator=(const BgThreadGuard&) = delete;
+};
+
+void WaitMusicFreeBackgroundThreads(
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) noexcept;
+
+void ShutdownMusicFree(
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(20000)) noexcept;
 
 // ---- 音源自动更新（复刻 MusicFree 的插件更新机制）----
 
@@ -121,6 +153,12 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
                                             const std::string& id,
                                             std::string* error = nullptr,
                                             const nlohmann::json* raw = nullptr);
+
+// 只查解析缓存、**绝不联网**。播放窗用它区分「可立即流式播放」与「需要
+// 后台解析」：后者不能在 UI 线程同步等插件取链（实测 28s，界面冻结）。
+// 返回 nullopt 表示缓存未命中，调用方应走异步解析。
+std::optional<MediaSource> PeekResolveCache(const std::string& platform,
+                                            const std::string& id);
 
 // 播放或下载失败时丢弃该曲目的解析结果缓存：CDN 直链可能在 TTL 内提前失效，
 // 不清掉的话下一次播放会继续拿到同一个坏地址。
@@ -211,5 +249,11 @@ std::filesystem::path DefaultDownloadDirectory();
 // 「搜索结果 → 解析出的地址 → 入列后条目实际带上的字段」串成一条
 // 可逐行核对的链路，而不必靠截图判断界面显示了什么。
 void TraceDiagnostic(const std::string& tag, const std::string& text);
+
+// 音乐点播诊断日志：<exe>\musicfree\play.log（UTF-8，512KB 轮转，失败静默）。
+// 与 TraceDiagnostic 不同：无条件写，不需要环境变量。UI 播放链路
+// （PlayCurrent / 后台解析 / 重选起播）也用它，否则「入了列表但没声音」
+// 只能靠猜。URL 调用方需先脱敏再传入。
+void AppendPlayLog(const std::string& text);
 
 } // namespace ttplayer::musicfree

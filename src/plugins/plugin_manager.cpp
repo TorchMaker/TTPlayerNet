@@ -1050,7 +1050,10 @@ std::string Win32ErrorText(DWORD error) {
 
 bool IsSoundAddInName(const std::filesystem::path& path) {
     const auto name = path.filename().wstring();
+    // ttp_i18n.dll = i18n 资源插件；ttp_v_*.dll = 视频协议插件
+    // （VideoProtocolRegistry 加载）。二者都不是 Sound AddIn。
     return _wcsicmp(name.c_str(), L"ttp_i18n.dll") != 0 &&
+           _wcsnicmp(name.c_str(), L"ttp_v_", 6) != 0 &&
            name.size() > 8 && _wcsnicmp(name.c_str(), L"ttp_", 4) == 0 &&
            _wcsicmp(path.extension().c_str(), L".dll") == 0;
 }

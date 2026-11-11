@@ -176,9 +176,10 @@ inline void PaintButton(HDC dc, const RECT& rect, const wchar_t* text,
 
 // ------------------------------------------------------------------ 兜底窗体
 
-// 兜底外框的分区。导航簇（音源标签 + ◀ ▶ + 重新搜索 + ✕）全部右对齐，
-// 标题文字区域裁到导航簇左侧 —— 早期版本把这三个按钮放在标题栏左上角
-// (10,7)-(80,23)，正好压在标题文字上，看起来就是「按钮和标题重叠」。
+// 兜底外框的分区。导航簇（音源标签 + ◀ ▶ + 重新搜索）**左对齐**排在标题栏
+// 最前面，标题文字跟在簇后面；只有 ✕ 仍贴右上角（Windows 的窗口按钮习惯）。
+// 早期版本导航簇右对齐、标题文字占满左边，视觉上按钮被挤到最右侧、鼠标要走
+// 很远才能点到，用户反馈「按钮挪到前面去」。
 struct FrameChrome {
     RECT client{};
     RECT title{};
@@ -212,16 +213,29 @@ inline FrameChrome BuildFrameChrome(const RECT& client, int pad, int title_heigh
 
     const int top = chrome.title.top + 4;
     const int bottom = std::min<LONG>(chrome.title.bottom - 4, top + 20);
-    chrome.close = {client.right - pad - 24, top, client.right - pad, bottom};
-    chrome.refresh = {chrome.close.left - 8 - 76, top, chrome.close.left - 8, bottom};
-    chrome.next_source = {chrome.refresh.left - 12 - 24, top,
-                          chrome.refresh.left - 12, bottom};
-    chrome.prev_source = {chrome.next_source.left - 2 - 24, top,
-                          chrome.next_source.left - 2, bottom};
-    chrome.navigation_label = {chrome.prev_source.left - 4 - 34, top,
-                               chrome.prev_source.left - 4, bottom};
-    chrome.title_text = {client.left + 11, chrome.title.top,
-                         std::max<LONG>(client.left + 11, chrome.navigation_label.left - 8),
+    // 尺寸沿用原右对齐版本的取值，保证按钮大小不变，只是整体搬到左边。
+    constexpr LONG kNavWidth = 24;      // ◀ / ▶
+    constexpr LONG kRefreshWidth = 76;  // 重新搜索
+    constexpr LONG kLabelWidth = 34;    // 「音源」标签
+    constexpr LONG kCloseWidth = 24;    // ✕
+
+    // ✕：唯一保留右锚定的控件。
+    chrome.close = {client.right - pad - kCloseWidth, top, client.right - pad, bottom};
+
+    // 导航簇：从标题栏最左侧开始依次排布 —— 音源 ◀ ▶ 重新搜索。
+    LONG cursor = client.left + pad;
+    chrome.navigation_label = {cursor, top, cursor + kLabelWidth, bottom};
+    cursor = chrome.navigation_label.right + 4;
+    chrome.prev_source = {cursor, top, cursor + kNavWidth, bottom};
+    cursor = chrome.prev_source.right + 2;
+    chrome.next_source = {cursor, top, cursor + kNavWidth, bottom};
+    cursor = chrome.next_source.right + 12;
+    chrome.refresh = {cursor, top, cursor + kRefreshWidth, bottom};
+    cursor = chrome.refresh.right + 12;
+
+    // 标题文字接在导航簇后面，右边界给 ✕ 留 8px 间隙，超长时省略号收尾。
+    chrome.title_text = {cursor, chrome.title.top,
+                         std::max<LONG>(cursor, chrome.close.left - 8),
                          chrome.title.bottom};
     return chrome;
 }
@@ -238,7 +252,7 @@ inline void PaintFrameChrome(HDC dc, const FrameChrome& chrome,
 
     PaintButton(dc, chrome.close, L"✕", ui_font, TitleButtonSkin(states.close));
     DrawTextIn(dc, chrome.navigation_label, L"音源", kOnAccentIdle, ui_font,
-               kRightFormat);
+               kCenterFormat);
     PaintButton(dc, chrome.prev_source, L"◀", ui_font,
                 TitleButtonSkin(states.prev_source));
     PaintButton(dc, chrome.next_source, L"▶", ui_font,

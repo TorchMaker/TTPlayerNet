@@ -75,6 +75,21 @@ END
 300 ICON "assets/AudioFile.ico"
 301 ICON "assets/PlaylistFile.ico"
 
+// ───────── 音乐窗 WebView2 页面嵌资源（RT_RCDATA，ID 3001-3003）─────────
+// ID 与 src/musicfree/webui_assets.h 中的 IDR_WEBUI_* 宏保持一致（勿单侧修改）。
+// 路径相对本 .rc 文件解析（与上方 assets/ 同机制：rc.exe 对含目录分隔符的
+// 相对路径按 .rc 所在目录回溯，已实测含 ".." 回溯亦有效）；webui/ 在仓库根
+// d:\Project\CodeBuddy\TTPlayerNet\webui\，本文件在 src\app\，故向上四级。
+// 复杂布局若失效，备选方案为 CMake configure 时把 webui/ 三个文件复制到
+// src\app\webui\ 旁再引用（当前直接相对路径已验证可行，无需复制）。
+#define IDR_WEBUI_INDEX  3001
+#define IDR_WEBUI_STYLE  3002
+#define IDR_WEBUI_SCRIPT 3003
+
+IDR_WEBUI_INDEX  RCDATA "../../../../webui/index.html"
+IDR_WEBUI_STYLE  RCDATA "../../../../webui/style.css"
+IDR_WEBUI_SCRIPT RCDATA "../../../../webui/app.js"
+
 // Explorer's 属性 → 详细信息 页读取这里。产品名固定为「千千静听2026」，
 // FILEVERSION 只能放四段数字，故用 2026,0,0,0 并保留可读字符串 "2026"。
 // 不要在这里改 InternalName/OriginalFilename：文件关联与 AddIn 都按 TTPlayer.exe 走。

@@ -4,7 +4,11 @@ project(TTPlayerRebuild VERSION 0.1.0 LANGUAGES C CXX)
 option(BUILD_TESTING "Build local, unpublished tests" OFF)
 include(CTest)
 option(TTPLAYER_STAGE_RUNTIME "Rebuild/copy local original DLLs, skins and configuration beside the EXE" ON)
-option(TTPLAYER_LEGACY_WINDOWS "Build the separate Windows XP SP3 / Windows 7 edition" OFF)
+# 单一兼容构建：一个 EXE 同时兼容 Win7/Win8/8.1 与 Win10/11。
+# 兼容机制全部运行时自适应（VC-LTL 静态 CRT、视频层静态编入、WebView2Loader
+# 动态加载、按系统版本选 WebView2 Runtime + 缺失自动安装），所以不需要再维护
+# 一份「现代版」与一份「Win7 版」两个 EXE。
+option(TTPLAYER_LEGACY_WINDOWS "Build a single EXE compatible with both Win7 and Win10+ (no separate modern build)" ON)
 option(TTPLAYER_OPTIMIZE_SIZE "Optimize Release player size, retaining fast audio processing" ON)
 option(TTPLAYER_BUILD_LIBRARY_TESTS "Build local media library regression tests" OFF)
 option(TTPLAYER_BUILD_NAVIGATION_TESTS "Build local playback navigation regression tests" OFF)
@@ -61,7 +65,8 @@ target_include_directories(qjs PUBLIC third_party/quickjs-0.9.0)
 target_compile_definitions(qjs PRIVATE _GNU_SOURCE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
 # quickjs-ng 假设 8MB 栈；MSVC 默认 1MB 会导致深递归崩溃。
 if(MSVC)
-  target_compile_options(qjs PRIVATE /W0)
+  # quickjs 使用 <stdatomic.h>（要求 C11 及以上）；MSVC 对 .c 默认标准过低会报 C1189。
+  target_compile_options(qjs PRIVATE /W0 /std:c11)
   target_link_options(qjs PUBLIC /STACK:8388608)
 else()
   target_compile_options(qjs PRIVATE -w)
@@ -102,6 +107,7 @@ add_library(ttplayer_core
   src/lyrics/lyric_http.cpp
   src/musicfree/quickjs_engine.cpp
   src/musicfree/musicfree_http.cpp
+  src/musicfree/webview2_runtime.cpp
   src/musicfree/musicfree_plugin.cpp
   src/musicfree/musicfree_source_manager.cpp
   src/musicfree/musicfree_import_dialog.cpp
@@ -112,6 +118,8 @@ add_library(ttplayer_core
   src/musicfree/lx_source_adapter.cpp
   src/musicfree/rest_source_adapter.cpp
   src/musicfree/source_protocol_registry.cpp
+  # 视频层整体编译进独立 DLL ttplayer_video（见下方 add_library），不再进主静态库，
+  # 避免十几个 spider 引擎把主程序撑大；对外的 C++ API 经 TTPLAYER_VIDEO_API 导出。
   src/playlist/playlist.cpp
   src/playlist/playback_order.cpp
   src/playlist/playlist_store.cpp
@@ -158,6 +166,7 @@ add_library(ttplayer_core
   src/ui/player_window_visual.cpp
   src/ui/album_background.cpp
   src/ui/cover_image.cpp
+  src/ui/image_decoder_registry.cpp
   src/ui/player_window_visual_options.cpp
   src/ui/shell_send_to.cpp
   src/ui/window_drag.cpp
@@ -169,6 +178,13 @@ target_include_directories(ttplayer_core
          third_party/ttp-osu-sdk/include
   PRIVATE "${TTPLAYER_GENERATED_INCLUDE_DIR}"
 )
+# musicfree_browser_window.cpp 挂接音乐窗 WebView2 宿主时要包含宿主头
+#（宿主头内含 WebView2.h），故主库编译单元也需要 WebView2 头文件搜索路径。
+# 只加头路径不加链接：WebView2Loader 的链接只落在主 exe 上（见下方
+# ttplayer_rebuild 的接线），架构只用 build/native/x86，不引入任何下载。
+target_include_directories(ttplayer_core PRIVATE
+  ../../third_party/webview2/build/native/include
+)
 add_dependencies(ttplayer_core ttplayer_build_date)
 target_compile_definitions(ttplayer_core PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WTL_DPI_SUPPORT)
 target_compile_options(ttplayer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
@@ -177,7 +193,7 @@ target_link_libraries(ttplayer_core PUBLIC
   qjs
   winmm ole32 oleaut32 comsuppw uuid strmiids msimg32 shell32 shlwapi comctl32 comdlg32
   windowscodecs gdiplus dsound setupapi dwmapi uxtheme
-  mfplat mfreadwrite mfuuid propsys winhttp
+  mfplat mfreadwrite mf mfuuid propsys winhttp
 )
 
 if(NOT TTPLAYER_LEGACY_WINDOWS)
@@ -193,9 +209,185 @@ if(NOT TTPLAYER_LEGACY_WINDOWS)
   endif()
 endif()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 视频层独立 DLL：视频源管理 / CMS 与直播拉取 / 地址解析 / spider 引擎 / 播放窗
+# 整体编译进 ttplayer_video.dll，不再进主静态库 —— 十几个 spider 引擎不再撑大
+# 主程序。对外公开 API 经 TTPLAYER_VIDEO_API（video_export.h）导出；同时提供
+# C ABI 插件入口 ttpGetVideoModule（video_module_api.h），未来新增内容类型按
+# query() 扩展点登记即可，不改 ABI。
+# 依赖方向：ttplayer_video → ttplayer_core（静态，仅拉入 text / musicfree_http
+# 等无状态符号）；主 exe 同时链接两者（core 在前、video 在后，未解析符号由
+# video 的导入库补齐）。TTPLAYER_VIDEO_BUILDING_DLL 使导出宏展开为 dllexport。
+# ─────────────────────────────────────────────────────────────────────────────
+set(TTPLAYER_VIDEO_SOURCES
+  src/video/video_config.cpp
+  src/video/video_cms.cpp
+  src/video/video_resolve.cpp
+  src/video/video_player_js.cpp
+  src/video/video_source_manager.cpp
+  src/video/video_source_dialog.cpp
+  src/video/video_player_window.cpp
+  src/video/video_protocol_registry.cpp
+  src/video/video_module.cpp
+  src/video/spider/spider_api.cpp
+  src/video/spider/spider_registry.cpp
+  src/video/spider/spider_recipe.cpp
+  src/video/spider/spider_http.cpp
+  src/video/spider/spider_util.cpp
+  src/video/spider/spider_builtins.cpp
+  src/video/spider/spider_engine_cms.cpp
+  src/video/spider/spider_engine_app.cpp
+  src/video/spider/spider_engine_html.cpp
+  src/video/spider/spider_engine_pan.cpp
+  src/video/spider/spider_engine_live.cpp
+  src/video/spider/spider_engine_recipe_api.cpp
+)
+# XP / Win7 兼容版：旧系统不能出现 ttplayer_video.dll 的启动导入，审计脚本也
+# 禁止任何延迟导入。因此兼容版把视频层静态编进主 EXE（无 DLL / 无 delayload），
+# 现代版保持独立 DLL + /DELAYLOAD 的「插件可选」语义不变。
+if(TTPLAYER_LEGACY_WINDOWS)
+  add_library(ttplayer_video STATIC ${TTPLAYER_VIDEO_SOURCES})
+else()
+  add_library(ttplayer_video SHARED ${TTPLAYER_VIDEO_SOURCES})
+endif()
+target_include_directories(ttplayer_video
+  PUBLIC include
+  PRIVATE "${TTPLAYER_GENERATED_INCLUDE_DIR}"
+)
+target_compile_definitions(ttplayer_video PRIVATE
+  UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WTL_DPI_SUPPORT
+  TTPLAYER_VIDEO_BUILDING_DLL)
+target_compile_options(ttplayer_video PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(ttplayer_video PRIVATE
+  ttplayer_core
+  ttplayer_wtl_headers
+  winmm ole32 oleaut32 comsuppw uuid strmiids msimg32 shell32 shlwapi comctl32
+  comdlg32 windowscodecs gdiplus dsound setupapi dwmapi uxtheme mfplat mfreadwrite
+  mf mfuuid propsys winhttp bcrypt)
+
 add_library(ttpcomm_api STATIC src/app/ttpcomm_api.c)
 target_include_directories(ttpcomm_api PUBLIC include)
 target_compile_definitions(ttpcomm_api PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+
+# 视频协议插件 DLL：每种流媒体协议一个独立 DLL，与音乐格式插件同约定，
+# 部署到 <exe>\AddIn\ 并命名 ttp_v_<协议>.dll（工厂导出 ttpGetVideoProtocol）。
+add_library(video_protocol_hls SHARED src/video/protocols/protocol_hls.cpp)
+set_target_properties(video_protocol_hls PROPERTIES OUTPUT_NAME "ttp_v_hls")
+target_include_directories(video_protocol_hls PUBLIC include)
+target_compile_definitions(video_protocol_hls PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_protocol_hls PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(video_protocol_hls PRIVATE ws2_32 bcrypt)
+
+# 网页播放地址协议：parses 解析接口 + 播放页内嵌直链 → 本地代理，
+# 结果为 m3u8 时委托 ttp_v_hls.dll 摊平成 TS 流。
+add_library(video_protocol_web SHARED src/video/protocols/protocol_web.cpp)
+set_target_properties(video_protocol_web PROPERTIES OUTPUT_NAME "ttp_v_web")
+target_include_directories(video_protocol_web PUBLIC include)
+target_compile_definitions(video_protocol_web PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_protocol_web PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(video_protocol_web PRIVATE ws2_32 winhttp)
+
+# MPEG-DASH：MPD → init + fMP4 分段的本地 MP4 代理（与 HLS 插件同骨架）。
+add_library(video_protocol_dash SHARED src/video/protocols/protocol_dash.cpp)
+set_target_properties(video_protocol_dash PROPERTIES OUTPUT_NAME "ttp_v_dash")
+target_include_directories(video_protocol_dash PUBLIC include)
+target_compile_definitions(video_protocol_dash PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_protocol_dash PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(video_protocol_dash PRIVATE ws2_32 bcrypt winhttp)
+
+# 直播频道列表：M3U/TXT/JSON → 选频道 → 委托 HLS / WEB 协议插件。
+add_library(video_protocol_m3u SHARED src/video/protocols/protocol_m3u.cpp)
+set_target_properties(video_protocol_m3u PROPERTIES OUTPUT_NAME "ttp_v_m3u")
+target_include_directories(video_protocol_m3u PUBLIC include)
+target_compile_definitions(video_protocol_m3u PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_protocol_m3u PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(video_protocol_m3u PRIVATE ws2_32 winhttp)
+
+# 视频协议插件全链路自测：加载 ttp_v_hls / ttp_v_web，打开会话、轮询就绪、
+# 抓取最终媒体地址（TS 本地流）的字节并校验 MPEG-TS 同步字节。
+add_executable(selftest_video tools/selftest_video.cpp)
+target_include_directories(selftest_video PRIVATE include)
+target_compile_definitions(selftest_video PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(selftest_video PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(selftest_video PRIVATE ws2_32 winhttp)
+
+# 音乐窗搜索无 GUI 探针：直接调用 musicfree::SearchAllSources，
+# 打印音源数 / 命中数 / 每音源错误原因。放在 TTPlayer\ 下运行。
+add_executable(music_search_probe tools/music_search_probe.cpp)
+target_include_directories(music_search_probe PRIVATE include)
+target_compile_definitions(music_search_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(music_search_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(music_search_probe PRIVATE ttplayer_core)
+
+# 视频全源搜索探针：与 video.search 同一实现（8 路并发 + 单站计时）。
+add_executable(video_search_probe tools/video_search_probe.cpp)
+target_include_directories(video_search_probe PRIVATE include)
+target_compile_definitions(video_search_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_search_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(video_search_probe PRIVATE ttplayer_core)
+
+# 图片解码插件自测：加载 ttp_i_webp.dll，解码真实缓存封面并校验/导出 BMP。
+add_executable(selftest_image tools/selftest_image.cpp)
+target_include_directories(selftest_image PRIVATE include)
+target_compile_definitions(selftest_image PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(selftest_image PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(selftest_image PRIVATE gdi32)
+
+# 原生 spider 自检（SubTask 1.7）：注册表 / 分派矩阵（普通 CMS、直播、drpy、
+# 已实现与未实现的 csp_*）/ recipe 目录探测与校验。无 GUI，输出
+# SPIDER_PROBE_RESULT: PASS|FAIL 并以 0/1 退出。
+add_executable(spider_probe tools/spider_probe.cpp)
+target_include_directories(spider_probe PRIVATE include)
+target_compile_definitions(spider_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(spider_probe PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(spider_probe PRIVATE ttplayer_core)
+
+# 原生 spider 全量自测（Task 8.1）：单站点四段（home/category/detail/player）
+# 与 --all 遍历 sites_resolved.json；--play 时校验 HLS/FLV/MP4 真实字节，可选
+# 转调同目录 selftest_video.exe 做插件级校验。报告 UTF-8，末行
+# SELFTEST_SPIDER_RESULT: PASS|FAIL 并以 0/1 退出。
+add_executable(selftest_spider tools/selftest_spider.cpp)
+target_include_directories(selftest_spider PRIVATE include)
+target_compile_definitions(selftest_spider PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(selftest_spider PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(selftest_spider PRIVATE ttplayer_core)
+
+# TVBox/catvod/drpy 自定义播放器宿主内部自测（纯本地内联 JS，无网络）：
+# 校验 playerContent / flag 命名函数 / async 入口、宿主 API、请求头回传。
+add_executable(selftest_player_js tools/selftest_player_js.cpp)
+target_include_directories(selftest_player_js PRIVATE include)
+target_compile_definitions(selftest_player_js PRIVATE
+  UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(selftest_player_js PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(selftest_player_js PRIVATE ttplayer_video ttplayer_core)
+
+# 图片解码插件：WebP（含 lossy VP8 / lossless VP8L / 透明 / 动画首帧）。
+# 与音乐/视频插件同约定：位置 <exe>\AddIn\，命名 ttp_i_<格式>.dll，工厂导出
+# ttpGetImageDecoder。解码核心由 libwebp（BSD）静态编入本 DLL 完成 —— 零外部运行时，
+# 不依赖系统 WebP 解码器，跨 Win10/11 与精简版系统都能解出封面。
+# 直接复用 libwebp 自带的 CMake（它按架构/编译选项条件编译 SIMD，避免手工拣源出错），
+# 仅启用解码链路：关闭全部可执行文件与 mux/extras，只暴露 webpdecode/webpdspdecode/
+# webputilsdecode 三个 object 库供本插件链接。
+set(WEBP_BUILD_LIBWEBPMUX OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_ANIM_UTILS OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_CWEBP       OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_DWEBP       OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_GIF2WEBP    OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_IMG2WEBP    OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_VWEBP       OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPINFO    OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPMUX     OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_EXTRAS      OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBP_JS     OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/libwebp-1.4.0)
+
+add_library(image_decoder_webp SHARED src/plugins/image/decoder_webp.cpp)
+set_target_properties(image_decoder_webp PROPERTIES OUTPUT_NAME "ttp_i_webp")
+target_include_directories(image_decoder_webp PRIVATE include third_party/libwebp-1.4.0/src)
+target_compile_definitions(image_decoder_webp PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(image_decoder_webp PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(image_decoder_webp PRIVATE
+  webpdecode webpdspdecode webputilsdecode gdi32 kernel32 user32)
 
 add_executable(ttplayer_rebuild WIN32
   src/app/application.cpp
@@ -210,7 +402,106 @@ set_target_properties(ttplayer_rebuild PROPERTIES
   OUTPUT_NAME "TTPlayerRebuild" PDB_NAME "TTPlayerRebuild")
 target_compile_definitions(ttplayer_rebuild PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(ttplayer_rebuild PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(ttplayer_rebuild PRIVATE ttplayer_core ttpcomm_api comctl32 comdlg32 shell32)
+# ttplayer_core 在前、ttplayer_video 在后：core 静态库里 musicfree 桥接代码
+# 引用的视频符号由 video 的导入库补齐（MSVC 按序搜索库）。
+# /DELAYLOAD + delayimp：ttplayer_video.dll 延迟到首次视频调用才解析 ——
+# DLL 缺失时主程序照常启动（视频模块缺失走 main.cpp 的失败钩子兜底提示），
+# 与「插件可选」语义一致。
+if(TTPLAYER_LEGACY_WINDOWS)
+  # 静态库：不能有 delayimp / 延迟导入，也不必复制 DLL。
+  target_link_libraries(ttplayer_rebuild PRIVATE
+    ttplayer_core ttplayer_video ttpcomm_api comctl32 comdlg32 shell32)
+else()
+  target_link_libraries(ttplayer_rebuild PRIVATE
+    ttplayer_core ttplayer_video ttpcomm_api comctl32 comdlg32 shell32 delayimp)
+  target_link_options(ttplayer_rebuild PRIVATE /DELAYLOAD:ttplayer_video.dll)
+  add_custom_command(TARGET ttplayer_rebuild POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:ttplayer_video>"
+            "$<TARGET_FILE_DIR:ttplayer_rebuild>")
+endif()
+add_dependencies(ttplayer_rebuild ttplayer_video)
+
+# ─────────────────── WebView2 SDK 接线（Win32/x86，本地 SDK 无网络）───────────────────
+# 三行照 ../../third_party/webview2/README.md 的要求：头文件目录 + x86 库搜索路径 +
+# 导入库 WebView2Loader.dll.lib（README 明确导入库/静态库二选一，取导入库，
+# 因此运行时必须带 WebView2Loader.dll —— 见文件末尾的 post-build 复制）。
+# 只用 build/native/x86，不破坏文件头的 32 位约束；不引入 FetchContent/下载。
+target_include_directories(ttplayer_rebuild PRIVATE
+  ../../third_party/webview2/build/native/include
+)
+target_link_directories(ttplayer_rebuild PRIVATE
+  ../../third_party/webview2/build/native/x86
+)
+# XP / Win7 版不链接导入库：启动导入表里出现 WebView2Loader.dll 会让旧系统
+# 加载器直接拒绝启动。改为运行时 LoadLibrary（见 webview2_dynamic.h），
+# 旧系统没有 WebView2 Runtime 时优雅回退原生界面。
+if(NOT TTPLAYER_LEGACY_WINDOWS)
+  target_link_libraries(ttplayer_rebuild PRIVATE WebView2Loader.dll.lib)
+endif()
+
+# 音乐窗 WebView2 化的三个新增源文件（编入主 exe）：
+#   musicfree_webview_host.cpp —— WebView2 宿主（并行任务创建，此处按文件名注册）
+#   webui_assets.cpp           —— 页面资产双源加载（外部覆盖优先 + 嵌资源兜底）
+#   musicfree_bridge.cpp       —— C++ ↔ 页面 JSON 双向桥协议层
+# 三个能力域的命令注册入口（编入主 exe，由音乐窗 ShowMusicFreeBrowser 建桥后各调一次）：
+#   bridge_cmds_music.cpp      —— 音乐能力命令（RegisterMusicCommands，并行任务创建）
+#   bridge_cmds_video.cpp      —— 视频能力命令（RegisterVideoCommands）
+#   bridge_cmds_misc.cpp       —— 搜索/收藏/历史/配置命令（RegisterMiscCommands）
+target_sources(ttplayer_rebuild PRIVATE
+  src/musicfree/musicfree_webview_host.cpp
+  src/musicfree/webui_assets.cpp
+  src/musicfree/musicfree_bridge.cpp
+  src/musicfree/bridge_cmds_music.cpp
+  src/musicfree/bridge_cmds_video.cpp
+  src/musicfree/bridge_cmds_misc.cpp
+  # 视频窗网页兜底宿主（WebView2）：官方网页线路解析全失败时在播放窗内加载网页。
+  # 只编入 exe：核心库经 ttplayer/video/video_web_host.h 的函数指针调用它。
+  src/musicfree/video_web_host.cpp
+)
+
+# WebUI 三件套是被 resources.rc 以 RCDATA 直接引用的；MSVC 的 RC 依赖文件
+# 不会自动跟踪这些 include，改页面后 ninja 会误判“资源无需重编”，导致 exe
+# 里仍是旧页面。这里显式加 OBJECT_DEPENDS，页面一变就重编资源并重链接。
+set_property(SOURCE src/app/resources.rc APPEND PROPERTY OBJECT_DEPENDS
+  "${CMAKE_SOURCE_DIR}/../../webui/index.html;${CMAKE_SOURCE_DIR}/../../webui/style.css;${CMAKE_SOURCE_DIR}/../../webui/app.js")
+
+# 崩溃定位用链接映射表：发布版没有 PDB，线上 dump 只能靠 map 把「exe+RVA」
+# 还原成函数名。map 不改变代码布局，可长期保留。
+if(MSVC)
+  target_link_options(ttplayer_rebuild PRIVATE
+    "/MAP:${CMAKE_BINARY_DIR}/TTPlayerRebuild.map")
+endif()
+
+# 视频网页兜底宿主的离屏冒烟探针（验证用，不进产品运行时依赖）。
+# 隐藏父窗口 + 真实腾讯播放页，20 秒消息循环内判定 READY/FAILED，
+# 末行输出 WEBVIEW_PROBE_RESULT: PASS|FAIL 并以 0/1 退出。
+if(NOT TTPLAYER_LEGACY_WINDOWS)
+  add_executable(webview_probe
+    tools/webview_probe.cpp
+    src/musicfree/video_web_host.cpp
+  )
+  target_include_directories(webview_probe PRIVATE
+    include
+    ../../third_party/webview2/build/native/include
+  )
+  target_link_directories(webview_probe PRIVATE
+    ../../third_party/webview2/build/native/x86
+  )
+  target_compile_definitions(webview_probe PRIVATE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(webview_probe PRIVATE /W4 /permissive- /EHsc /utf-8)
+  target_link_libraries(webview_probe PRIVATE
+    ttplayer_core WebView2Loader.dll.lib ole32 oleaut32 user32)
+
+  # WebView2 运行时选择（Win10+ 系统 Runtime / Win7 109 / 自动安装开关）的内部自测。
+  add_executable(selftest_webview2_runtime tools/selftest_webview2_runtime.cpp)
+  target_include_directories(selftest_webview2_runtime PRIVATE include)
+  target_compile_definitions(selftest_webview2_runtime PRIVATE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(selftest_webview2_runtime PRIVATE /W3 /permissive- /EHsc /utf-8)
+  target_link_libraries(selftest_webview2_runtime PRIVATE ttplayer_core)
+endif()
 
 # The player and translation provider are built and distributed independently.
 # An already-built DLL is only needed for optional integration tests.
@@ -252,6 +543,9 @@ include(cmake/size_optimization.cmake)
 # emulation, faulting before WM_INITDIALOG finishes. wWinMain instead
 # enables DEP explicitly, with the system's legacy ATL compatibility.
 target_link_options(ttplayer_rebuild PRIVATE /NXCOMPAT:NO)
+# 崩溃诊断：生成 public symbol 映射，配合 %TEMP%\ttplayer_crash.log 的 RVA 定位函数
+target_link_options(ttplayer_rebuild PRIVATE
+  /MAP:$<TARGET_FILE_DIR:ttplayer_rebuild>/ttplayer_rebuild.map)
 if(TTPLAYER_LEGACY_WINDOWS)
   include(cmake/legacy_ttpcomm.cmake)
   target_link_options(ttplayer_rebuild PRIVATE /SUBSYSTEM:WINDOWS,5.01 /OSVERSION:5.1)
@@ -930,7 +1224,8 @@ add_custom_target(ttpres_resources ALL
 # The recovered program resolves runtime files strictly beside the executable.
 # Keep the intermediate resource products for tests/inspection, then stage the
 # exact runtime layout into every single- or multi-config output directory.
-add_dependencies(ttplayer_rebuild ttpres_resources)
+add_dependencies(ttplayer_rebuild ttpres_resources video_protocol_hls
+                 video_protocol_web video_protocol_dash video_protocol_m3u)
 add_custom_command(TARGET ttplayer_rebuild POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/../ttpcomm.dll"
@@ -1073,4 +1368,76 @@ if(TARGET ttplayer_rebuild)
             "$<TARGET_FILE_DIR:ttplayer_rebuild>/musicfree/libs"
     VERBATIM
   )
+endif()
+
+# WebView2Loader.dll：现代版链接导入库、启动时静态导入；XP/Win7 版不链接导入库
+# 但用 LoadLibrary 动态解析 CreateCoreWebView2EnvironmentWithOptions，同样需要
+# 这个 DLL 在 exe 同目录。只复制 build/native/x86 下的 dll（32 位约束），不下载。
+if(TARGET ttplayer_rebuild)
+  add_custom_command(TARGET ttplayer_rebuild POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/webview2/build/native/x86/WebView2Loader.dll"
+            "$<TARGET_FILE_DIR:ttplayer_rebuild>/WebView2Loader.dll"
+    COMMENT "Deploying WebView2Loader.dll beside the exe"
+    VERBATIM
+  )
+endif()
+# 部署目录 TTPlayer/ 只给现代版写，避免兼容版构建覆盖正在运行的现代版目录。
+if(TARGET ttplayer_rebuild AND NOT TTPLAYER_LEGACY_WINDOWS)
+  add_custom_command(TARGET ttplayer_rebuild POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/webview2/build/native/x86/WebView2Loader.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../TTPlayer/WebView2Loader.dll"
+    COMMENT "Deploying WebView2Loader.dll into TTPlayer/"
+    VERBATIM
+  )
+endif()
+
+# ── VC++ 运行时 app-local 部署 ──────────────────────────────────────────────
+# 为什么必须「自带」而不是「启动后检测再安装」：主 exe 与 AddIn 插件都是 /MD
+# 动态链接，缺 MSVCP140 时是 **Windows 加载器** 直接拒绝启动（弹系统错误框，
+# 进程根本没起来），我们自己的检测代码一行都执行不到。所以唯一可靠的办法是
+# 按微软官方支持的方式做 app-local 部署：把运行时 DLL 放到 exe 同目录，加载器
+# 优先在应用目录找到它们，目标机器无需安装任何 VC++ 运行时。
+#
+# 依赖清单由 dumpbin /DEPENDENTS 实测得出（exe + 4 个协议插件 + webp 插件）：
+#   MSVCP140 / MSVCP140_ATOMIC_WAIT / VCRUNTIME140 为直接依赖，
+#   VCRUNTIME140_1 为 MSVCP140 的间接依赖（异常处理），一并带上。
+# 运行时目录从编译器路径反推（.../VC/Tools/MSVC/<ver>/bin/... → .../VC/Redist/MSVC），
+# 不硬编码 VS 版本号；找不到时只警告不中断构建（老手可自行拷 DLL）。
+if(TARGET ttplayer_rebuild AND NOT TTPLAYER_LEGACY_WINDOWS)
+  string(REGEX REPLACE "/VC/Tools/MSVC/.*$" "/VC" _vc_root
+         "${CMAKE_CXX_COMPILER}")
+  string(REPLACE "\\" "/" _vc_root "${_vc_root}")
+  file(GLOB _crt_dirs "${_vc_root}/Redist/MSVC/*/x86/Microsoft.VC*.CRT")
+  if(_crt_dirs)
+    list(SORT _crt_dirs)
+    list(GET _crt_dirs -1 _crt_dir)      # 取最高版本
+    set(_crt_files
+      msvcp140.dll
+      vcruntime140.dll
+      vcruntime140_1.dll
+      msvcp140_atomic_wait.dll)
+    set(_crt_copied "")
+    foreach(_f ${_crt_files})
+      if(EXISTS "${_crt_dir}/${_f}")
+        list(APPEND _crt_copied "${_f}")
+        add_custom_command(TARGET ttplayer_rebuild POST_BUILD
+          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                  "${_crt_dir}/${_f}"
+                  "$<TARGET_FILE_DIR:ttplayer_rebuild>/${_f}"
+          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                  "${_crt_dir}/${_f}"
+                  "${CMAKE_CURRENT_SOURCE_DIR}/../../TTPlayer/${_f}"
+          COMMENT "Deploying VC runtime (app-local): ${_f}"
+          VERBATIM
+        )
+      endif()
+    endforeach()
+    message(STATUS "VC 运行时 app-local 部署: ${_crt_dir} -> ${_crt_copied}")
+  else()
+    message(WARNING
+      "未找到 VC 运行时 redist 目录（${_vc_root}/Redist/MSVC/*/x86/Microsoft.VC*.CRT），"
+      "已跳过 app-local 部署；目标机器需自行安装 VC++ 2015-2022 运行库。")
+  endif()
 endif()

@@ -206,6 +206,15 @@ constexpr UINT kMsgOnlinePlayResolved = WM_APP + 0x519;
 struct PlayResolvedPayload {
     size_t playlist_index;
     size_t row;
+    // 每次后台解析自增：用户连续双击多首歌时，只让最后一次的结果重选行，
+    // 旧任务的迟到消息直接丢弃（否则会把播放抢回先点的那首）。
+    unsigned long long serial = 0;
+    // 解析失败时不要重选行：否则 PlayCurrent 又会因缓存未命中再启动一次
+    // 后台解析，形成无限重试循环。
+    bool success = true;
+    // 把真实直链直接带回 UI 线程，不再依赖「重选行 → 查缓存」这条间接且
+    // 受 same_item / 换轨淡出状态影响的路径（用户实测「入了列表但没声音」）。
+    std::string url;
 };
 // 流式播放时后台落盘的本地副本就绪通知。若此刻播放没有真正推进（部分 CDN
 // 只建立了流会话却没吐数据），UI 线程用本地文件重播一次，用户无需手点播放。
