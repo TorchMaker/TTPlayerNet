@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TTPlayer 音乐窗</title>
+  <!-- 样式：本地文件，禁止外链网络资源 -->
+  <link rel="stylesheet" href="style.css">
+  <!-- 逻辑脚本：本地文件，禁止外链；defer 保证 DOM 解析完成后再执行。
+       app.js = 桥封装（send/on）+ 真实模式业务（接 chrome.webview 时启用）；
+       无桥（普通浏览器）时由页面底部内联 __MOCK__ 分支渲染。 -->
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+  <!-- ========== 顶栏：只放 tab 切换（搜索 / 导入下放到各页签首行） ========== -->
+  <header class="topbar">
+    <nav id="tabbar" class="tabbar" role="tablist" aria-label="主导航">
+      <button class="tab active" type="button" data-tab="music" role="tab" aria-selected="true">音乐</button>
+      <button class="tab" type="button" data-tab="video" role="tab" aria-selected="false">视频</button>
+    </nav>
+  </header>
+
+  <!-- ========== 内容区：两个面板（音乐 / 视频） ========== -->
+  <main id="view" class="view">
+
+    <!-- ---- 音乐面板：首行搜索条 / 左推荐 / 右歌曲列表 ---- -->
+    <section id="panel-music" class="panel" role="tabpanel" aria-label="音乐">
+      <!-- 首行通栏：搜索框 + 搜索 + 导入音源（点击 → cmd music.import） -->
+      <div class="search-bar panel-search">
+        <input id="search-input" class="search-input" type="search"
+               placeholder="输入歌曲 / 歌手 / 专辑关键词…" autocomplete="off">
+        <button id="search-btn" class="primary-btn" type="button">搜索</button>
+        <button id="btn-import-music" class="ghost-btn" type="button"
+                title="导入 MusicFree 音源插件（.js 或注册表 JSON）">导入音源</button>
+      </div>
+
+      <div class="split">
+        <div class="split-left">
+          <h2 class="sec-title">推荐</h2>
+          <div id="music-charts" class="card-grid">
+            <!-- 榜单卡片由 app.js（或假数据分支）填充，卡片结构示例：
+            <article class="card">
+              <div class="card-cover"><img loading="lazy" src="..."></div>
+              <div class="card-title">飙升榜</div>
+              <div class="card-meta">100 首</div>
+            </article> -->
+          </div>
+        </div>
+
+        <div class="split-right">
+          <!-- 搜索结果渲染到 #search-results（evt search.result） -->
+          <h2 id="track-list-title" class="sec-title">歌曲列表</h2>
+          <ul id="track-list" class="track-list">
+            <!-- 曲目行由 app.js 填充，结构示例：
+            <li class="track" data-id="1">
+              <span class="track-no">1</span>
+              <div class="track-main">
+                <div class="track-title">歌曲名</div>
+                <div class="track-artist">歌手 · 专辑</div>
+              </div>
+              <span class="track-dur">03:45</span>
+            </li> -->
+          </ul>
+          <!-- 搜索结果：有结果时隐藏曲目列表，清空搜索后恢复 -->
+          <div id="search-results" class="search-results" hidden>
+            <div class="empty">输入关键词开始搜索</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---- 视频面板：首行搜索条 / 左推荐 / 右视频列表 ---- -->
+    <section id="panel-video" class="panel" role="tabpanel" aria-label="视频" hidden>
+      <!-- 首行通栏：搜索框 + 搜索 + 导入视频源（点击 → cmd video.sources） -->
+      <div class="search-bar panel-search">
+        <input id="video-search-input" class="search-input" type="search"
+               placeholder="输入影片 / 剧集关键词…" autocomplete="off">
+        <button id="video-search-btn" class="primary-btn" type="button">搜索</button>
+        <button id="btn-import-video" class="ghost-btn" type="button"
+                title="导入 / 管理影视仓 / TVBox 视频源">导入视频源</button>
+      </div>
+
+      <!-- 加载/状态行：由 evt video.status 驱动（正常加载完成时不占用空间） -->
+      <div id="video-status" class="video-status" hidden></div>
+
+      <div class="split">
+        <div class="split-left">
+          <h2 id="video-rec-title" class="sec-title">推荐</h2>
+          <!-- 分类 chips：由 app.js 按 video.home 的 sections[].title 生成，首项「全部」 -->
+          <div id="video-cats" class="video-cats"></div>
+          <!-- 分区容器：每个分区为 <section class="vsec"><h3 class="vsec-title"></h3><div class="cards"></div></section> -->
+          <div id="video-sections"></div>
+          <!-- 视频搜索结果：搜索态显示在左栏（覆盖推荐流），清空搜索后恢复，默认隐藏 -->
+          <div id="video-search-results" class="search-results" hidden>
+            <div class="empty">输入关键词开始搜索</div>
+          </div>
+        </div>
+
+        <div class="split-right">
+          <!-- 右栏常驻剧集/选集：视频搜索结果在左栏，点结果后剧集在此展开 -->
+          <h2 id="video-list-title" class="sec-title">剧集</h2>
+          <div id="episode-list" class="episode-list">
+            <!-- 选集/视频条目由 app.js 填充：
+            <button class="episode" type="button" data-ep="1">第 1 集</button> -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 轻提示 -->
+  <div id="toast" class="toast" hidden></div>
+
+  <!-- ========== 本地假数据分支：chrome.webview 缺失（浏览器直接打开）时驱动渲染 ========== -->
+  <script>
+  (function () {
+    'use strict';
+
+    // 占位封面：内联 SVG data URI，零网络请求
+    function phCover(text, c1, c2) {
+      var svg =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'>" +
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>" +
+        "<stop offset='0' stop-color='" + c1 + "'/>" +
+        "<stop offset='1' stop-color='" + c2 + "'/>" +
+        "</linearGradient></defs>" +
+        "<rect width='320' height='320' fill='url(#g)'/>" +
+        "<text x='160' y='176' font-size='44' fill='rgba(255,255,255,.9)' " +
+        "text-anchor='middle' font-family='sans-serif'>" + text + "</text></svg>";
+      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    }
+
+    // ---- 假数据（app.js 未接桥时的渲染来源）----
+    window.__MOCK__ = {
+      charts: [
+        { id: 'c1', title: '飙升榜', cover: phCover('飙升', '#3b4a6b', '#4f8cff'), count: 100 },
+        { id: 'c2', title: '热歌榜', cover: phCover('热歌', '#6b3b4a', '#ff5f6d'), count: 100 },
+        { id: 'c3', title: '新歌榜', cover: phCover('新歌', '#3b6b52', '#2fd39b'), count: 50 },
+        { id: 'c4', title: '原创榜', cover: phCover('原创', '#6b5a3b', '#ffb64f'), count: 50 }
+      ],
+      tracks: [
+        { id: 't1', title: '海阔天空', artist: 'Beyond', album: '乐与怒', duration: '05:20', cover: phCover('1', '#334', '#556') },
+        { id: 't2', title: '晴天', artist: '周杰伦', album: '叶惠美', duration: '04:29', cover: phCover('2', '#334', '#556') },
+        { id: 't3', title: '孤勇者', artist: '陈奕迅', album: '孤勇者', duration: '04:16', cover: phCover('3', '#334', '#556') },
+        { id: 't4', title: '起风了', artist: '买辣椒也用券', album: '起风了', duration: '05:25', cover: phCover('4', '#334', '#556') },
+        { id: 't5', title: '富士山下', artist: '陈奕迅', album: 'What\u2019s Going On…?', duration: '04:20', cover: phCover('5', '#334', '#556') },
+        { id: 't6', title: '稻香', artist: '周杰伦', album: '魔杰座', duration: '03:43', cover: phCover('6', '#334', '#556') }
+      ],
+      videoSections: [
+        {
+          name: '热播电影',
+          items: [
+            { id: 'v1', title: '星际穿越', poster: phCover('星际', '#2b3550', '#4f8cff'), rating: '9.4', tags: ['科幻', '冒险'] },
+            { id: 'v2', title: '盗梦空间', poster: phCover('盗梦', '#43304f', '#a06bff'), rating: '9.3', tags: ['悬疑', '烧脑'] },
+            { id: 'v3', title: '千与千寻', poster: phCover('千寻', '#2f4a41', '#2fd39b'), rating: '9.4', tags: ['动画', '奇幻'] },
+            { id: 'v4', title: '让子弹飞', poster: phCover('子弹', '#4f3a2b', '#ffb64f'), rating: '9.0', tags: ['喜剧'] }
+          ]
+        },
+        {
+          name: '热播剧集',
+          items: [
+            { id: 'v5', title: '漫长的季节', poster: phCover('季节', '#4f2b35', '#ff5f6d'), rating: '9.4', tags: ['悬疑', '年代'] },
+            { id: 'v6', title: '三体', poster: phCover('三体', '#2b3d4f', '#4fc3ff'), rating: '8.7', tags: ['科幻'] },
+            { id: 'v7', title: '狂飙', poster: phCover('狂飙', '#4f452b', '#ffd166'), rating: '8.5', tags: ['犯罪'] }
+          ]
+        }
+      ],
+      episodes: ['第 1 集', '第 2 集', '第 3 集', '第 4 集', '第 5 集', '第 6 集', '第 7 集', '第 8 集'],
+      searchResults: [
+        { id: 's1', title: '晴天（Live）', artist: '周杰伦', album: 'The One 演唱会', duration: '04:36' },
+        { id: 's2', title: '晴天 纯音乐', artist: '群星', album: '轻音乐精选', duration: '03:58' },
+        { id: 's3', title: '雨天', artist: '周杰伦', album: '我很忙', duration: '04:11' }
+      ]
+    };
+
+    var M = window.__MOCK__;
+    // 与 app.js 的 hasNative 判定保持一致：只看 postMessage 是否可用。
+    // 旧写法只看 chrome.webview，postMessage 尚未注入的窗口期会出现
+    // 「app.js 判定降级直接 return + mock 也不渲染」的双空态。
+    var hasBridge = !!(window.chrome && window.chrome.webview &&
+                       window.chrome.webview.postMessage);
+    var $ = function (id) { return document.getElementById(id); };
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      });
+    }
+
+    // 右栏搜索态：有搜索结果时隐藏曲目列表（及标题），清空搜索后恢复
+    function setSearchMode(on) {
+      $('search-results').hidden = !on;
+      $('track-list').hidden = !!on;
+      $('track-list-title').hidden = !!on;
+    }
+
+    // ---------- 两个面板的假数据渲染 ----------
+    function renderMusic() {
+      $('music-charts').innerHTML = M.charts.map(function (c) {
+        return '<article class="card" data-id="' + esc(c.id) + '">' +
+          '<div class="card-cover"><img loading="lazy" src="' + c.cover + '" alt=""></div>' +
+          '<div class="card-title">' + esc(c.title) + '</div>' +
+          '<div class="card-meta">' + c.count + ' 首</div></article>';
+      }).join('');
+
+      $('track-list').innerHTML = M.tracks.map(function (t, i) {
+        return '<li class="track" data-id="' + esc(t.id) + '">' +
+          '<span class="track-no">' + (i + 1) + '</span>' +
+          '<div class="track-main"><div class="track-title">' + esc(t.title) + '</div>' +
+          '<div class="track-artist">' + esc(t.artist) + ' · ' + esc(t.album) + '</div></div>' +
+          '<span class="track-dur">' + esc(t.duration) + '</span></li>';
+      }).join('');
+    }
+
+    // 视频分类：数据来自各分区标题，首项「全部」
+    var mockCat = '全部';
+
+    function renderVideoCats() {
+      var cats = ['全部'].concat(M.videoSections.map(function (s) { return s.name; }));
+      $('video-cats').innerHTML = cats.map(function (c) {
+        return '<button class="vcat' + (c === mockCat ? ' active' : '') +
+          '" type="button" data-cat="' + esc(c) + '">' + esc(c) + '</button>';
+      }).join('');
+    }
+
+    function applyMockCat(cat) {
+      mockCat = cat;
+      Array.prototype.forEach.call($('video-sections').querySelectorAll('.vsec'), function (sec, i) {
+        sec.hidden = cat !== '全部' && M.videoSections[i].name !== cat;
+      });
+      Array.prototype.forEach.call($('video-cats').querySelectorAll('.vcat'), function (b) {
+        b.classList.toggle('active', b.getAttribute('data-cat') === cat);
+      });
+    }
+
+    function renderVideo() {
+      $('video-sections').innerHTML = M.videoSections.map(function (s) {
+        var cards = s.items.map(function (v) {
+          var tags = (v.tags || []).map(function (x) {
+            return '<span class="tag">' + esc(x) + '</span>';
+          }).join('');
+          return '<article class="card" data-id="' + esc(v.id) + '">' +
+            '<div class="card-cover"><img loading="lazy" src="' + v.poster + '" alt="">' +
+            '<span class="rating">' + esc(v.rating) + '</span></div>' +
+            '<div class="card-title">' + esc(v.title) + '</div>' +
+            '<div class="card-meta">' + tags + '</div></article>';
+        }).join('');
+        // 分区为空时给空态（保持 section.vsec > h3 + div.cards 结构）
+        if (!cards) cards = '<div class="empty" style="grid-column:1/-1">该分区暂无内容</div>';
+        return '<section class="vsec">' +
+          '<h3 class="vsec-title">' + esc(s.name) + '</h3>' +
+          '<div class="cards">' + cards + '</div></section>';
+      }).join('');
+
+      // 稳定行为：保留上次选中的分类（演示数据固定，选中的分区不会被清掉）
+      renderVideoCats();
+      applyMockCat(mockCat);
+
+      $('episode-list').innerHTML = M.episodes.map(function (e, i) {
+        return '<button class="episode" type="button" data-ep="' + (i + 1) + '">' + esc(e) + '</button>';
+      }).join('');
+
+      var st = $('video-status');
+      st.hidden = false;
+      st.className = 'video-status info';
+      st.textContent = '演示模式：以下为本地示例数据，未连接宿主。';
+    }
+
+    function renderSearch(kw) {
+      var box = $('search-results');
+      if (!kw) { box.innerHTML = '<div class="empty">输入关键词开始搜索</div>'; return false; }
+      box.innerHTML = '<div class="result-group"><h3 class="vsec-title">“' + esc(kw) + '” 的搜索结果</h3>' +
+        M.searchResults.map(function (r) {
+          return '<div class="result-row" data-id="' + esc(r.id) + '">' +
+            '<span class="track-no">♪</span>' +
+            '<div class="track-main"><div class="track-title">' + esc(r.title) + '</div>' +
+            '<div class="track-artist">' + esc(r.artist) + ' · ' + esc(r.album) + '</div></div>' +
+            '<span class="track-dur">' + esc(r.duration) + '</span></div>';
+        }).join('') + '</div>';
+      return true;
+    }
+
+    // ---------- 轻提示 ----------
+    var toastTimer = null;
+    function showToast(msg) {
+      var el = $('toast');
+      el.textContent = msg;
+      el.hidden = false;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () {
+        el.classList.remove('show');
+        setTimeout(function () { el.hidden = true; }, 250);
+      }, 2000);
+    }
+
+    // ---------- 无桥兜底：tab 切换 ----------
+    function switchTab(name) {
+      var btns = document.querySelectorAll('#tabbar .tab');
+      Array.prototype.forEach.call(btns, function (b) {
+        var on = b.dataset.tab === name;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      ['music', 'video'].forEach(function (n) {
+        $('panel-' + n).hidden = (n !== name);
+      });
+      // 切回音乐页时恢复曲目列表（搜索结果不跨 tab 保留）
+      if (name === 'music') setSearchMode(false);
+      if (name === 'video') setVideoSearchMode(false);
+    }
+
+    // 视频搜索结果态：左栏切结果、右栏剧集常驻（与真实模式一致）
+    function setVideoSearchMode(on) {
+      $('video-search-results').hidden = !on;
+      $('video-sections').hidden = !!on;
+      $('video-cats').hidden = !!on;
+      var rec = $('video-rec-title');
+      if (rec) rec.hidden = !!on;
+    }
+
+    function mockVideoSearch() {
+      var kw = $('video-search-input').value.trim();
+      var box = $('video-search-results');
+      if (!kw) { setVideoSearchMode(false); return; }
+      var all = [];
+      M.videoSections.forEach(function (s) {
+        s.items.forEach(function (v) { all.push(v); });
+      });
+      var hits = all.filter(function (v) { return v.title.indexOf(kw) >= 0; });
+      box.innerHTML = hits.length
+        ? '<div class="result-group"><h3 class="vsec-title">“' + esc(kw) + '” 的搜索结果</h3>' +
+          hits.map(function (v) {
+            return '<div class="result-row" data-id="' + esc(v.id) + '">' +
+              '<span class="track-no">▶</span>' +
+              '<div class="track-main"><div class="track-title">' + esc(v.title) + '</div>' +
+              '<div class="track-artist">' + esc((v.tags || []).join(' · ')) + '</div></div>' +
+              '<span class="track-dur">' + esc(v.rating || '') + '</span></div>';
+          }).join('') + '</div>'
+        : '<div class="empty">未找到「' + esc(kw) + '」相关内容</div>';
+      setVideoSearchMode(true);
+    }
+
+    // ---------- 初始化 ----------
+    function initMock() {
+      renderMusic();
+      renderVideo();
+      renderSearch('');
+      setSearchMode(false);
+      setVideoSearchMode(false);
+
+      $('tabbar').addEventListener('click', function (e) {
+        var b = e.target.closest('.tab');
+        if (b) switchTab(b.dataset.tab);
+      });
+
+      function doSearch() {
+        var kw = $('search-input').value.trim();
+        if (!kw) {
+          $('search-results').innerHTML = '<div class="empty">输入关键词开始搜索</div>';
+          setSearchMode(false);
+          return;
+        }
+        setSearchMode(renderSearch(kw));
+        showToast('演示模式：本地示例搜索结果');
+      }
+      $('search-btn').addEventListener('click', doSearch);
+      $('search-input').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') doSearch();
+      });
+      // 演示模式也把曲目点击接上（旧版渲染了 li.track 却完全不绑定事件，
+      // 在浏览器里预览时看起来就是「点歌没反应」）。
+      $('track-list').addEventListener('click', function (e) {
+        if (e.target.closest('.track'))
+          showToast('演示模式：未连接宿主，无法解析和加入播放列表');
+      });
+
+      // 视频分类 chips → 只显示所选分区
+      $('video-cats').addEventListener('click', function (e) {
+        var b = e.target.closest('.vcat');
+        if (b) applyMockCat(b.getAttribute('data-cat'));
+      });
+
+      // 演示：视频搜索（真实模式由 app.js 走 cmd video.search）
+      $('video-search-btn').addEventListener('click', mockVideoSearch);
+      $('video-search-input').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') mockVideoSearch();
+      });
+      $('video-search-results').addEventListener('click', function (e) {
+        if (e.target.closest('.result-row')) {
+          showToast('演示模式：未连接宿主，无法播放视频');
+        }
+      });
+
+      // 演示：导入视频源按钮（真实模式由 app.js 接桥处理）
+      $('btn-import-video').addEventListener('click', function () {
+        showToast('演示模式：未连接宿主，无法导入视频源');
+      });
+      // 演示：导入音源按钮（真实模式由 app.js 接桥处理）
+      $('btn-import-music').addEventListener('click', function () {
+        showToast('演示模式：未连接宿主，无法导入音源');
+      });
+
+      showToast('未连接宿主，已启用本地演示数据');
+    }
+
+    if (!hasBridge) {
+      // 普通浏览器调试：警告 + 假数据渲染，不报错
+      console.warn('[TTPlayer] chrome.webview 不可用（非 WebView2 环境），启用本地假数据渲染');
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initMock);
+      } else {
+        initMock();
+      }
+      window.__MOCK_RENDERED__ = true;
+    }
+  })();
+  </script>
+</body>
+</html>

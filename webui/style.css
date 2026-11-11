@@ -1,0 +1,507 @@
+/* =========================================================
+   TTPlayer 音乐窗（WebView2）样式
+   深色影视仓/音乐窗统一调性
+   - 全部资源内联/本地，禁止外链（无 CDN、无外链字体/图片）
+   - 颜色变量集中在 :root，改主题只动这里
+   ========================================================= */
+
+:root {
+  /* 背景层次 */
+  --bg:            #12151c;   /* 主背景 */
+  --bg-top:        #171b24;   /* 顶栏 */
+  --bg-bottom:     #161a22;   /* 控制条 */
+  --panel:         #1a1f29;   /* 面板 */
+  --card:          #1e2430;   /* 卡片 */
+  --card-hover:    #252c3a;   /* 卡片悬停 */
+  --input-bg:      #232a38;   /* 输入框/滑杆槽 */
+
+  /* 文本 */
+  --text:          #e6e9f0;
+  --text-sub:      #8b93a5;
+  --text-dim:      #5b6376;
+
+  /* 强调色（唯一） */
+  --accent:        #4f8cff;
+  --accent-soft:   rgba(79, 140, 255, .16);
+
+  /* 描边与阴影 */
+  --border:        rgba(255, 255, 255, .07);
+  --shadow:        0 6px 18px rgba(0, 0, 0, .38);
+
+  /* 圆角 / 字号 */
+  --radius:        10px;
+  --radius-sm:     6px;
+  --font:          "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+
+  /* 动效 */
+  --t-fast:        .16s ease;
+  --t-base:        .25s ease;
+}
+
+/* ---------- 基础 ---------- */
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+}
+
+[hidden] { display: none !important; }
+
+button {
+  font-family: var(--font);
+  color: var(--text);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+button:active { transform: scale(.96); }
+
+img { display: block; }
+
+/* ---------- 顶栏 / Tab ---------- */
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 46px;
+  padding: 0 12px;
+  background: var(--bg-top);
+  border-bottom: 1px solid var(--border);
+}
+
+.tabbar { display: flex; gap: 6px; }
+
+.tab {
+  padding: 7px 20px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  color: var(--text-sub);
+  letter-spacing: 2px;
+}
+.tab:hover { color: var(--text); background: rgba(255, 255, 255, .05); }
+.tab.active {
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 2px 10px rgba(79, 140, 255, .35);
+}
+
+.ghost-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--text-sub);
+  background: rgba(255, 255, 255, .03);
+}
+.ghost-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* 顶栏只放页签，搜索与导入按钮下放到面板首行（见 .panel-search） */
+
+/* ---------- 内容区 ---------- */
+/* .view 只做竖向弹性容器，不再整体滚动；滚动交给左右两栏各自负责 */
+.view {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 16px 18px 24px;
+  scroll-behavior: smooth;
+}
+
+/* 面板撑满内容区可用高度，内部再分「固定行 + 分栏」 */
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  animation: fade-in var(--t-base);
+}
+
+/* ---------- 左右分栏：左推荐（宽）/ 右列表（窄） ---------- */
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 20px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 两栏各自滚动：列内内容超出时出现各自的滚动条 */
+.split-left,
+.split-right {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* 左栏承担推荐内容，卡片保持常规尺寸（空间足够时自然多列） */
+.split-left .card-grid,
+.split-left .vsec .cards {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+.split-left {
+  padding-right: 20px;
+  border-right: 1px solid var(--border);
+}
+
+/* 窄窗口下退回上下布局，并恢复整页滚动（两栏不再各自滚动） */
+@media (max-width: 760px) {
+  .view { overflow-y: auto; padding-bottom: 24px; }
+  .panel { height: auto; }
+  .split {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    flex: 0 0 auto;
+    gap: 12px;
+  }
+  .split-left,
+  .split-right { overflow: visible; }
+  .split-left { padding-right: 0; border-right: none; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 分区标题 */
+.sec-title,
+.vsec-title {
+  position: relative;
+  margin: 22px 0 12px;
+  padding-left: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sec-title:first-child { margin-top: 4px; }
+.sec-title::before,
+.vsec-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 15px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.vsec-title { font-size: 15px; }
+
+/* ---------- 卡片网格 ---------- */
+.card-grid,
+.vsec .cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  padding: 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: background var(--t-fast), transform var(--t-fast), box-shadow var(--t-fast);
+}
+.card:hover {
+  background: var(--card-hover);
+  transform: translateY(-3px);
+  box-shadow: var(--shadow);
+}
+
+.card-cover {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+}
+.card-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform var(--t-base);
+}
+.card:hover .card-cover img { transform: scale(1.05); }
+
+/* 评分角标（视频卡） */
+.rating {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: #ffd166;
+  background: rgba(0, 0, 0, .65);
+}
+
+.card-title {
+  margin-top: 9px;
+  font-size: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-meta {
+  margin-top: 4px;
+  min-height: 18px;
+  font-size: 12px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------- 曲目 / 结果列表 ---------- */
+.track-list,
+.search-results { list-style: none; margin: 0; padding: 0; }
+
+.track,
+.result-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+.track:hover,
+.result-row:hover { background: var(--card); }
+
+.track.playing,
+.track.active {
+  background: var(--accent-soft);
+}
+.track.playing .track-title { color: var(--accent); }
+
+.track-no {
+  flex: 0 0 26px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.track-main { flex: 1 1 auto; min-width: 0; }
+
+.track-title {
+  font-size: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-artist {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-dur {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.result-group + .result-group { margin-top: 18px; }
+
+/* ---------- 视频面板 ---------- */
+.video-status {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.video-status.info {
+  color: var(--text-sub);
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.video-status.error {
+  color: #ff8a8a;
+  background: rgba(255, 95, 109, .12);
+  border: 1px solid rgba(255, 95, 109, .35);
+}
+
+/* 视频分类 chips（首项「全部」，其余为各分区标题） */
+.video-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.vcat {
+  padding: 5px 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-sub);
+  background: rgba(255, 255, 255, .03);
+}
+.vcat:hover { color: var(--text); border-color: var(--accent); }
+.vcat.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.episode-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.episode {
+  min-width: 64px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--text-sub);
+  background: var(--card);
+}
+.episode:hover { color: #fff; border-color: var(--accent); background: var(--accent-soft); }
+.episode.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+
+/* ---------- 搜索面板 ---------- */
+/* 面板首行通栏：搜索框占满剩余宽度，后面依次是「搜索」和导入按钮 */
+.search-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.panel-search {
+  flex: 0 0 auto;
+}
+
+.panel-search .primary-btn,
+.panel-search .ghost-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.search-input {
+  flex: 1 1 auto;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  outline: none;
+  font-size: 14px;
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--input-bg);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+  user-select: text;
+}
+.search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.search-input::placeholder { color: var(--text-dim); }
+
+.primary-btn {
+  padding: 0 24px;
+  border-radius: 999px;
+  font-size: 14px;
+  color: #fff;
+  background: var(--accent);
+}
+.primary-btn:hover { filter: brightness(1.12); }
+
+/* ---------- 空态 / 加载态 ---------- */
+.empty,
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 140px;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.loading::before {
+  content: "";
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- 轻提示 ---------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 99;
+  max-width: 70%;
+  padding: 9px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(30, 36, 48, .96);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  transform: translate(-50%, 8px);
+  transition: opacity var(--t-base), transform var(--t-base);
+  pointer-events: none;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---------- 滚动条美化 ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #2c3444;
+  border: 2px solid var(--bg);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a4459; }
+::-webkit-scrollbar-corner { background: transparent; }
