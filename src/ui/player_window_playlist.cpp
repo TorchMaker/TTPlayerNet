@@ -15,6 +15,7 @@
 #include "ttplayer/ui/playlist_network_commands.h"
 #include "ttplayer/ui/playlist_transforms.h"
 #include "ttplayer/ui/window_drag.h"
+#include "ttplayer/video/video_history.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,11 @@ namespace {
 constexpr int kPlaylistTargetListControl = 1064;
 constexpr int kPlaylistRenamePatternControl = 2161;
 constexpr int kPlaylistUrlControl = 2001;
+// 不可删除的「视频」栏目：带中括号与 [默认] 观感一致；不带括号的「视频」
+// 是旧版本建的，启动时原地改名迁移。行路径用伪协议标记（不交给音频解码器）。
+constexpr wchar_t kVideoPlaylistTitle[] = L"[视频]";
+constexpr wchar_t kVideoPlaylistLegacyTitle[] = L"视频";
+constexpr wchar_t kVideoTrackScheme[] = L"ttplayer-video://";
 
 std::wstring FormatPlaylistResource(std::wstring_view format,
                                     const wchar_t* argument);
@@ -3893,6 +3899,8 @@ void PlayerWindow::EnsurePlaylistSelectionVisible() {
 
 void PlayerWindow::SwitchPlaylist(size_t index) {
     if (index >= playlists_.Size()) return;
+    // 「视频」栏目内容随观看历史变化：切进去时按 history.json 重建一次。
+    if (IsVideoPlaylist(index)) RefreshVideoPlaylist();
     // Selecting the already-active catalogue row is still a native selection
     // transition after a blank-area click.  FUN_00489AE2 skips only the
     // expensive active-playlist switch; it does not undo ListCtrl state.
@@ -4526,10 +4534,16 @@ void PlayerWindow::PreparePlaylistMenu(HMENU menu) const {
         has_tracks && (playlist_find_text_[0] != L'\0' || (!playlist_find_quick_ &&
             (!playlist_find_artist_.empty() || !playlist_find_album_.empty()))));
     EnableCommand(menu, kPlaylistQuickFind, has_tracks);
-    EnableCommand(menu, kPlaylistDeleteList, playlists_.Size() > 1);
     const auto catalogue_row = playlist_context_list_
         ? playlist_context_list_ : playlist_list_selection_;
-    EnableCommand(menu, kPlaylistRenameList, catalogue_row && *catalogue_row < playlists_.Size());
+    const bool video_catalogue =
+        catalogue_row && IsVideoPlaylist(*catalogue_row);
+    // 「视频」栏目固定存在：禁用删除 / 重命名（类似默认列表）。
+    EnableCommand(menu, kPlaylistDeleteList,
+                  playlists_.Size() > 1 && !video_catalogue);
+    EnableCommand(menu, kPlaylistRenameList,
+                  catalogue_row && *catalogue_row < playlists_.Size() &&
+                      !video_catalogue);
     EnableCommand(menu, kPlaylistActivateList, catalogue_row &&
         *catalogue_row != playlists_.ActiveIndex());
     EnableCommand(menu, kPlaylistDeleteFiles,
@@ -4712,6 +4726,18 @@ void PlayerWindow::ShowPlaylistContextMenu(POINT screen_point, POINT client_poin
 
 void PlayerWindow::DeleteSelectedPlaylistRows() {
     if (playlist_selected_rows_.empty()) return;
+    // 「视频」栏目：删行的同时删掉对应的观看历史，否则一刷新又冒出来
+    // （用户反馈「第二个删不掉」就是这个原因）。
+    if (IsVideoPlaylist(playlists_.ActiveIndex())) {
+        const auto& tracks = ActivePlaylist().Tracks();
+        const std::wstring scheme(kVideoTrackScheme);
+        for (const size_t row : playlist_selected_rows_) {
+            if (row >= tracks.size()) continue;
+            const std::wstring path = tracks[row].path.wstring();
+            if (path.rfind(scheme, 0) != 0) continue;
+            ttplayer::video::RemoveVideoHistory(path.substr(scheme.size()));
+        }
+    }
     // FUN_00485759 remembers the last selected ListView row, then subtracts
     // selectedCount - 1.  After deletion it wraps an out-of-range caret to
     // row zero.  This differs visibly from always choosing first_removed for
@@ -4816,6 +4842,11 @@ void PlayerWindow::DetachPlayingPlaylistItem() {
 }
 
 void PlayerWindow::ClearActivePlaylist() {
+    // 「视频」栏目清空 = 清空观看历史（否则刷新后会恢复）。
+    if (IsVideoPlaylist(playlists_.ActiveIndex())) {
+        for (const auto& entry : ttplayer::video::LoadVideoHistory())
+            ttplayer::video::RemoveVideoHistory(entry.id);
+    }
     const bool clears_playing = playing_playlist_index_ &&
         *playing_playlist_index_ == playlists_.ActiveIndex();
     ActivePlaylist().Clear();
@@ -5737,11 +5768,15 @@ bool PlayerWindow::HandlePlaylistCommand(UINT command) {
         // invocation queries that same selection, not an unrelated active list.
         const auto target = playlist_context_list_
             ? playlist_context_list_ : playlist_list_selection_;
+        // 「视频」栏目由观看历史生成，标题固定，不允许重命名。
+        if (target && IsVideoPlaylist(*target)) return true;
         if (target) BeginPlaylistListEdit(*target);
         return true;
     }
     if (command == kPlaylistDeleteList) {
         const size_t target = playlist_context_list_.value_or(playlists_.ActiveIndex());
+        // 「视频」栏目不可删除（用户要求：类似默认列表的固定栏目）。
+        if (IsVideoPlaylist(target)) return true;
         if (playlists_.Delete(target)) {
             if (playing_playlist_index_) {
                 if (*playing_playlist_index_ == target) {
@@ -6359,6 +6394,8 @@ void PlayerWindow::LoadStoredPlaylist() {
         if (playlists_.At(index).Title().empty())
             playlists_.At(index).SetTitle(default_title);
     }
+    // 「视频」栏目：不可删除，内容由观看历史生成（第一次启动时自动创建）。
+    EnsureVideoPlaylist();
     settings_.player.playlist_scan_count = static_cast<int>(playlists_.Size());
     settings_.player.active_playlist = static_cast<int>(playlists_.ActiveSlot());
     RefreshPlaylist();
@@ -6383,6 +6420,86 @@ void PlayerWindow::LoadStoredPlaylist() {
 
 void PlayerWindow::SaveStoredPlaylist() {
     playlists_.FlushDirty(true);
+}
+
+std::optional<size_t> PlayerWindow::VideoPlaylistIndex() const {
+    for (size_t index = 0; index < playlists_.Size(); ++index) {
+        const auto& title = playlists_.At(index).Title();
+        if (title == kVideoPlaylistTitle || title == kVideoPlaylistLegacyTitle)
+            return index;
+    }
+    return std::nullopt;
+}
+
+bool PlayerWindow::IsVideoPlaylist(size_t index) const {
+    if (index >= playlists_.Size()) return false;
+    const auto& title = playlists_.At(index).Title();
+    return title == kVideoPlaylistTitle || title == kVideoPlaylistLegacyTitle;
+}
+
+void PlayerWindow::RefreshVideoPlaylist() {
+    const auto index = VideoPlaylistIndex();
+    if (!index) return;
+    auto& list = playlists_.At(*index);
+    // 只清掉「我们自己」的行（伪协议路径），用户同名列表里的其它曲目原样保留。
+    for (size_t i = list.Tracks().size(); i-- > 0;) {
+        if (list.Tracks()[i].path.wstring().rfind(kVideoTrackScheme, 0) == 0)
+            list.Remove(i);
+    }
+    const auto entries = ttplayer::video::LoadVideoHistory();
+    for (const auto& entry : entries) {
+        playlist::Track track;
+        // 伪协议路径：只作为「这一行是视频」的标识，不交给音频解码器。
+        track.path = std::filesystem::path(kVideoTrackScheme + entry.id);
+        std::string title = core::WideToUtf8(entry.title);
+        const bool has_episode =
+            entry.current_index >= 0 &&
+            entry.current_index < static_cast<int>(entry.episodes.size());
+        if (has_episode) {
+            const auto& episode =
+                entry.episodes[static_cast<std::size_t>(entry.current_index)];
+            if (!episode.title.empty()) {
+                if (!title.empty()) title += " · ";
+                title += core::WideToUtf8(episode.title);
+            }
+        }
+        track.title = title.empty() ? "视频" : title;
+        // 不写 artist：默认标题格式「%A - %T」会把线路名顶在标题前面。
+        // -1 = 不再尝试读时长/标签：伪协议路径不是本地文件，交给探针只会空跑。
+        track.duration_ms = entry.duration_ms > 0 ? entry.duration_ms : -1;
+        track.metadata.push_back({"ttvideo.id", core::WideToUtf8(entry.id)});
+        list.Add(std::move(track));
+    }
+    playlists_.MarkDirty(*index);
+    if (playlists_.ActiveIndex() == *index) RefreshPlaylist();
+    if (playlist_window_) InvalidateRect(playlist_window_, nullptr, FALSE);
+    // 诊断：列表里实际有几条、首条标题、当前选中的栏目下标（排查「栏目为空 /
+    // 显示成源名」时看这行；标题显示由 FormatPlaylistTitle 按 Tag 格式取）。
+    ttplayer::video::VideoHistoryLog(
+        "PLAYLIST refresh entries=" + std::to_string(entries.size()) +
+        " list=" + std::to_string(*index) +
+        " active=" + std::to_string(playlists_.ActiveIndex()) +
+        " first=" + (entries.empty()
+                         ? std::string()
+                         : playlists_.At(*index).Tracks().front().title));
+}
+
+void PlayerWindow::EnsureVideoPlaylist() {
+    auto index = VideoPlaylistIndex();
+    if (!index) {
+        const bool had_lists = !playlists_.Empty();
+        const size_t previous_active =
+            had_lists ? playlists_.ActiveIndex() : 0;
+        playlists_.NewList(kVideoPlaylistTitle);
+        if (had_lists) playlists_.SetActive(previous_active);
+        playlists_.FlushDirty(true);   // 新栏目立即落盘，下次启动可见
+    } else if (playlists_.At(*index).Title() == kVideoPlaylistLegacyTitle) {
+        // 旧版本建的「视频」：原地补上中括号，避免同时留下两条栏目。
+        playlists_.Rename(*index, kVideoPlaylistTitle);
+        playlists_.MarkDirty(*index);
+        playlists_.FlushDirty(true);
+    }
+    RefreshVideoPlaylist();
 }
 
 LRESULT CALLBACK PlayerWindow::PlaylistWindowProc(HWND window, UINT message,

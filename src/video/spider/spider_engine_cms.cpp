@@ -91,6 +91,21 @@ CmsProfile BuildProfile(const SpiderContext& ctx) {
     if (load.ok) {
         profile.recipe = load.recipe.raw;
         profile.base = spider_util::Trim(load.recipe.base);
+        // TVBox 导入配置里的 ext 常是加密串（rfOX1voD…），解析不出 siteUrl。
+        // recipe 里的 default_ext 是逆向得到的明文参数，此时用它兜底，
+        // 否则光影 / 奶酪这类 T4 站点会一直「缺少 CMS 接口」。
+        if (!profile.ext.is_object() || profile.ext.empty()) {
+            if (const auto by = profile.recipe.find("default_ext_by_name");
+                by != profile.recipe.end() && by->is_object()) {
+                const auto it = by->find(ctx.site.name);
+                if (it != by->end() && it->is_object()) profile.ext = *it;
+            }
+            if (!profile.ext.is_object() || profile.ext.empty()) {
+                const auto de = profile.recipe.find("default_ext");
+                if (de != profile.recipe.end() && de->is_object())
+                    profile.ext = *de;
+            }
+        }
     }
 
     // base 优先级：recipe.base → ext.siteUrl/site_url/api/url/host。

@@ -29,8 +29,10 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "musicfree_bridge.h"
@@ -229,6 +231,27 @@ public:
     }
 };
 
+// WebResourceRequested：图片等子资源在发出前可改请求头。豆瓣图床（img*.doubanio.com）
+// 只认 douban.com 来源页，页面里 <img referrerpolicy="no-referrer"> 不带 Referer
+// 会被 418 拒绝（卡片封面空白），在这里补上 Referer。
+using ResFn = std::function<void(ICoreWebView2*,
+                                 ICoreWebView2WebResourceRequestedEventArgs*)>;
+class ComResEvt
+    : public ComCallback<ICoreWebView2WebResourceRequestedEventHandler, ResFn> {
+public:
+    explicit ComResEvt(ResFn fn)
+        : ComCallback<ICoreWebView2WebResourceRequestedEventHandler, ResFn>(
+              std::move(fn)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* a) override {
+        try {
+            fn_(nullptr, a);
+        } catch (...) {
+        }
+        return S_OK;
+    }
+};
+
 }  // namespace
 
 // ───────────────────────── 宿主状态（pimpl） ─────────────────────────
@@ -248,12 +271,15 @@ struct WebviewHost::Impl : std::enable_shared_from_this<WebviewHost::Impl> {
     EventRegistrationToken tok_nav{};
     EventRegistrationToken tok_msg{};
     EventRegistrationToken tok_ctx{};
+    EventRegistrationToken tok_cover{};
     bool has_nav = false;
     bool has_msg = false;
     bool has_ctx = false;
+    bool has_cover = false;
     ComNavEvt* nav_evt = nullptr;  // 自持引用，Destroy 时撤事件并释放
     ComMsgEvt* msg_evt = nullptr;
     ComCtxEvt* ctx_evt = nullptr;
+    ComResEvt* cover_evt = nullptr;
 
     DWORD create_tick = 0;      // 进入 Creating 的 GetTickCount（超时判定）
     unsigned long long serial = 0;  // 创建代数：超时重试后丢弃上一代在途回调
@@ -294,6 +320,10 @@ WebviewHost::Impl::~Impl() {
         if (msg_evt) {
             msg_evt->Release();
             msg_evt = nullptr;
+        }
+        if (cover_evt) {
+            cover_evt->Release();
+            cover_evt = nullptr;
         }
         if (core) {
             core->Release();
@@ -455,6 +485,31 @@ void WebviewHost::Impl::OnController(HRESULT hr, ICoreWebView2Controller* c) {
     }
     has_nav = true;
 
+    // 图片封面：豆瓣图床缺 Referer 会返回 418（卡片空白）。页面为了隐私给
+    // <img> 加了 referrerpolicy="no-referrer"，这里在资源请求层补 douban Referer。
+    // SDK/Runtime 过旧时静默跳过（封面仍按原逻辑失败并落 COVER_FAIL 日志）。
+    if (SUCCEEDED(core->AddWebResourceRequestedFilter(
+            L"*://*.doubanio.com/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE))) {
+        cover_evt = new ComResEvt(
+            [](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) {
+                if (!args) return;
+                ICoreWebView2WebResourceRequest* req = nullptr;
+                if (FAILED(args->get_Request(&req)) || !req) return;
+                ICoreWebView2HttpRequestHeaders* hdrs = nullptr;
+                if (SUCCEEDED(req->get_Headers(&hdrs)) && hdrs) {
+                    hdrs->SetHeader(L"Referer", L"https://movie.douban.com/");
+                    hdrs->Release();
+                }
+                req->Release();
+            });
+        if (SUCCEEDED(core->add_WebResourceRequested(cover_evt, &tok_cover))) {
+            has_cover = true;
+        } else {
+            cover_evt->Release();
+            cover_evt = nullptr;
+        }
+    }
+
     // 拦截 WebView2 默认右键菜单：壳内应用不需要 Edge 菜单（刷新/后退/另存为/
     // 检查），其中菜单里的 Reload 还会绕开宿主的刷新链路、让页面重新握手。
     // SDK/Runtime 过旧（无 ICoreWebView2_11）时静默跳过 —— 右键仍弹系统菜单，无碍。
@@ -504,8 +559,27 @@ void WebviewHost::Impl::OnNavigationCompleted(bool success) {
     // 页面 DOM/CSS 已就绪（深色）：现在才显示控件，消除创建→首帧之间的白屏。
     if (controller) controller->put_IsVisible(TRUE);
     try {
+        // 每次导航（含用户点刷新）都要重新握手：ready 的「只发一次」锁存
+        // 必须在这里复位，否则刷新后页面永远停在「正在连接宿主…」。
+        bridge->ResetReadyForReload();
         bridge->PushEvent("bridge.ready", nlohmann::json::object());
         bridge->FlushPending();
+        // 兜底：页面脚本可能比 NavigationCompleted 晚注册消息监听（刷新后
+        // 资源走缓存、时序和首次加载不同），那时第一条 ready 会丢。400ms 后
+        // 再推一次（页面握手是幂等的，重复 ready 直接忽略）。
+        std::weak_ptr<Impl> weak = weak_from_this();
+        std::thread([weak] {
+            ::Sleep(400);
+            if (auto st = weak.lock()) {
+                if (!st->destroying.load(std::memory_order_acquire) && st->bridge) {
+                    try {
+                        st->bridge->ResetReadyForReload();
+                        st->bridge->PushEvent("bridge.ready", nlohmann::json::object());
+                    } catch (...) {
+                    }
+                }
+            }
+        }).detach();
     } catch (...) {
         AppendHostLog("推送 bridge.ready 异常（已忽略）");
     }
@@ -713,6 +787,14 @@ void WebviewHost::Destroy() {
                 }
                 st->has_ctx = false;
             }
+            if (st->has_cover) {
+                st->core->remove_WebResourceRequested(st->tok_cover);
+                st->has_cover = false;
+            }
+        }
+        if (st->cover_evt) {
+            st->cover_evt->Release();
+            st->cover_evt = nullptr;
         }
         if (st->nav_evt) {
             st->nav_evt->Release();  // 事件已撤 + 自持引用归零 → 释放

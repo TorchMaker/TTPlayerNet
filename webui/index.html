@@ -84,8 +84,8 @@
       <!-- 加载/状态行：由 evt video.status 驱动（正常加载完成时不占用空间） -->
       <div id="video-status" class="video-status" hidden></div>
 
-      <div class="split">
-        <div class="split-left">
+      <div class="split video-split">
+        <div class="split-left video-left">
           <h2 id="video-rec-title" class="sec-title">推荐</h2>
           <!-- 分类 chips：由 app.js 按 video.home 的 sections[].title 生成，首项「全部」 -->
           <div id="video-cats" class="video-cats"></div>
@@ -330,15 +330,19 @@
         s.items.forEach(function (v) { all.push(v); });
       });
       var hits = all.filter(function (v) { return v.title.indexOf(kw) >= 0; });
+      // 与 app.js 的真实搜索一致：大图卡片网格（竖版海报），不是细行列表。
       box.innerHTML = hits.length
         ? '<div class="result-group"><h3 class="vsec-title">“' + esc(kw) + '” 的搜索结果</h3>' +
+          '<div class="search-cards">' +
           hits.map(function (v) {
-            return '<div class="result-row" data-id="' + esc(v.id) + '">' +
-              '<span class="track-no">▶</span>' +
-              '<div class="track-main"><div class="track-title">' + esc(v.title) + '</div>' +
-              '<div class="track-artist">' + esc((v.tags || []).join(' · ')) + '</div></div>' +
-              '<span class="track-dur">' + esc(v.rating || '') + '</span></div>';
-          }).join('') + '</div>'
+            var cover = v.cover
+              ? '<img loading="lazy" src="' + esc(v.cover) + '" alt="">' : '';
+            return '<article class="card search-card" data-id="' + esc(v.id) + '">' +
+              '<div class="card-cover">' + cover +
+              (v.rating ? '<span class="rating">' + esc(v.rating) + '</span>' : '') +
+              '</div><div class="card-title">' + esc(v.title) + '</div>' +
+              '<div class="card-meta">' + esc((v.tags || []).join(' · ')) + '</div></article>';
+          }).join('') + '</div></div>'
         : '<div class="empty">未找到「' + esc(kw) + '」相关内容</div>';
       setVideoSearchMode(true);
     }

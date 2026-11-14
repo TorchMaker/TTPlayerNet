@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1398,6 +1399,50 @@ void AppendEpisodes(const std::vector<std::string>& names,
     detail->lines.push_back(std::move(line));
 }
 
+// recipe 里写的请求头（Referer/User-Agent）只用在抓页面，播放时丢了 ——
+// 像厂长（4kcz）的 py.php 播放页缺 Referer 直接 403。这里把 recipe.headers
+// 以播放器支持的「URL 内联请求头」后缀挂到每条播放地址上：
+//   https://…/play.html{"Referer":"https://www.4kcz.com/"}
+void AttachPlayHeaders(const nlohmann::json& recipe, VideoDetail* detail) {
+    if (!detail || !recipe.contains("headers") || !recipe["headers"].is_object())
+        return;
+    std::string referer;
+    std::string ua;
+    for (auto it = recipe["headers"].begin(); it != recipe["headers"].end();
+         ++it) {
+        if (!it.value().is_string()) continue;
+        const std::string key = su::ToLower(it.key());
+        if (key == "referer") referer = it.value().get<std::string>();
+        else if (key == "user-agent") ua = it.value().get<std::string>();
+    }
+    if (referer.empty()) referer = JsonStr(recipe, "base");
+    if (referer.empty() && ua.empty()) return;
+    nlohmann::json headers = nlohmann::json::object();
+    if (!referer.empty()) headers["Referer"] = referer;
+    if (!ua.empty()) headers["User-Agent"] = ua;
+    const std::string suffix = headers.dump();
+    for (auto& line : detail->lines) {
+        for (auto& ep : line.episodes) {
+            if (ep.url.empty() || ep.url.rfind("http", 0) != 0) continue;
+            if (ep.url.find('{') != std::string::npos) continue;   // 已有内联头
+            ep.url += suffix;
+        }
+    }
+}
+
+// 去掉 AttachPlayHeaders 追加的 JSON 前缀后缀，拿真正的地址去抓页面。
+std::string StripInlinePlayHeaders(const std::string& url) {
+    if (url.empty() || url.back() != '}') return url;
+    const size_t open = url.rfind('{');
+    if (open == std::string::npos || open == 0) return url;
+    std::string head = url.substr(0, open);
+    while (!head.empty() &&
+           (head.back() == '$' || head.back() == '&' || head.back() == '#' ||
+            head.back() == ' '))
+        head.pop_back();
+    return head.empty() ? url : head;
+}
+
 std::string PickRegexGroup(const std::string& text, const std::string& pattern) {
     if (pattern.empty()) return {};
     try {
@@ -1497,7 +1542,86 @@ std::string ExtractPlayerUrl(const HtmlRun& run, const std::string& body,
     return {};
 }
 
-class RecipeHtmlEngine final : public SpiderEngine {
+// ───────────── hhplayer 型播放页（巴士 Dm84 等，引导配置 + 现算直链） ─────────────
+//
+// 这类站点的「线路地址」本身是播放页，页面里只有一段引导配置：
+//   window.__HHJX_BOOTSTRAP__ = {"url":"<加密token>","t":<unix秒>,"key":"<hex>"}
+// 真正的直链要按 recipe 里声明的 post 模板 POST 到 endpoints.player 现算。
+// 以前这里没实现，详情/播放只能拿到网页地址，全靠网页协议插件兜底。
+std::string BootstrapMarker(const json& recipe) {
+    const json extract = recipe.value("extract", json::object());
+    const json player = extract.value("player", json::object());
+    if (JsonStr(player, "post").empty()) return {};
+    return JsonStr(player, "extract");
+}
+
+std::string HostOrigin(const std::string& url) {
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) return {};
+    const size_t slash = url.find('/', scheme + 3);
+    return slash == std::string::npos ? url : url.substr(0, slash);
+}
+
+std::string ResolveBootstrapDirect(const SpiderContext& ctx, const HtmlRun& run,
+                                   const std::string& page_html,
+                                   const std::string& page_url) {
+    const json extract = run.profile.recipe.value("extract", json::object());
+    const json player = extract.value("player", json::object());
+    const std::string marker = JsonStr(player, "extract");
+    const std::string post_tpl = JsonStr(player, "post");
+    if (marker.empty() || post_tpl.empty()) return {};
+    const size_t at = page_html.find(marker);
+    if (at == std::string::npos) return {};
+    // 取引导配置对象（花括号配对，够用且不依赖正则）。
+    const size_t lb = page_html.find('{', at);
+    if (lb == std::string::npos) return {};
+    int depth = 0;
+    size_t end = std::string::npos;
+    for (size_t i = lb; i < page_html.size() && i < lb + 4096; ++i) {
+        if (page_html[i] == '{') ++depth;
+        else if (page_html[i] == '}' && --depth == 0) { end = i; break; }
+    }
+    if (end == std::string::npos) return {};
+    const json cfg = su::ParseJsonLoose(page_html.substr(lb, end - lb + 1));
+    if (!cfg.is_object()) return {};
+    const std::string token = JsonStr(cfg, "url");
+    const std::string key = JsonStr(cfg, "key");
+    const std::string t = JsonStr(cfg, "t");
+    if (token.empty() || key.empty() || t.empty()) return {};
+
+    // post 模板里的 %s 依次是 url / t / key。
+    std::string body = post_tpl;
+    for (const std::string& value : {token, t, key}) {
+        const size_t p = body.find("%s");
+        if (p == std::string::npos) break;
+        body.replace(p, 2, value);
+    }
+    const std::string api = EndpointUrl(run, "player", {});
+    if (!IsHttpUrl(api)) return {};
+    try {
+        SpiderHttp http(ctx.spider_id, ctx.net, ctx.site);
+        http.SetStage("player");
+        http.SetDefaultHeaders(run.profile.headers);
+        // 该接口有来源校验：Referer 用播放页、Origin 用接口同源（recipe 里配的
+        // 站点 Origin 对它无效，必须在这里覆盖）。
+        const std::map<std::string, std::string> headers = {
+            {"referer", page_url.empty() ? api : page_url},
+            {"origin", HostOrigin(api)},
+        };
+        const SpiderHttpResponse resp =
+            http.Post(api, body, headers, "application/json");
+        const json root = su::ParseJsonLoose(resp.body);
+        if (!root.is_object()) return {};
+        std::string url = UnescapeSlashes(su::JsonString(root, "url"));
+        if (url.rfind("//", 0) == 0) url = "https:" + url;
+        if (IsHttpUrl(url)) return url;
+    } catch (const std::exception&) {
+        // 解析失败回退网页地址，由网页协议插件再试一次。
+    }
+    return {};
+}
+
+class RecipeHtmlEngine : public SpiderEngine {
 public:
     VideoListing Home(const SpiderContext& ctx) override {
         HtmlRun run = BeginRun(ctx);
@@ -1672,25 +1796,355 @@ public:
         }
 
         AppendEpisodes(names, urls, run.profile.base, &detail);
+        AttachPlayHeaders(run.profile.recipe, &detail);
         detail.raw = json{{"url", url}};
         return detail;
     }
 
     std::string Player(const SpiderContext& ctx,
                        const VideoEpisode& episode) override {
-        const std::string original = episode.url;
+        const std::string original = episode.url;   // 保留内联请求头后缀
         if (original.empty()) return original;
-        if (IsDirectMedia(original) || IsNonPageScheme(original)) return original;
+        const std::string clean = StripInlinePlayHeaders(original);
+        // 解析出新地址时也要把内联请求头带过去：不少 CDN/播放页校验 Referer，
+        // 丢了就 403（播放窗会把后缀拆成 open_headers 再传给协议插件）。
+        const std::string suffix =
+            original.size() > clean.size() ? original.substr(clean.size())
+                                           : std::string();
+        // 直链/非网页协议原样回传（带内联头，播放层解析后使用）。
+        if (IsDirectMedia(clean) || IsNonPageScheme(clean)) return original;
 
         try {
             HtmlRun run = BeginRun(ctx);
-            const std::string body = FetchPage(run, original, "player");
-            const std::string found = ExtractPlayerUrl(run, body, original);
-            if (!found.empty()) return found;
+            const std::string body = FetchPage(run, clean, "player");
+            const std::string found = ExtractPlayerUrl(run, body, clean);
+            // 播放页只有引导配置（巴士的 hhplayer 线路）：按 recipe 声明的
+            // post 模板现算直链。当前页命中就直接算；否则把 ExtractPlayerUrl
+            // 找到的播放器 iframe 再抓一层（最多一层）。
+            const std::string marker = BootstrapMarker(run.profile.recipe);
+            if (!marker.empty()) {
+                std::string media;
+                if (body.find(marker) != std::string::npos) {
+                    media = ResolveBootstrapDirect(ctx, run, body, clean);
+                } else if (!found.empty() && IsHttpUrl(found) &&
+                           !IsDirectMedia(found) && found != clean) {
+                    try {
+                        const std::string inner = FetchPage(run, found, "player");
+                        if (inner.find(marker) != std::string::npos)
+                            media = ResolveBootstrapDirect(ctx, run, inner, found);
+                    } catch (const std::exception&) {
+                    }
+                }
+                // 现算出来的直链挂在播放器域名下（QQ 云等），站点 Referer 会被
+                // 判为盗链直接 404，所以这里不带详情里的内联请求头。
+                if (!media.empty()) return media;
+            }
+            if (!found.empty()) return found + suffix;
         } catch (const std::exception&) {
             // 播放页取不到时回传详情里的原始地址，由上层解析链兜底。
         }
         return original;
+    }
+};
+
+// ───────────────────────── Bttwoo（比特）播放签名 ─────────────────────────
+//
+// 2026-11 逆向结论（nbmovie_wasm_bg.wasm）：
+//   q   = 清晰度（'4k' 映射成 '1'，其余原样）
+//   t   = 服务器毫秒时间戳（页面 <meta id="nb-st"> + 本地经过时间）
+//   k   = base64( userlink XOR 重复密钥 "nbmovie2024secretkey" )
+//   s   = HMAC-SHA256(key=路径 id, data="{dataid}:{t}:{路径 id}") 的 hex 前 32 位
+//   请求 GET /video/play?p={dataid}&v={路径id}&q={q}&s={s}&t={t}&k={k}
+// 响应 {"data":{"quality_urls":[{"mtype":"m3u8","url":"…"}]}}。
+//
+// 详情页每个分集锚点都带 dataid（a.episode-link），因此详情里把 dataid 编进
+// 片段（#bttwoo=），Player 再回抓一次分集页拿 userlink / nb-st 后现算签名。
+
+std::string BttwooXorBase64(const std::string& text) {
+    static const char kKey[] = "nbmovie2024secretkey";
+    std::string out = text;
+    const size_t klen = sizeof(kKey) - 1;
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<char>(out[i] ^ kKey[i % klen]);
+    return su::Base64Encode(out);
+}
+
+std::string BttwooInlineHeaders(std::string url, const std::string& referer,
+                                const std::string& ua) {
+    if (url.empty() || url.find('{') != std::string::npos) return url;
+    nlohmann::json h;
+    h["Referer"] = referer;
+    if (!ua.empty()) h["User-Agent"] = ua;
+    return url + h.dump();
+}
+
+std::string BttwooLastSegment(const std::string& url) {
+    std::string s = url;
+    const size_t cut = s.find_first_of("?#");
+    if (cut != std::string::npos) s.resize(cut);
+    while (!s.empty() && s.back() == '/') s.pop_back();
+    const size_t slash = s.rfind('/');
+    return slash == std::string::npos ? std::string() : s.substr(slash + 1);
+}
+
+class BttwooEngine : public RecipeHtmlEngine {
+public:
+    VideoDetail Detail(const SpiderContext& ctx, const VideoItem& item) override {
+        HtmlRun run = BeginRun(ctx);
+        std::string page;
+        if (IsHttpUrl(item.id)) {
+            page = item.id;
+        } else if (!item.id.empty() && item.id.front() == '/') {
+            page = su::JoinUrl(run.profile.base, item.id);
+        } else {
+            page = su::JoinUrl(run.profile.base, "/play/" + item.id);
+        }
+        if (page.empty())
+            throw std::runtime_error("Bttwoo 详情地址为空");
+
+        const std::string body = FetchPage(run, page, "detail");
+        const HtmlNode doc = HtmlParser(body).Parse();
+        const json extract = run.profile.recipe.value("extract", json::object());
+        const json fields =
+            extract.value("detail", json::object()).value("fields", json::object());
+
+        VideoDetail detail;
+        detail.id = item.id;
+        detail.title = FieldValue(doc, fields, "vod_name");
+        if (detail.title.empty()) detail.title = item.title;
+        detail.pic = NormalizeUrl(run.profile.base,
+                                  FieldValue(doc, fields, "vod_pic"));
+        if (detail.pic.empty()) detail.pic = item.pic;
+        detail.remarks = FieldValue(doc, fields, "vod_remarks");
+        if (detail.remarks.empty()) detail.remarks = item.remarks;
+
+        const std::vector<std::string> hrefs =
+            SelectAll(doc, "a.episode-link@href");
+        const std::vector<std::string> dataids =
+            SelectAll(doc, "a.episode-link@dataid");
+        const std::vector<std::string> line_attrs =
+            SelectAll(doc, "a.episode-link@data-line");
+        const std::vector<std::string> texts =
+            SelectAll(doc, "a.episode-link@text");
+
+        std::map<int, VideoLine> grouped;
+        for (size_t i = 0; i < hrefs.size(); ++i) {
+            const std::string dataid =
+                i < dataids.size() ? su::DigitsOnly(dataids[i]) : std::string();
+            if (dataid.empty()) continue;
+            int line_no = 1;
+            if (i < line_attrs.size() && !line_attrs[i].empty()) {
+                const int parsed = std::atoi(line_attrs[i].c_str());
+                if (parsed > 0) line_no = parsed;
+            }
+            VideoEpisode ep;
+            ep.url = su::JoinUrl(run.profile.base, hrefs[i]) + "#bttwoo=" +
+                     dataid;
+            ep.name = i < texts.size() ? su::Trim(texts[i]) : std::string();
+            if (ep.name.empty())
+                ep.name = "第" + std::to_string(grouped[line_no].episodes.size() + 1) +
+                          "集";
+            grouped[line_no].episodes.push_back(std::move(ep));
+        }
+        for (auto& kv : grouped) {
+            if (kv.second.episodes.empty()) continue;
+            kv.second.name = "线路" + std::to_string(kv.first);
+            detail.lines.push_back(std::move(kv.second));
+        }
+        detail.raw = json{{"url", page}};
+        return detail;
+    }
+
+    std::string Player(const SpiderContext& ctx,
+                       const VideoEpisode& episode) override {
+        const std::string raw = episode.url;
+        const size_t frag = raw.find("#bttwoo=");
+        if (frag == std::string::npos) return raw;
+        const std::string dataid = raw.substr(frag + 9);
+        const std::string page = raw.substr(0, frag);
+        if (dataid.empty() || page.empty()) return raw;
+
+        HtmlRun run = BeginRun(ctx);
+        const long long fetch_start = su::UnixMilliseconds();
+        std::string body;
+        try {
+            body = FetchPage(run, page, "player");
+        } catch (const std::exception&) {
+            return raw;
+        }
+        const std::string userlink =
+            PickRegexGroup(body, "userlink:'(.*?)',");
+        if (userlink.empty()) return raw;
+        const std::string secret = BttwooLastSegment(page);
+        if (secret.empty()) return raw;
+
+        long long server_ms = 0;
+        {
+            const std::string st =
+                PickRegexGroup(body, "id=\"nb-st\"[^>]*content=\"(\\d+)\"");
+            if (!st.empty()) server_ms = std::atoll(st.c_str());
+        }
+        const long long t = server_ms > 0
+                                ? server_ms + (su::UnixMilliseconds() - fetch_start)
+                                : su::UnixMilliseconds();
+        const std::string sign =
+            su::HmacSha256Hex(secret, dataid + ":" + std::to_string(t) + ":" + secret)
+                .substr(0, 32);
+        if (sign.size() != 32) return raw;
+
+        std::string api = su::JoinUrl(run.profile.base, "/video/play");
+        api += "?p=" + su::UrlEncode(dataid) + "&v=" + su::UrlEncode(secret) +
+               "&q=1080&s=" + sign + "&t=" + std::to_string(t) +
+               "&k=" + su::UrlEncode(BttwooXorBase64(userlink));
+
+        std::string ua;
+        for (const auto& kv : run.profile.headers)
+            if (su::ToLower(kv.first) == "user-agent") ua = kv.second;
+
+        std::string media;
+        try {
+            SpiderHttp http(ctx.spider_id, ctx.net, ctx.site);
+            http.SetStage("player");
+            http.SetDefaultHeaders(run.profile.headers);
+            const SpiderHttpResponse resp = http.Get(api);
+            const json root = su::ParseJsonLoose(resp.body);
+            if (root.is_object()) {
+                for (const json* node :
+                     su::JsonFindAll(root, "$.data.quality_urls[*]")) {
+                    if (!node || !node->is_object()) continue;
+                    const std::string url = su::JsonString(*node, "url");
+                    if (url.empty()) continue;
+                    const std::string locked = su::JsonString(*node, "locked");
+                    const std::string vip = su::JsonString(*node, "isvip");
+                    if (locked == "true" || locked == "1" || vip == "true" ||
+                        vip == "1")
+                        continue;
+                    if (media.empty() || url.find(".m3u8") != std::string::npos)
+                        media = url;
+                    if (url.find(".m3u8") != std::string::npos) break;
+                }
+            }
+        } catch (const std::exception&) {
+            return raw;
+        }
+        if (media.empty()) return raw;
+        return BttwooInlineHeaders(media, page, ua);
+    }
+};
+
+// ───────────────────────── 看球（Kanqiu）：运行时注入的直播页 ─────────────────────────
+//
+// 卡片本身就是 /live/{id}/play 直播页，播放地址由 sss.js 运行时写进页面，
+// 静态解析永远拿不到。这里把“直播页 URL”当作线路交给播放层：
+//   · 配置了 parses 时由 WEB 插件解析；
+//   · 解析不出来时播放窗先用隐藏 WebView2 跑页面 JS，嗅探到 m3u8 后切原生。
+// /live/{id}/source 的 data 形如「6 位随机前缀 + base64(JSON) + == + 2 位后缀」，
+// 从 JSON 的 eyJ 起点截到第一个 '=' 再解 base64。
+std::string KanqiuDecodeSource(const std::string& data) {
+    const size_t start = data.find("eyJ");
+    if (start == std::string::npos) return {};
+    std::string b64 = data.substr(start);
+    const size_t pad = b64.find('=');
+    if (pad != std::string::npos) b64.resize(pad);
+    while (b64.size() % 4) b64 += '=';
+    std::string out;
+    return su::Base64Decode(b64, &out) ? out : std::string();
+}
+
+class KanqiuEngine : public RecipeHtmlEngine {
+public:
+    VideoDetail Detail(const SpiderContext& ctx, const VideoItem& item) override {
+        VideoDetail detail;
+        detail.id = item.id;
+        detail.title = item.title;
+        detail.pic = item.pic;
+        detail.remarks = item.remarks;
+        std::string page;
+        try {
+            HtmlRun run = BeginRun(ctx);
+            if (IsHttpUrl(item.id)) {
+                page = item.id;
+            } else if (!item.id.empty() && item.id.front() == '/') {
+                page = su::JoinUrl(run.profile.base, item.id);
+            }
+        } catch (const std::exception&) {
+            return detail;
+        }
+        if (page.empty()) return detail;
+        // 线路 1：走 /source 现算的直链；线路 2：原直播页，直链失效时由
+        // 播放窗「自动换线」切到网页（隐藏 WebView2 兜底）。
+        VideoLine line;
+        line.name = "线路Q1";
+        VideoEpisode ep;
+        ep.name = "直播";
+        ep.url = page + "#kanqiu=1";
+        line.episodes.push_back(std::move(ep));
+        detail.lines.push_back(std::move(line));
+
+        VideoLine fallback;
+        fallback.name = "网页兜底";
+        VideoEpisode web;
+        web.name = "直播页";
+        web.url = page;
+        fallback.episodes.push_back(std::move(web));
+        detail.lines.push_back(std::move(fallback));
+        detail.raw = json{{"url", page}};
+        return detail;
+    }
+
+    std::string Player(const SpiderContext& ctx,
+                       const VideoEpisode& episode) override {
+        std::string page = episode.url;
+        if (page.empty()) return page;
+        // 不带 #kanqiu 标记的是「网页兜底」线路：原样返回，交给网页嗅探。
+        if (page.find("#kanqiu=") == std::string::npos) return page;
+        page = page.substr(0, page.find('#'));
+        // /live/{id}/play → /live/{id}/source 返回 base64(JSON)：
+        // {"links":[{"url":"https://play.88player.top/m3u8.html?url=<m3u8>"}]}
+        const size_t live = page.find("/live/");
+        if (live == std::string::npos) return page;
+        const size_t begin = live + 6;
+        const size_t end = page.find('/', begin);
+        const std::string id =
+            page.substr(begin, end == std::string::npos ? std::string::npos
+                                                        : end - begin);
+        if (id.empty()) return page;
+
+        HtmlRun run = BeginRun(ctx);
+        std::string media;
+        try {
+            SpiderHttp http(ctx.spider_id, ctx.net, ctx.site);
+            http.SetStage("player");
+            http.SetDefaultHeaders(run.profile.headers);
+            const SpiderHttpResponse resp = http.Get(
+                su::JoinUrl(run.profile.base, "/live/" + id + "/source"));
+            const json root = su::ParseJsonLoose(resp.body);
+            const std::string payload = su::JsonString(root, "data");
+            const std::string decoded = KanqiuDecodeSource(payload);
+            if (!decoded.empty()) {
+                const json src = su::ParseJsonLoose(decoded);
+                for (const json* link : su::JsonFindAll(src, "$.links[*]")) {
+                    if (!link || !link->is_object()) continue;
+                    const std::string url = su::JsonString(*link, "url");
+                    if (url.empty()) continue;
+                    // 线路地址是包装页，真正的 m3u8 在 url= 参数里。
+                    std::string inner = su::QueryParam(url, "url");
+                    if (inner.empty() && url.find(".m3u8") != std::string::npos)
+                        inner = url;
+                    inner = su::UrlDecode(inner);
+                    if (inner.rfind("http", 0) == 0) {
+                        media = inner;
+                        break;
+                    }
+                }
+            }
+        } catch (const std::exception&) {
+            return page;
+        }
+        if (media.empty()) return page;   // 解析失败 → 交给隐藏 WebView2 嗅探
+        // 包装页 <meta name="referrer" content="no-referrer">，分片请求不带 Referer；
+        // 这里保持裸地址，由 HLS 插件用默认头请求。
+        return media;
     }
 };
 
@@ -1758,8 +2212,12 @@ void RegisterHtmlSpiderMetas(SpiderRegistry& registry) {
         meta.tmpl = SpiderTemplate::kHtml;
         meta.implemented = spec.implemented;
         meta.note = spec.note;
-        registry.Register(std::move(meta),
-                          [] { return std::make_unique<RecipeHtmlEngine>(); });
+        registry.Register(
+            std::move(meta),
+            [id = std::string(spec.id)]() -> std::unique_ptr<SpiderEngine> {
+                if (id == "csp_Bttwoo") return std::make_unique<BttwooEngine>();
+                return std::make_unique<RecipeHtmlEngine>();
+            });
     }
 }
 
@@ -1776,6 +2234,33 @@ struct HtmlEngineRegistrar {
         // 把 sources/spiders 里所有 html 模板的社区 spider recipe 自动点亮。
         RegisterRecipeSpiderVariants(SpiderTemplate::kHtml,
                                      [] { return std::make_unique<RecipeHtmlEngine>(); });
+        // 上面的批量注册会覆盖同名专用引擎（skip_if_registered=false），
+        // 这里再登记一次 Bttwoo，确保它的签名实现生效。
+        {
+            SpiderMeta meta;
+            meta.id = "csp_Bttwoo";
+            meta.class_name = "Bttwoo";
+            meta.tmpl = SpiderTemplate::kHtml;
+            meta.implemented = true;
+            meta.note =
+                "PASS：播放签名已逆向（HMAC-SHA256(key=路径id, data=id:t:id) + "
+                "XOR/base64(userlink)）；/video/play 现算直链";
+            registry.Register(std::move(meta),
+                              [] { return std::make_unique<BttwooEngine>(); });
+        }
+        // 看球：详情直接返回直播页，播放地址交给 WEB 解析 / 播放窗隐藏嗅探。
+        {
+            SpiderMeta meta;
+            meta.id = "csp_Kanqiu";
+            meta.class_name = "Kanqiu";
+            meta.tmpl = SpiderTemplate::kHtml;
+            meta.implemented = true;
+            meta.note =
+                "PASS：卡片/直播页可用；播放地址由 sss.js 运行时注入，"
+                "交给 WEB 解析或播放窗隐藏 WebView2 嗅探";
+            registry.Register(std::move(meta),
+                              [] { return std::make_unique<KanqiuEngine>(); });
+        }
     }
 };
 

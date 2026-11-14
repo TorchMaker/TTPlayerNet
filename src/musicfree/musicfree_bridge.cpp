@@ -251,8 +251,18 @@ void MusicFreeBridge::OnWebMessage(const std::string& json_text) {
         const std::string stage = (pl.contains("stage") && pl["stage"].is_string())
                                       ? pl["stage"].get<std::string>()
                                       : "";
-        BridgeFailLog("COVER_FAIL url=" + url + " wasHttp=" + (wasHttp ? "1" : "0") +
-                      " stage=" + stage);
+        // 带上片名/来源：按站点统计「哪家的图床挂了」，比只看 URL 快。
+        const std::string title = (pl.contains("title") && pl["title"].is_string())
+                                      ? pl["title"].get<std::string>()
+                                      : "";
+        const std::string site = (pl.contains("site") && pl["site"].is_string())
+                                     ? pl["site"].get<std::string>()
+                                     : "";
+        std::string line = "COVER_FAIL url=" + url + " wasHttp=" +
+                           (wasHttp ? "1" : "0") + " stage=" + stage;
+        if (!site.empty()) line += " site=" + site;
+        if (!title.empty()) line += " title=" + title;
+        BridgeFailLog(line);
         json resp;
         resp["id"] = id;
         resp["ok"] = true;
@@ -376,6 +386,11 @@ void MusicFreeBridge::PushEvent(const std::string& evt,
     } else {
         BridgeDebugLog("事件节流挂起（合并为最新一份）: " + evt);
     }
+}
+
+void MusicFreeBridge::ResetReadyForReload() {
+    std::lock_guard lk(mtx_);
+    ready_sent_ = false;
 }
 
 void MusicFreeBridge::FlushPending() {

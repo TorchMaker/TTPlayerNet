@@ -97,6 +97,11 @@ public:
     // 以免宿主与 app.init 握手各推一次造成页面重复初始化。
     void PushEvent(const std::string& evt, const nlohmann::json& payload);
 
+    // 页面重新导航（刷新）时调用：清掉「bridge.ready 只发一次」的锁存，
+    // 否则刷新后宿主的 ready 会被当成重复推送丢掉，页面永远停在
+    //「正在连接宿主…」，重新握手无法完成。
+    void ResetReadyForReload();
+
     // 把处于节流窗口内、被挂起（合并）的高频事件立即补发。
     // 宿主可用约 100ms 的定时器周期调用；OnWebMessage 每次处理消息时也会调用。
     void FlushPending();

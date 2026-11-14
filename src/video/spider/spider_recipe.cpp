@@ -313,6 +313,11 @@ void RegisterRecipeSpiderVariants(SpiderTemplate tmpl, SpiderFactory factory,
             std::string err;
             if (!ValidateSpiderRecipe(root, fname, &rec, &err)) continue;
             if (rec.tmpl != want) continue;  // 只注册与本模板匹配的 recipe
+            // 专用引擎已登记的站点必须保留（AppTT / JPJ / Alllive 等）。漏掉这个
+            // 判断会让通用 recipe 引擎把已经实测跑通的实现整体覆盖：recipe 里
+            // base 为空时 URL 退化成 "/vod/search"，日志只剩一句「非法 URL」。
+            if (skip_if_registered && SpiderRegistry::Instance().Has(rec.id))
+                continue;
             SpiderMeta meta;
             meta.id = rec.id;
             meta.class_name = rec.cls.empty() ? rec.id : rec.cls;

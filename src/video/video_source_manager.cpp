@@ -71,16 +71,17 @@ VideoSite SiteFromJson(const nlohmann::json& j) {
         s.spider_id = j["spider_id"].get<std::string>();
     if (j.contains("native_ready") && j["native_ready"].is_boolean())
         s.native_ready = j["native_ready"].get<bool>();
-    // 老缓存没有 spider_id / native_ready：重新识别一次补全，避免原生站点
-    // 升级后仍显示成「需要 Java 运行库」。
-    if (s.spider_id.empty() || s.kind == VideoSourceKind::kUnknown) {
+    // 缓存里的 kind / native_ready 是入库那一刻的快照，注册表变化后可能已经
+    // 过期（例如通用 recipe 引擎一度把「原生未实现」的 csp_* 标成可用，缓存
+    // 就把它们记成 kNativeSpider）。这里始终按当前注册表重新识别，避免旧缓存
+    // 让站点继续走一条已经不存在的引擎。
+    {
         const VideoSite detected = VideoSite::FromJson(j);
-        if (detected.kind == VideoSourceKind::kNativeSpider) {
+        if (detected.kind != VideoSourceKind::kUnknown) {
             s.kind = detected.kind;
             s.spider_id = detected.spider_id;
             s.native_ready = detected.native_ready;
-        } else if (s.kind == VideoSourceKind::kUnknown) {
-            s = detected;
+            s.why_unsupported = detected.why_unsupported;
         }
     }
     return s;

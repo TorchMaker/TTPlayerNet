@@ -163,6 +163,54 @@ img { display: block; }
   border-right: 1px solid var(--border);
 }
 
+/* 视频左栏：标题 + 分类 chips 固定在顶部，只让分区卡片/搜索结果滚动。
+   此前整个左栏一起滚，往下翻时分类条会滚出视野，无法随时切分区。 */
+.split-left.video-left {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.video-left #video-sections,
+.video-left #video-search-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* 标题与分类条不参与压缩，保证始终完整可见 */
+.video-left > .sec-title,
+.video-left > .video-cats {
+  flex: 0 0 auto;
+}
+
+/* 视频页：左栏更宽、封面更大；右侧（剧集）只保留单列。
+   与音乐页的 .split / 卡片网格解耦，只作用于 .video-split。 */
+.split.video-split {
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 220px);
+  gap: 16px;
+}
+.video-split .split-left .vsec .cards {
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+/* 推荐流封面用海报比例（3:4），比原来的 1:1 更大更饱满 */
+.video-split .vsec .card-cover {
+  aspect-ratio: 3 / 4;
+}
+/* 搜索结果同样放大一档 */
+.video-split .search-cards {
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+/* 右栏剧集：单列纵向排列（此前是 flex-wrap 多列 chips） */
+.video-split .episode-list {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+.video-split .episode {
+  width: 100%;
+  text-align: left;
+}
+
 /* 窄窗口下退回上下布局，并恢复整页滚动（两栏不再各自滚动） */
 @media (max-width: 760px) {
   .view { overflow-y: auto; padding-bottom: 24px; }
@@ -176,6 +224,10 @@ img { display: block; }
   .split-left,
   .split-right { overflow: visible; }
   .split-left { padding-right: 0; border-right: none; }
+  /* 窄屏恢复整页滚动：视频左栏不再自己开滚动容器，交给 .view。 */
+  .split-left.video-left { display: block; overflow: visible; }
+  .video-left #video-sections,
+  .video-left #video-search-results { overflow: visible; }
 }
 
 @keyframes fade-in {
@@ -303,6 +355,45 @@ img { display: block; }
 .track:hover,
 .result-row:hover { background: var(--card); }
 
+/* 视频搜索结果：封面缩略图（竖版海报 2:3）+ 顶部返回按钮 */
+/* 搜索结果大图网格：竖版海报卡（与首页卡片同结构，封面 2:3 更接近影视仓） */
+.search-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 14px;
+}
+.search-card .card-cover { aspect-ratio: 2 / 3; }
+
+.result-cover {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 60px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--card);
+}
+.result-cover.empty {
+  display: block;
+  border: 1px dashed var(--border);
+  background: transparent;
+}
+.result-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 2px 8px;
+}
+.search-back-btn {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-sub);
+  background: rgba(255, 255, 255, .03);
+}
+.search-back-btn:hover { color: var(--text); border-color: var(--accent); }
+
 .track.playing,
 .track.active {
   background: var(--accent-soft);
@@ -414,6 +505,11 @@ img { display: block; }
 
 .panel-search {
   flex: 0 0 auto;
+  /* 窄窗口整页滚动时搜索条也固定在顶部（正常布局下本就在 panel 首行）。 */
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
 }
 
 .panel-search .primary-btn,

@@ -29,32 +29,50 @@
 (function () {
     "use strict";
 
-    // 封面加载兜底：影视源大量封面是 http://，页面又跑在 https://app.webui 上，
-    // 即便宿主已放开混合内容，个别图床仍会拒。这里先尝试 http→https 再取一次，
-    // 仍失败就把破图隐藏（卡片有深色底，比显示裂图干净）。
-    function ttCoverFail(el) {
+    // 封面加载兜底 + 诊断（影视源封面来自各站图床，失败原因差异很大）：
+    //   · 豆瓣图床只认 douban.com 来源页，缺 Referer 直接 418（宿主已注入）；
+    //   · 个别站图床已失效，返回 JSON 占位/404，本源封面永远拿不到。
+    // 失败先上报宿主落盘（COVER_FAIL 行），再做兜底：
+    //   ① http → https 重试一次；
+    //   ② 业务层注册的 window.__coverFallback（换同一部片在其它源里的封面）。
+    // 注意：本文件有两个 IIFE —— 这里只放「桥层」能用的东西，渲染相关
+    // （规范化标题/封面索引）在下面的业务 IIFE 里，通过全局钩子回调。
+    function reportCover(url, title, site, stage, wasHttp) {
         try {
-            var s = el.getAttribute("src") || "";
+            if (!(window.chrome && window.chrome.webview &&
+                  window.chrome.webview.postMessage)) return;
+            window.chrome.webview.postMessage(JSON.stringify({
+                cmd: "video.coverFail", id: 0,
+                payload: {
+                    url: url || "", title: title || "", site: site || "",
+                    stage: stage, wasHttp: !!wasHttp
+                }
+            }));
+        } catch (e) { /* ignore */ }
+    }
+
+    function ttCoverFail(el) {
+        var s = "", title = "", site = "";
+        try {
+            s = el.getAttribute("src") || "";
+            title = el.getAttribute("data-title") || "";
+            site = el.getAttribute("data-site") || "";
             var wasHttp = s.indexOf("http://") === 0;
-            // 诊断：封面加载失败（mixed content / 防盗链 / 404 等）时把 URL
-            // 上报给宿主落盘（COVER_FAIL 日志），用于定位「图片不显示」根因。
-            if (window.chrome && window.chrome.webview &&
-                window.chrome.webview.postMessage) {
-                try {
-                    window.chrome.webview.postMessage(JSON.stringify({
-                        cmd: "video.coverFail", id: 0,
-                        payload: { url: s, wasHttp: wasHttp, stage: "error" }
-                    }));
-                } catch (e) { /* ignore */ }
-            }
+            reportCover(s, title, site, "error", wasHttp);
             if (wasHttp) {
                 el.setAttribute("src", "https://" + s.slice(7));  // http→https 重试一次
+                return;
+            }
+            // 业务层（第二个 IIFE）注册的跨源补图：命中就换下一张图。
+            if (typeof window.__coverFallback === "function" &&
+                window.__coverFallback(el, s, title, site)) {
                 return;
             }
         } catch (e) { /* ignore */ }
         el.style.visibility = "hidden";  // 彻底失败，隐藏破图
     }
     window.ttCoverFail = ttCoverFail;
+    window.__ttCoverReport = reportCover;
 
     // ── 协议契约清单：必须与 src/musicfree/musicfree_bridge.cpp 中的
     //    kSupportedCmds / kSupportedEvts 完全一致
@@ -324,6 +342,55 @@
         return e && e.message ? e.message : String(e);
     }
 
+    // ── 封面诊断/跨源兜底（与桥层的 ttCoverFail 配套）────────────────────
+    // 卡片封面来自各站图床：某个站图床挂了（返回 JSON 占位/404）时，用同一部片
+    // 在其它源里的封面顶上。规范化片名后匹配，忽略标点/空格/结尾年份。
+    var coverAltIndex = {};   // 规范化标题 -> [封面 url]
+
+    function normTitle(t) {
+        return String(t || "").toLowerCase()
+            .replace(/[\s\u3000]/g, "")
+            .replace(/[()（）【】\[\]《》〈〉!！?？,，.。:：;；·、'"“”‘’\-—_~～]/g, "")
+            .replace(/20\d{2}$/, "");
+    }
+
+    function rebuildCoverAltIndex(cards) {
+        coverAltIndex = {};
+        (cards || []).forEach(function (c) {
+            if (!c || !c.cover) return;
+            var k = normTitle(c.title);
+            if (!k) return;
+            var list = coverAltIndex[k] || (coverAltIndex[k] = []);
+            if (list.indexOf(c.cover) < 0) list.push(c.cover);
+        });
+    }
+
+    // 统一走桥层上报（保证日志格式只有一份实现）。
+    function reportCover(url, title, site, stage, wasHttp) {
+        if (typeof window.__ttCoverReport === "function")
+            window.__ttCoverReport(url, title, site, stage, wasHttp);
+    }
+
+    // 桥层 ttCoverFail 的回调：换下一张未试过的同名片封面；无可用封面返回 false。
+    window.__coverFallback = function (el, src, title, site) {
+        try {
+            var alts = coverAltIndex[normTitle(title)] || [];
+            var tried = el.__coverTried || (el.__coverTried = {});
+            tried[src] = 1;
+            for (var i = 0; i < alts.length; i++) {
+                var u = alts[i];
+                if (u && !tried[u]) {
+                    tried[u] = 1;
+                    el.setAttribute("src", u);
+                    reportCover(u, title, site, "fallback", false);
+                    return true;
+                }
+            }
+        } catch (e) { /* ignore */ }
+        return false;
+    };
+
+
     // 容错取字段：按别名列表取第一个有值的（宿主字段命名未最终定稿时的缓冲）
     function pick(obj, keys) {
         if (!obj || typeof obj !== "object") return undefined;
@@ -462,13 +529,25 @@
     function renderVideoSections(sections) {
         var s = Array.isArray(sections) ? sections : [];
         videoCards = [];
+        var all = [];
+        s.forEach(function (sec) {
+            (Array.isArray(sec.cards) ? sec.cards : []).forEach(function (c) {
+                all.push(c);
+            });
+        });
+        // 多源推荐流的同一部片可互相补封面（某站图床挂了也能显示）。
+        rebuildCoverAltIndex(all);
+        var missing = [];
         var html = s.map(function (sec) {
             var cards = (Array.isArray(sec.cards) ? sec.cards : []).map(function (c) {
                 var idx = videoCards.push(c) - 1;
                 var cover = c.cover
-                    ? '<img loading="lazy" src="' + esc(c.cover) +
-                      '" alt="" onerror="ttCoverFail(this)">'
+                    ? '<img loading="lazy" referrerpolicy="no-referrer" src="' +
+                      esc(c.cover) + '" alt="" data-title="' +
+                      esc(c.title || "") + '" data-site="' +
+                      esc(c.from || c.site || "") + '" onerror="ttCoverFail(this)">'
                     : "";
+                if (!c.cover) missing.push(c);
                 var rating = c.rate ? '<span class="rating">' + esc(c.rate) + "</span>" : "";
                 var tags = [c.from, c.remarks, c.type, c.year]
                     .filter(function (t) { return t; })
@@ -484,6 +563,17 @@
                 '</h3><div class="cards">' + cards + "</div></section>";
         }).join("");
         $("video-sections").innerHTML = html;
+        reportMissingCovers(missing);
+    }
+
+    // 完全没有封面地址的卡片也上报（此前这类卡片无任何日志，无法定位是
+    // 「源里就没图」还是「图加载失败」）。每次渲染最多报 20 条，避免刷屏。
+    function reportMissingCovers(list) {
+        var n = Math.min(list.length, 20);
+        for (var i = 0; i < n; i++) {
+            var c = list[i] || {};
+            reportCover("", c.title || "", c.from || c.site || "", "empty", false);
+        }
     }
 
     // 点分类页签：发 video.category（后端逐站拉该分类第一页）
@@ -599,8 +689,16 @@
         // 用户希望搜索时左看结果、右看剧集。
     }
 
+    // 搜索态顶部的「返回首页」按钮：搜索框内容保留，便于再次搜索。
+    function videoSearchHead() {
+        return '<div class="result-head">' +
+            '<button id="video-search-back" class="search-back-btn" type="button"' +
+            ' title="返回视频首页推荐">← 返回首页</button></div>';
+    }
+
     function videoSearchEmpty(text) {
-        $("video-search-results").innerHTML = '<div class="empty">' + esc(text) + "</div>";
+        $("video-search-results").innerHTML =
+            videoSearchHead() + '<div class="empty">' + esc(text) + "</div>";
     }
 
     function doVideoSearch() {
@@ -613,7 +711,7 @@
         }
         videoPendingQ = q;
         setVideoSearchMode(true);
-        $("video-search-results").innerHTML =
+        $("video-search-results").innerHTML = videoSearchHead() +
             '<div class="loading">正在搜索“' + esc(q) + "”…</div>";
         clearTimeout(videoSearchEvtTimer);
         // 事件看门狗：宿主会并发扫描全部视频源，40s 未到给空态提示
@@ -643,21 +741,34 @@
                 ("未找到" + (p.q ? "「" + p.q + "」" : "相关") + "结果"));
             return;
         }
+        // 搜索结果用大图卡片网格（与首页一致的影视仓观感），不再是细行列表。
+        rebuildCoverAltIndex(cards);
+        var missing = [];
         var html = cards.map(function (c, i) {
-            var sub = [c.from, c.type, c.year]
+            var meta = [c.from, c.remarks || c.type, c.year]
                 .filter(function (x) { return x; }).join(" · ");
-            return '<div class="result-row" data-idx="' + i + '">' +
-                '<span class="track-no">▶</span>' +
-                '<div class="track-main"><div class="track-title">' + esc(c.title || "") +
-                "</div>" +
-                (sub ? '<div class="track-artist">' + esc(sub) + "</div>" : "") +
-                "</div>" +
-                '<span class="track-dur">' + esc(c.rate || "") + "</span></div>";
+            var cover = c.cover
+                ? '<img loading="lazy" referrerpolicy="no-referrer" src="' +
+                  esc(c.cover) + '" alt="" data-title="' +
+                  esc(c.title || "") + '" data-site="' +
+                  esc(c.from || c.site || "") + '" onerror="ttCoverFail(this)">'
+                : "";
+            if (!c.cover) missing.push(c);
+            var rating = c.rate
+                ? '<span class="rating">' + esc(c.rate) + "</span>" : "";
+            return '<article class="card search-card" data-idx="' + i + '">' +
+                '<div class="card-cover">' + cover + rating + "</div>" +
+                '<div class="card-title">' + esc(c.title || "") + "</div>" +
+                (meta ? '<div class="card-meta">' + esc(meta) + "</div>" : "") +
+                "</article>";
         }).join("");
         $("video-search-results").innerHTML =
-            '<div class="result-group"><h3 class="vsec-title">“' + esc(p.q || "") +
+            '<div class="result-group">' + videoSearchHead() +
+            '<h3 class="vsec-title">“' + esc(p.q || "") +
             '” 的搜索结果（' + cards.length +
-            (p.partial ? "，搜索中…" : "") + "）</h3>" + html + "</div>";
+            (p.partial ? "，搜索中…" : "") + "）</h3>" +
+            '<div class="search-cards">' + html + "</div></div>";
+        reportMissingCovers(missing);
     }
 
     // 点卡片 → 取详情（30s 超时）或直开播放窗
@@ -731,6 +842,20 @@
             sources: Array.isArray(ep.sources) ? ep.sources : [],
             ep: ep.name || ""
         };
+        // 整部剧的选集一起带上：播放窗的「选集」按钮据此在同一窗口里切集
+        // （以前只有电影能切源，剧集在播放窗里没有任何换集入口）。
+        var allEps = [];
+        for (var ei = 0; ei < videoEpisodes.length; ei++) {
+            var v = videoEpisodes[ei];
+            if (!v || !v.ep || !v.ep.url) continue;
+            allEps.push({
+                title: v.ep.name || "",
+                url: v.ep.url,
+                line: v.line || "",
+                sources: Array.isArray(v.ep.sources) ? v.ep.sources : []
+            });
+        }
+        if (allEps.length > 1) payload.episodes = allEps;
         if (it.line) payload.line = it.line;
         B.send("video.open", payload, { timeout: 30000 }).then(function (r) {
             r = r || {};
@@ -1063,7 +1188,14 @@
     // 视频搜索结果行 → 取详情 / 开播。左栏搜索结果保留（方便在结果间切换），
     // 剧集在右栏展开；清空搜索框即恢复推荐流。
     $("video-search-results").addEventListener("click", function (e) {
-        var row = e.target.closest(".result-row");
+        // 返回首页：收起搜索结果，恢复推荐流（搜索框内容保留）。
+        if (e.target.closest("#video-search-back")) {
+            videoPendingQ = "";
+            clearTimeout(videoSearchEvtTimer);
+            setVideoSearchMode(false);
+            return;
+        }
+        var row = e.target.closest(".result-row, .search-card");
         if (!row) return;
         var c = videoSearchResults[Number(row.getAttribute("data-idx"))];
         if (!c) return;
@@ -1135,6 +1267,9 @@
         var b = e.target.closest(".vcat");
         if (!b) return;
         var cat = b.getAttribute("data-cat");
+        // 切分区后回到顶部（分区容器现在是独立滚动区，滚动位置会保留）。
+        var secs = $("video-sections");
+        if (secs) secs.scrollTop = 0;
         if (cat === VIDEO_CAT_ALL) {
             applyVideoCat(VIDEO_CAT_ALL);
             if (!homeSectionsCache.length) loadVideoHome();

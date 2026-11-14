@@ -48,6 +48,8 @@ bool Base64Decode(std::string_view text, std::string* out);
 std::string Md5Hex(std::string_view data);
 std::string Sha1Hex(std::string_view data);
 std::string Sha256Hex(std::string_view data);
+// HMAC-SHA256（小写 hex）。用于站点播放签名（如 Bttwoo 的 s=）。
+std::string HmacSha256Hex(std::string_view key, std::string_view data);
 
 // AES-128/192/256-CBC 解密（PKCS#7 去填充）；key/iv 长度需匹配算法。
 // 用于 app 模板里「响应体 AES 加密」的站点（App99/YueTing 等）：一旦从 smali

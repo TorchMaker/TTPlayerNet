@@ -143,6 +143,10 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
     musicfree::StartMusicFreeSourcesLoading(player.Handle(),
                                             kMsgStartupSourcesReady);
     TT_STARTUP_TRACE("bg_sources_scheduled");
+    // 音乐窗按上次退出状态尽早打开：以前要等音源挂载完（实测约 11 秒）才恢复，
+    // 用户会以为「没自动打开」而手动按 F11，反而把随后自动弹出的窗口关掉。
+    // 这里先开窗，音源就绪后（kMsgStartupSourcesReady）再刷新一次页面数据。
+    if (!command_line.smoke_test) player.RestoreStartupMusicBrowserWindow();
     // 自检模式需要确定性的完整音源列表，且马上就要退出，这里直接等后台完成。
     if (command_line.smoke_test) musicfree::WaitForMusicFreeSources();
 
@@ -219,10 +223,13 @@ int TTPlayer_RunApplicationSession(HINSTANCE instance, int show_command,
                     EnsureSoundLibrary();
                     // 后台线程发消息前已置 done，这里不会阻塞。
                     musicfree::WaitForMusicFreeSources();
-                    // 上次退出时音乐窗是开着的，按同样的状态恢复；必须等音源
-                    // 挂载完，否则平台列表是空的。自检模式不弹窗。
-                    if (!command_line.smoke_test)
+                    // 启动早期按上次状态自动开的音乐窗：页面首帧数据可能为空，
+                    // 音源就绪后重载一次；若早期没开成（WebView2 未就绪），
+                    // 这里再补开一次（窗口已存在时是空操作）。自检模式不弹窗。
+                    if (!command_line.smoke_test) {
+                        player.RefreshAutoRestoredMusicBrowser();
                         player.RestoreStartupMusicBrowserWindow();
+                    }
                     if (playback_deferred) player.RestoreStartupPlayback();
                     TT_STARTUP_TRACE("deferred_done");
                 }

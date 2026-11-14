@@ -125,6 +125,10 @@ constexpr UINT_PTR kSkinMenuToolTipTimer = 0x215;
 // separate from every main-window animation timer above.
 constexpr UINT_PTR kPlaylistScrollbarRepeatTimer = 0x216;
 constexpr UINT_PTR kPlaylistMarqueeTimer = 0x217;
+// 音乐窗移动/关闭后的状态落盘合并定时器（800ms 一次）。
+// ⚠ 不能与既有定时器复用 ID：0x217/0x218/0x219 已被皮肤淡入、关闭音频淡出、
+// 波形切歌占用，同 ID 会让 WM_TIMER 分发先命中别的分支，本定时器永远不执行。
+constexpr UINT_PTR kMusicBrowserStateTimer = 0x21a;
 constexpr UINT kPlaylistScrollbarRepeatIntervalMs = 50;
 // FUN_0040C0C9/0040C0F6 advances the original alpha clock in roughly
 // five-alpha-unit samples. A window timer keeps the recovered transition on

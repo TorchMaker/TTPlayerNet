@@ -3,6 +3,7 @@
 #include "ttplayer/ui/wtl_menu.h"
 #include "ttplayer/ui/wtl_window.h"
 #include "ttplayer/ui/player_window.h"
+#include "ttplayer/video/video_history.h"
 #include "player_window_internal.h"
 #include "ttplayer/ui/wtl_runtime.h"
 #include "project_links.h"
@@ -3241,6 +3242,9 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             PollWaveTrackChange();
         } else if (wparam == kSkinMenuToolTipTimer) {
             ShowQueuedSkinMenuToolTip();
+        } else if (wparam == kMusicBrowserStateTimer) {
+            // 音乐窗移动/关闭后的合并落盘（下次启动据此恢复位置与开关）。
+            PersistMusicBrowserState();
         } else if (wparam == kPlaybackErrorTimer) {
             // A timer message queued before a retry must not expire the new notice.
             if (!playback_error_text_.empty() && GetTickCount64() -
@@ -3614,6 +3618,14 @@ void PlayerWindow::PersistWindowState() {
     // flags on the next launch.  FUN_0045D5FA uses this same per-skin branch
     // when leaving a package; commit the active package snapshot at shutdown
     // as well, before the root state that owns mini visibility/top-most data.
+    SaveWindowStateSnapshot();
+    if (!lyric_associations_.Save())
+        OutputDebugStringW(L"TTPlayerRebuild: cannot save lyric associations; previous .rll retained.\n");
+}
+
+// 把「窗口布局 + 可见性」这一刻的状态写到磁盘（皮肤 sidecar + 根 XML）。
+// 与 PersistWindowState 的落盘部分完全同源；供音乐窗拖动/关闭时的即时保存复用。
+void PlayerWindow::SaveWindowStateSnapshot() {
     if (skin_ && skin_->Valid()) {
         const auto profile = CurrentSkinProfilePath();
         if (!profile.empty()) {
@@ -3623,8 +3635,19 @@ void PlayerWindow::PersistWindowState() {
         }
     }
     settings::SaveWindowState(settings_.source_path, settings_);
-    if (!lyric_associations_.Save())
-        OutputDebugStringW(L"TTPlayerRebuild: cannot save lyric associations; previous .rll retained.\n");
+}
+
+void PlayerWindow::ScheduleMusicBrowserStateSave() {
+    if (!window_) return;
+    // 拖动会连续产生 WM_MOVE：800ms 合并一次，避免反复写盘。
+    SetTimer(window_, kMusicBrowserStateTimer, 800, nullptr);
+}
+
+void PlayerWindow::PersistMusicBrowserState() {
+    if (!window_) return;
+    KillTimer(window_, kMusicBrowserStateTimer);
+    CaptureWindowState();
+    SaveWindowStateSnapshot();
 }
 
 void PlayerWindow::LayoutControls(int width, int height) const {
@@ -5235,16 +5258,23 @@ void PlayerWindow::ShowMusicFreeBrowserWindow(const std::wstring& query) {
     host.saved_bounds = [this]() { return settings_.player.browser_window; };
     host.store_bounds = [this](const RECT& bounds) {
         settings_.player.browser_window = bounds;
+        // 拖动/缩放结束立即合并落盘：进程若被强杀（任务管理器、断电），
+        // 退出时的 PersistWindowState 不会跑，下次启动仍能回到这里的位置。
+        ScheduleMusicBrowserStateSave();
     };
     host.store_top_most = [this](bool top_most) {
         settings_.player.browser_top_most = top_most;
     };
     host.on_closed = [this]() {
         // 音乐窗自己关掉时主窗口收不到任何消息；重画一下让「音乐窗」按钮
-        // 的按下态跟着恢复。
+        // 的按下态跟着恢复，并把「已关闭」立即写盘。
+        settings_.player.browser_visible = false;
+        ScheduleMusicBrowserStateSave();
         if (window_) InvalidateRect(window_, nullptr, FALSE);
     };
     host.top_most = settings_.player.browser_top_most;
+    // 打开即视为「上次是开着的」：即使随后进程异常退出，下次启动也会恢复。
+    settings_.player.browser_visible = true;
     musicfree::ShowMusicFreeBrowser(window_, musicfree::AppMusicFreeManager(),
         std::move(host),
         [this](musicfree::OnlineTrackAction action,
@@ -5256,6 +5286,7 @@ void PlayerWindow::ShowMusicFreeBrowserWindow(const std::wstring& query) {
             return AddOnlineTrack(hit, url,
                 action == musicfree::OnlineTrackAction::play);
         }, query);
+    ScheduleMusicBrowserStateSave();
 }
 
 void PlayerWindow::RestoreStartupMusicBrowserWindow() {
@@ -5265,6 +5296,16 @@ void PlayerWindow::RestoreStartupMusicBrowserWindow() {
     if (!settings_.player.browser_visible) return;
     if (musicfree::IsMusicFreeBrowserVisible()) return;
     ShowMusicFreeBrowserWindow({});
+    music_browser_auto_restored_ = true;
+}
+
+void PlayerWindow::RefreshAutoRestoredMusicBrowser() {
+    if (!music_browser_auto_restored_) return;
+    music_browser_auto_restored_ = false;
+    // 自动恢复发生在音源挂载完成之前，页面首帧拿到的榜单/平台列表是空的；
+    // 音源就绪后重载一次，让页面重新握手并拉全数据（刷新后会重新发 ready）。
+    if (musicfree::IsMusicFreeBrowserVisible())
+        musicfree::ReloadMusicFreeBrowser();
 }
 
 bool PlayerWindow::HandleContextCommand(UINT command, HWND fullscreen_origin) {
@@ -6735,6 +6776,42 @@ void PlayerWindow::SelectTrackFrom(size_t playlist_index, size_t index,
                                    bool start_playback) {
     if (playlist_index >= playlists_.Size() ||
         index >= playlists_.At(playlist_index).Tracks().size()) return;
+    {
+        // 播放列表「视频」栏目：行路径是伪协议（ttplayer-video://<id>），
+        // 不进音频解码器，直接按历史里保存的解析结果 + 进度打开视频播放窗。
+        static const std::wstring kVideoScheme = L"ttplayer-video://";
+        const auto& video_track = playlists_.At(playlist_index).Tracks()[index];
+        const std::wstring video_path = video_track.path.wstring();
+        if (video_path.rfind(kVideoScheme, 0) == 0) {
+            const std::wstring video_id = video_path.substr(kVideoScheme.size());
+            ttplayer::video::VideoHistoryLog(
+                "PLAYLIST open id=" + core::WideToUtf8(video_id));
+            playlists_.At(playlist_index).SetPlayingRow(index);
+            if (playlist_index == playlists_.ActiveIndex()) {
+                playlist_selection_ = index;
+                playlist_selection_anchor_ = index;
+                playlist_selected_rows_.clear();
+                playlist_selected_rows_.insert(index);
+                EnsurePlaylistSelectionVisible();
+                if (playlist_view_)
+                    SendMessageW(playlist_view_, LB_SETCURSEL, index, 0);
+                if (playlist_window_)
+                    InvalidateRect(playlist_window_, nullptr, FALSE);
+            }
+            // 与音乐窗打开视频时用同一份 <browser_window> 皮肤，保证外观一致。
+            const skin::BrowserSkin* browser_skin =
+                (skin_ && skin_->Browser().valid) ? &skin_->Browser() : nullptr;
+            if (!ttplayer::video::OpenVideoFromHistory(video_id, window_,
+                                                       browser_skin)) {
+                MessageBoxW(
+                    window_,
+                    L"无法打开该视频：保存的播放地址不可用，重新解析也没有取到选集。\n"
+                    L"详细原因见程序目录下 video\\history.log 与 video\\player_ui.log。",
+                    L"视频播放", MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+    }
     if (lyric_save_in_progress_) return;
     FinishLyricDocument();
     media_library_startup_pending_ = false;

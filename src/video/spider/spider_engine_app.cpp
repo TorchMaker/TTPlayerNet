@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -256,6 +257,32 @@ AppRun AppEngineBase::Begin(const SpiderContext& ctx) {
     run.ctx = &ctx;
     run.recipe = &Recipe(ctx);
     run.ext = ParseExtText(ctx.ext.empty() ? ctx.site.ext : ctx.ext);
+    // TVBox 导入配置里的 ext 常是加密串（rfOX1voD…）。ParseExtText 会把这种
+    // 非 JSON 文本包成 {"host":"<密文>"}，看起来"有值"但拼出的 URL 必然非法
+    //（日志里的「非法 URL」就是这个）。这里校验 host 是否 http(s)，不是就
+    // 用 recipe 里逆向得到的明文参数兜底：先按站点名精确匹配，再退全局。
+    auto has_valid_base = [&run]() {
+        if (!run.ext.is_object()) return false;
+        for (const char* key : {"host", "siteUrl", "site_url", "url"}) {
+            const std::string v = ExtString(run.ext, key);
+            if (v.rfind("http://", 0) == 0 || v.rfind("https://", 0) == 0)
+                return true;
+        }
+        return false;
+    };
+    const bool recipe_base_ok = !su::Trim(run.recipe->base).empty();
+    if (!recipe_base_ok && !has_valid_base()) {
+        if (const auto by = run.recipe->raw.find("default_ext_by_name");
+            by != run.recipe->raw.end() && by->is_object()) {
+            const auto it = by->find(ctx.site.name);
+            if (it != by->end() && it->is_object()) run.ext = *it;
+        }
+        if (!has_valid_base()) {
+            const auto de = run.recipe->raw.find("default_ext");
+            if (de != run.recipe->raw.end() && de->is_object())
+                run.ext = *de;
+        }
+    }
     run.uuid = su::UuidV4();
     run.nonce = su::RandomHex(8);
     run.ts = su::UnixSeconds();
@@ -275,6 +302,19 @@ std::string AppEngineBase::ResolveBase(AppRun& run) {
     while (!base.empty() && base.back() == '/') base.pop_back();
     if (base.empty()) {
         throw std::runtime_error("模板 B 缺少 host：recipe.base 与 ext.host 均为空");
+    }
+    // 省略协议的站点补 http://；仍然不像地址（ext 是加密串）就直接报清楚，
+    // 免得下游只看到一句「非法 URL」。
+    if (base.rfind("//", 0) == 0) {
+        base = "http:" + base;
+    } else if (base.rfind("http://", 0) != 0 &&
+               base.rfind("https://", 0) != 0) {
+        base = "http://" + base;
+    }
+    if (base.find('.') == std::string::npos ||
+        base.size() > 300) {
+        throw std::runtime_error(
+            "模板 B 的 host 无效（ext 可能仍是加密串）：" + base.substr(0, 60));
     }
     return base;
 }
@@ -716,7 +756,12 @@ std::string JpjEngine::ResolveBase(AppRun& run) {
         if (!cached.empty()) return cached;
     }
 
-    SpiderHttp http(run.ctx->spider_id, run.ctx->net, run.ctx->site);
+    // 域名探测用短超时并并行执行：候选表里常有已失效域名，按默认 20s 串行
+    // 探测会把单站搜索拖到 20s+（实测 23s），并行后最坏也就几秒。
+    musicfree::NetworkConfig probe_net = run.ctx->net;
+    if (probe_net.timeout_ms == 0 || probe_net.timeout_ms > 5000)
+        probe_net.timeout_ms = 5000;
+    SpiderHttp http(run.ctx->spider_id, probe_net, run.ctx->site);
     http.SetStage("init");
     const SpiderHttpResponse dns = http.Get(
         "https://dns.alidns.com/resolve?name=swrdsfeiujo25sw.cc&type=TXT");
@@ -728,6 +773,7 @@ std::string JpjEngine::ResolveBase(AppRun& run) {
         if (!answers.empty()) text = ScalarOf(*answers.front());
     }
     std::vector<std::string> domains = su::Split(text, ',');
+    std::vector<std::string> candidates;
     for (std::string& domain : domains) {
         domain = su::Trim(domain);
         while (!domain.empty() &&
@@ -736,18 +782,33 @@ std::string JpjEngine::ResolveBase(AppRun& run) {
         while (!domain.empty() && (domain.back() == '"' || domain.back() == '\''))
             domain.pop_back();
         if (domain.empty()) continue;
-        const std::string candidate = "https://fan123." + domain;
-        try {
-            const SpiderHttpResponse probe = http.Get(
-                candidate + "/api/v2/settings/resourceDomainConfig");
-            if (probe.status == 200 &&
-                probe.body.find("\"code\":1") != std::string::npos) {
-                std::lock_guard<std::mutex> lock(mutex);
-                cached = candidate;
-                return candidate;
+        candidates.push_back("https://fan123." + domain);
+    }
+    std::vector<std::future<std::string>> jobs;
+    for (const auto& candidate : candidates) {
+        jobs.push_back(std::async(std::launch::async,
+                                  [&http, candidate]() -> std::string {
+            try {
+                const SpiderHttpResponse probe = http.Get(
+                    candidate + "/api/v2/settings/resourceDomainConfig");
+                if (probe.status == 200 &&
+                    probe.body.find("\"code\":1") != std::string::npos)
+                    return candidate;
+            } catch (...) {
             }
+            return {};
+        }));
+    }
+    for (auto& job : jobs) {
+        std::string candidate;
+        try {
+            candidate = job.get();
         } catch (...) {
         }
+        if (candidate.empty()) continue;
+        std::lock_guard<std::mutex> lock(mutex);
+        cached = candidate;
+        return candidate;
     }
     throw std::runtime_error("JPJ 动态域名解析失败（DNS TXT 无可用 fan123 主机）");
 }

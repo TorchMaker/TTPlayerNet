@@ -87,6 +87,11 @@ HWND MusicFreeBrowserWindow();
 // 关闭音乐窗（等同框体上的关闭按钮）。未创建时是空操作。
 void CloseMusicFreeBrowser();
 
+// 重载音乐窗页面（WebView2 刷新）。用于「启动时按上次状态自动恢复、但音源
+// 还没挂载完」的场景：页面首帧数据是空的，音源就绪后重载一次拉全。
+// 宿主未创建 / 用的是旧 Win32 控件模式时是空操作。
+void ReloadMusicFreeBrowser();
+
 // 换肤后按新皮肤重新贴合外框（尺寸 / 窗口区域 / 控件位置）。窗口未创建时是空操作。
 void RefreshMusicFreeBrowserFrame();
 

@@ -136,6 +136,9 @@ std::string ExtractMediaUrl(const std::string& raw) {
     ReplaceAll(&text, "\\/", "/");
     ReplaceAll(&text, "\\u002F", "/");
     ReplaceAll(&text, "\\u002f", "/");
+    ReplaceAll(&text, "\\u0026", "&");
+    ReplaceAll(&text, "\\u003D", "=");
+    ReplaceAll(&text, "\\u003d", "=");
     ReplaceAll(&text, "&amp;", "&");
     ReplaceAll(&text, "%3A", ":");
     ReplaceAll(&text, "%2F", "/");
@@ -230,6 +233,73 @@ std::string ExtractRelativeMediaUrl(const std::string& text) {
     return {};
 }
 
+// ───────────── base64 包裹的直链（Auete 等苹果 CMS 换皮站） ─────────────
+//
+// 播放页正文里没有明文地址，而是：
+//   var now=base64decode("aHR0cHM6Ly9wbGF5Lm1vZHVqeDE3LmNvbS8...");
+// base64 解出来才是 index.m3u8。以前整页扫 http(s) 只能扫到 js/css 地址，
+// 于是误判「页面里没有内嵌直链」，播放窗停在 00:00。
+std::string Base64DecodeLoose(const std::string& in) {
+    auto value = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+' || c == '-') return 62;
+        if (c == '/' || c == '_') return 63;
+        return -1;
+    };
+    std::string out;
+    int buffer = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        const int v = value(c);
+        if (v < 0) continue;
+        buffer = (buffer << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+std::string ExtractBase64DecodedUrl(const std::string& text) {
+    static const char* kCalls[] = {"base64decode(", "Base64.decode(", "atob("};
+    for (const char* call : kCalls) {
+        const std::string key(call);
+        size_t pos = 0;
+        while ((pos = text.find(key, pos)) != std::string::npos) {
+            pos += key.size();
+            size_t q = pos;
+            while (q < text.size() &&
+                   (text[q] == ' ' || text[q] == '\t' || text[q] == '\r' ||
+                    text[q] == '\n'))
+                ++q;
+            if (q >= text.size() || (text[q] != '"' && text[q] != '\'')) continue;
+            const char quote = text[q++];
+            const size_t end = text.find(quote, q);
+            if (end == std::string::npos) break;
+            pos = end + 1;
+            if (end - q < 16) continue;   // 太短的不可能是直链
+            std::string decoded = Base64DecodeLoose(text.substr(q, end - q));
+            while (!decoded.empty() &&
+                   (decoded.front() == ' ' || decoded.front() == '\r' ||
+                    decoded.front() == '\n' || decoded.front() == '\t'))
+                decoded.erase(decoded.begin());
+            if (decoded.rfind("//", 0) == 0) decoded = "https:" + decoded;
+            if (!StartsHttp(decoded)) continue;
+            const std::string low = Lower(decoded);
+            if (low.find(".m3u8") != std::string::npos ||
+                low.find(".mp4") != std::string::npos ||
+                low.find(".flv") != std::string::npos ||
+                low.find(".ts") != std::string::npos)
+                return decoded;
+        }
+    }
+    return {};
+}
+
 // ───────────── TVBox 风格：从 JSON 响应取直链（type 1） ─────────────
 // 扫描 "url" / "data":{"url"} 等键值，优先带媒体后缀者。很多解析接口返回
 // {"url":"https://...m3u8"} 或 {"data":{"url":"..."}}，纯子串扫描容易漏/拿错。
@@ -248,6 +318,9 @@ std::string ExtractJsonMediaUrl(const std::string& body) {
         ReplaceAll(&v, "\\/", "/");
         ReplaceAll(&v, "\\u002F", "/");
         ReplaceAll(&v, "\\u002f", "/");              // 编码器输出小写 hex 也认
+        ReplaceAll(&v, "\\u0026", "&");
+        ReplaceAll(&v, "\\u003D", "=");
+        ReplaceAll(&v, "\\u003d", "=");
         if (v.rfind("//", 0) == 0) v = "https:" + v; // 协议相对直链 //host/x.m3u8
         if (StartsHttp(v)) cands.push_back(v);
         pos = q2 + 1;
@@ -312,6 +385,28 @@ struct ParseEndpoint {
     int type = 0;   // 0=嗅探（跳过）1=JSON 2=HTML 3=直链前缀
 };
 
+// 把 \uXXXX 的码点按 UTF-8 追加。解析接口常把 URL 里的 & 转义成 \u0026，
+// 原样保留会让直链带上字面量 "\u0026"：源站一律 404、转发响应体为空。
+void AppendUtf8(std::string* out, unsigned cp) {
+    if (cp < 0x80) {
+        out->push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+int HexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 // 读取 JSON 对象片段里的字符串字段（只处理常见转义，够 parses 用）。
 std::string JsonStringField(const std::string& obj, const std::string& key) {
     const std::string pat = "\"" + key + "\"";
@@ -332,9 +427,38 @@ std::string JsonStringField(const std::string& obj, const std::string& key) {
             else if (c == 'r') out.push_back('\r');
             else if (c == 't') out.push_back('\t');
             else if (c == 'u' && p + 5 < obj.size()) {
-                // 解析接口 URL 里几乎不会出现 \u；按字面保留 4 位hex。
-                out.append(obj, p, 6);
-                p += 5;
+                // 解析接口 URL 里的 & / = / ? 常被转义成 \u0026 之类，
+                // 必须还原成字符，否则直链请求会 404。
+                int v = 0;
+                bool hex_ok = true;
+                for (int k = 0; k < 4; ++k) {
+                    const int h = HexValue(obj[p + 2 + k]);
+                    if (h < 0) { hex_ok = false; break; }
+                    v = (v << 4) | h;
+                }
+                if (!hex_ok) {
+                    out.append(obj, p, 6);   // 不是合法 hex，按字面保留
+                    p += 6;
+                    continue;
+                }
+                p += 6;
+                // 代理对（emoji 等）合并成一个码点。
+                if (v >= 0xD800 && v <= 0xDBFF && p + 5 < obj.size() &&
+                    obj[p] == '\\' && obj[p + 1] == 'u') {
+                    int lo = 0;
+                    bool lo_ok = true;
+                    for (int k = 0; k < 4; ++k) {
+                        const int h = HexValue(obj[p + 2 + k]);
+                        if (h < 0) { lo_ok = false; break; }
+                        lo = (lo << 4) | h;
+                    }
+                    if (lo_ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                AppendUtf8(&out, static_cast<unsigned>(v));
+                continue;
             } else out.push_back(c);
             p += 2;
             continue;
@@ -431,13 +555,32 @@ struct UrlParts {
     bool https = false;
 };
 
+// WinHTTP 请求行必须是 ASCII：把 URL 里的非 ASCII（未编码中文等）按 UTF-8
+// 百分号编码，与浏览器一致。地址里带中文时不做这步会直接 Crack 失败。
+std::wstring EscapeNonAsciiUrl(const std::wstring& url) {
+    static const char* kHex = "0123456789ABCDEF";
+    const std::string utf8 = WideToUtf8(url);
+    std::string out;
+    out.reserve(utf8.size() + 16);
+    for (unsigned char c : utf8) {
+        if (c >= 0x80) {
+            out += '%';
+            out += kHex[(c >> 4) & 0xF];
+            out += kHex[c & 0xF];
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return Utf8ToWide(out);
+}
+
 bool Crack(const std::wstring& url, UrlParts* out) {
     URL_COMPONENTSW uc{};
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = 1;
     uc.dwUrlPathLength = 1;
     uc.dwExtraInfoLength = 1;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
+    if (!WinHttpCrackUrl(EscapeNonAsciiUrl(url).c_str(), 0, 0, &uc)) return false;
     out->https = uc.nScheme == INTERNET_SCHEME_HTTPS;
     out->host.assign(uc.lpszHostName, uc.dwHostNameLength);
     out->path.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
@@ -482,6 +625,12 @@ std::wstring ResolveLocation(const std::wstring& base, const std::wstring& loc) 
     const size_t slash = path.find_last_of(L'/');
     return authority +
            (slash == std::wstring::npos ? L"/" : path.substr(0, slash + 1)) + l;
+}
+
+// WinHttpSendRequest 的 lpstrHeaders 要的是「Header: value\r\n」整串。
+// 以前把 Referer 的**值**直接传进去，等于没带 Referer（源站一律 403）。
+std::wstring RefererHeader(const std::wstring& ref) {
+    return ref.empty() ? std::wstring() : L"Referer: " + ref + L"\r\n";
 }
 
 HINTERNET MakeRequest(HINTERNET con, const std::wstring& path, bool https,
@@ -532,9 +681,12 @@ bool HttpGetText(const std::wstring& url, const std::wstring& ua,
         if (!con) break;
         HINTERNET req = MakeRequest(con, u.path, u.https, L"");
         if (!req) { WinHttpCloseHandle(con); break; }
-        const wchar_t* r = ref.empty() ? WINHTTP_NO_REFERER : ref.c_str();
-        if (!WinHttpSendRequest(req, r, r ? -1L : 0L,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        const std::wstring hdr = RefererHeader(ref);
+        if (!WinHttpSendRequest(
+                req,
+                hdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdr.c_str(),
+                hdr.empty() ? 0 : static_cast<DWORD>(-1),
+                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(req, nullptr)) {
             WinHttpCloseHandle(req);
             WinHttpCloseHandle(con);
@@ -589,6 +741,189 @@ bool HttpGetText(const std::wstring& url, const std::wstring& ua,
     }
     WinHttpCloseHandle(ses);
     return ok;
+}
+
+// POST application/json（HHJX 型解析器 /api/parse 这类接口只收 POST）。
+// 与 HttpGetText 同族：跟随 ≤4 跳重定向、https 证书宽容、body 截断到
+// max_bytes。成功（2xx）返回 true，status 供诊断日志。
+bool HttpPostJson(const std::wstring& url, const std::wstring& ua,
+                  const std::wstring& ref, const std::string& json_body,
+                  int timeout_ms, size_t max_bytes, std::string* body,
+                  DWORD* out_status) {
+    body->clear();
+    if (out_status) *out_status = 0;
+    UrlParts u{};
+    if (!Crack(url, &u)) return false;
+    HINTERNET ses = WinHttpOpen(
+        ua.empty() ? L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     L"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                   : ua.c_str(),
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return false;
+    const int to = timeout_ms > 0 ? timeout_ms : 8000;
+    WinHttpSetTimeouts(ses, to, to, to, to);
+    bool ok = false;
+    for (int hop = 0; hop < 5; ++hop) {
+        HINTERNET con = WinHttpConnect(ses, u.host.c_str(), u.port, 0);
+        if (!con) break;
+        HINTERNET req = WinHttpOpenRequest(
+            con, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, u.https ? WINHTTP_FLAG_SECURE : 0);
+        if (!req) {
+            WinHttpCloseHandle(con);
+            break;
+        }
+        if (u.https) {
+            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                          SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &flags,
+                             sizeof(flags));
+        }
+        WinHttpAddRequestHeaders(req, L"Content-Type: application/json",
+                                 static_cast<DWORD>(-1),
+                                 WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpAddRequestHeaders(req, L"Accept: application/json, */*",
+                                 static_cast<DWORD>(-1),
+                                 WINHTTP_ADDREQ_FLAG_ADD);
+        const std::wstring hdr = RefererHeader(ref);
+        const bool sent = WinHttpSendRequest(
+            req,
+            hdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdr.c_str(),
+            hdr.empty() ? 0 : static_cast<DWORD>(-1),
+            const_cast<char*>(json_body.data()),
+            static_cast<DWORD>(json_body.size()),
+            static_cast<DWORD>(json_body.size()), 0);
+        if (!sent || !WinHttpReceiveResponse(req, nullptr)) {
+            WinHttpCloseHandle(req);
+            WinHttpCloseHandle(con);
+            break;
+        }
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                            WINHTTP_NO_HEADER_INDEX);
+        if (out_status) *out_status = status;
+        if (IsRedirect(status)) {
+            wchar_t loc[4096]{};
+            DWORD ls = sizeof(loc);
+            bool moved = false;
+            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_LOCATION,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, loc, &ls,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                const std::wstring next = ResolveLocation(url, loc);
+                UrlParts nu{};
+                if (!next.empty() && Crack(next, &nu)) {
+                    u = nu;
+                    moved = true;
+                }
+            }
+            WinHttpCloseHandle(req);
+            WinHttpCloseHandle(con);
+            if (moved) continue;
+            break;
+        }
+        if (status >= 200 && status < 300) {
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(req, &avail) || !avail) break;
+                std::vector<char> chunk(avail);
+                DWORD got = 0;
+                if (!WinHttpReadData(req, chunk.data(), avail, &got) || !got)
+                    break;
+                if (body->size() + got > max_bytes)
+                    got = static_cast<DWORD>(max_bytes > body->size()
+                                                 ? max_bytes - body->size() : 0);
+                body->append(chunk.data(), got);
+                if (body->size() >= max_bytes) break;
+            }
+            ok = true;
+        }
+        WinHttpCloseHandle(req);
+        WinHttpCloseHandle(con);
+        break;
+    }
+    WinHttpCloseHandle(ses);
+    return ok;
+}
+
+// hhplayer 系解析器（动漫巴士 dmbus 等站点内嵌的 iframe 播放器）：
+// 播放页 HTML 里没有明文直链，iframe 页面只下发一段引导配置：
+//   window.__HHJX_BOOTSTRAP__ = {"url":"<加密token>","t":<unix秒>,
+//                                "key":"<hex>", ...}
+// 真正的 m3u8 要 POST {host}/api/parse（body 就是上面那三个字段）现算：
+//   {"code":200,"url":"https://.../index.m3u8","ext":"..."}
+// 返回解出的直链；失败返回空并写 why（进 play_fail.log 诊断）。
+std::string ResolveHhJx(const std::string& frame_url,
+                        const std::string& frame_html,
+                        const std::wstring& ua, const std::wstring& referer,
+                        int timeout_ms, std::string* why) {
+    const size_t boot = frame_html.find("__HHJX_BOOTSTRAP__");
+    if (boot == std::string::npos) return {};
+    const size_t lb = frame_html.find('{', boot);
+    if (lb == std::string::npos) return {};
+    int depth = 0;
+    size_t end = std::string::npos;
+    for (size_t i = lb; i < frame_html.size() && i < lb + 4096; ++i) {
+        if (frame_html[i] == '{') ++depth;
+        else if (frame_html[i] == '}' && --depth == 0) { end = i; break; }
+    }
+    if (end == std::string::npos) {
+        if (why) *why = "HHJX 引导配置不完整";
+        return {};
+    }
+    const std::string cfg = frame_html.substr(lb, end - lb + 1);
+    const std::string token = JsonStringField(cfg, "url");
+    const std::string key = JsonStringField(cfg, "key");
+    const int t = JsonIntField(cfg, "t");
+    if (token.empty() || key.empty() || t == 0) {
+        if (why) *why = "HHJX 引导配置缺字段";
+        return {};
+    }
+    UrlParts fu{};
+    if (!Crack(Utf8ToWide(frame_url), &fu)) return {};
+    std::wstring api = fu.https ? L"https://" : L"http://";
+    api += fu.host;
+    if (fu.port != (fu.https ? 443 : 80))
+        api += L":" + std::to_wstring(fu.port);
+    api += L"/api/parse";
+    const std::string req = "{\"url\":\"" + token + "\",\"t\":" +
+                            std::to_string(t) + ",\"key\":\"" + key + "\"}";
+    // 该接口有来源校验：缺 Origin / Referer 一律 403（浏览器里是同源
+    // fetch，两个头都带）。Referer 用 iframe 页地址，Origin 用同源前缀。
+    // 传入的 referer 来自用户配置（可能是站外地址），在这里不适用。
+    (void)referer;
+    std::wstring origin = fu.https ? L"https://" : L"http://";
+    origin += fu.host;
+    if (fu.port != (fu.https ? 443 : 80))
+        origin += L":" + std::to_wstring(fu.port);
+    const std::wstring hdr =
+        L"Referer: " + Utf8ToWide(frame_url) + L"\r\nOrigin: " + origin;
+    std::string resp;
+    DWORD status = 0;
+    if (!HttpPostJson(api, ua, hdr, req, timeout_ms, 256 * 1024, &resp,
+                      &status)) {
+        if (why)
+            *why = "HHJX 解析接口请求失败(HTTP " + std::to_string(status) + ")";
+        return {};
+    }
+    std::string url = JsonStringField(resp, "url");
+    ReplaceAll(&url, "\\/", "/");
+    if (url.rfind("//", 0) == 0) url = "https:" + url;
+    if (IsValidResolvedUrl(url)) return url;
+    // 个别版本把直链包在 data 里，退回到通用 JSON 挖链。
+    std::string alt = ExtractJsonMediaUrl(resp);
+    if (!alt.empty()) return alt;
+    if (why) {
+        std::string note = resp.substr(0, 160);
+        ReplaceAll(&note, "\r", " ");
+        ReplaceAll(&note, "\n", " ");
+        *why = "HHJX 解析返回无效: " + note;
+    }
+    return {};
 }
 
 std::wstring HeaderText(HINTERNET req, DWORD which) {
@@ -646,9 +981,12 @@ void StreamForward(SOCKET c, const std::wstring& url, const std::wstring& ua,
         if (!con) break;
         HINTERNET req = MakeRequest(con, u.path, u.https, range);
         if (!req) { WinHttpCloseHandle(con); break; }
-        const wchar_t* r = ref.empty() ? WINHTTP_NO_REFERER : ref.c_str();
-        if (!WinHttpSendRequest(req, r, r ? -1L : 0L,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        const std::wstring hdr = RefererHeader(ref);
+        if (!WinHttpSendRequest(
+                req,
+                hdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdr.c_str(),
+                hdr.empty() ? 0 : static_cast<DWORD>(-1),
+                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(req, nullptr)) {
             WinHttpCloseHandle(req);
             WinHttpCloseHandle(con);
@@ -742,6 +1080,10 @@ struct WebState {
 
     std::wstring resolved;     // 解析出的真实媒体直链
     std::wstring final_media;  // 交给播放器/代理的最终地址
+    // 请求媒体/分片时实际使用的 Referer。部分 CDN（QQ 云等）对带 Referer 的请求
+    // 直接 404，而浏览器里页面是 <meta name="referrer" content="no-referrer">，
+    // 解析成功后探测一次，被拒就改用空 Referer。
+    std::wstring media_referer;
     std::wstring error;
     bool via_hls = false;      // 是否委托了 ttp_v_hls.dll
 
@@ -774,7 +1116,7 @@ bool DelegateToHls(const std::shared_ptr<WebState>& st,
     }
     VPHttpConfig cfg{};
     cfg.user_agent = st->ua.empty() ? nullptr : st->ua.c_str();
-    cfg.referer = st->referer.empty() ? nullptr : st->referer.c_str();
+    cfg.referer = st->media_referer.empty() ? nullptr : st->media_referer.c_str();
     cfg.timeout_ms = st->timeout_ms;
     cfg.options = nullptr;
     wchar_t media[1024]{};
@@ -913,6 +1255,29 @@ void ResolveThread(const std::shared_ptr<WebState>& st) {
                 std::string rel = ExtractRelativeMediaUrl(page);
                 if (!rel.empty()) media = JoinUrl(raw, rel);
             }
+            // 直链被 base64decode("…") 包起来（Auete 等站点）。必须在 iframe
+            // 之前处理：这类页面虽然也写 iframe，但 iframe src 是站内 js 播放器，
+            // 直链只在本页的 now 变量里。
+            if (media.empty()) {
+                media = ExtractBase64DecodedUrl(page);
+                if (!media.empty())
+                    page_info += "播放页 base64decode 直链: " +
+                                 media.substr(0, 120) + "\n";
+            }
+            // hhplayer 系解析器（动漫巴士等站点的线路地址本身就是 iframe 播放页）：
+            // 页面只下发 __HHJX_BOOTSTRAP__，必须 POST /api/parse 现算直链。
+            // 以前只在「页面里再套 iframe」时走这条分支，顶级播放页直接漏掉。
+            if (media.empty() &&
+                page.find("__HHJX_BOOTSTRAP__") != std::string::npos) {
+                std::string why;
+                media = ResolveHhJx(raw, page, st->ua, st->referer, per_req,
+                                    &why);
+                if (!media.empty())
+                    page_info += "播放页 hhplayer 解析直链: " +
+                                 media.substr(0, 120) + "\n";
+                else if (!why.empty())
+                    page_info += why + "\n";
+            }
             // 播放页常见 iframe 播放器：再抓一层（最多 2 个）。
             if (media.empty()) {
                 std::string low = Lower(page);
@@ -931,6 +1296,12 @@ void ResolveThread(const std::shared_ptr<WebState>& st) {
                         continue;
                     std::string frame = page.substr(q1 + 1, q2 - q1 - 1);
                     if (frame.rfind("//", 0) == 0) frame = "https:" + frame;
+                    // 站内播放器常用根相对地址（/js/player/myun.html），以前这里
+                    // 直接 continue，等于放弃了这类 iframe 里的直链。
+                    if (!StartsHttp(frame) && !frame.empty()) {
+                        if (frame[0] == '/' || frame.rfind("./", 0) == 0)
+                            frame = JoinUrl(raw, frame);
+                    }
                     if (!StartsHttp(frame)) continue;
                     ++taken;
                     std::string inner;
@@ -938,11 +1309,27 @@ void ResolveThread(const std::shared_ptr<WebState>& st) {
                     if (HttpGetText(Utf8ToWide(frame), st->ua, st->referer,
                                     per_req, 1024 * 1024, &inner,
                                     nullptr)) {
-                        media = ExtractMediaUrl(inner);
+                        // hhplayer 型解析器页面：HTML 里只有加密引导配置，
+                        // 直链必须 POST /api/parse 现算（动漫巴士等站点的
+                        // 内嵌播放器都是这套）。放在 ExtractMediaUrl 之前，
+                        // 避免把页面里的 js 库地址误当媒体。
+                        if (inner.find("__HHJX_BOOTSTRAP__") !=
+                            std::string::npos) {
+                            std::string why;
+                            media = ResolveHhJx(frame, inner, st->ua,
+                                                st->referer, per_req, &why);
+                            if (!media.empty())
+                                page_info += "iframe 解析器直链: " +
+                                             media.substr(0, 120) + "\n";
+                            else if (!why.empty())
+                                page_info += why + "\n";
+                        }
+                        if (media.empty()) media = ExtractMediaUrl(inner);
                         if (media.empty()) {
                             std::string rel = ExtractRelativeMediaUrl(inner);
                             if (!rel.empty()) media = JoinUrl(frame, rel);
                         }
+                        if (media.empty()) media = ExtractBase64DecodedUrl(inner);
                         if (!media.empty()) break;
                     }
                 }
@@ -959,6 +1346,24 @@ void ResolveThread(const std::shared_ptr<WebState>& st) {
         std::lock_guard<std::mutex> lk(st->mtx);
         if (!media.empty()) {
             st->resolved = Utf8ToWide(media);
+            // 媒体请求的 Referer 探测：带 Referer 被 403/404（QQ 云、部分字节
+            // CDN 会拒绝跨站 Referer）就改发空 Referer，与浏览器 no-referrer
+            // 行为一致；否则保留页面 Referer（多数 CDN 需要它防盗链）。
+            st->media_referer = st->referer;
+            if (!st->media_referer.empty()) {
+                DWORD probe_status = 0;
+                std::string probe_body;
+                // 403/404 也会走到这里（HttpGetText 只在 2xx 置 ok），
+                // 因此只看状态码，不看 probed。
+                HttpGetText(st->resolved, st->ua, st->media_referer, per_req, 1,
+                            &probe_body, &probe_status);
+                if (probe_status == 403 || probe_status == 404) {
+                    st->media_referer.clear();
+                    AppendProtoFailLog(
+                        "媒体请求带 Referer 被 " +
+                        std::to_string(probe_status) + " 拒绝，已改用无 Referer");
+                }
+            }
             // m3u8 → 交给 HLS 协议 DLL；其余（mp4/flv…）走本地转发代理。
             if (Lower(media).find(".m3u8") != std::string::npos &&
                 !DelegateToHls(st, st->resolved)) {
@@ -1074,7 +1479,7 @@ void HandleConn(const std::shared_ptr<WebState>& st, SOCKET c) {
                         "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         SendAll(c, h.data(), static_cast<int>(h.size()));
     } else {
-        StreamForward(c, final_media, st->ua, st->referer, st->timeout_ms,
+        StreamForward(c, final_media, st->ua, st->media_referer, st->timeout_ms,
                       range, st->stop);
     }
     closesocket(c);
@@ -1139,6 +1544,7 @@ VPSession* VpOpen(const wchar_t* url, const VPHttpConfig* cfg,
     st->origin = url;
     st->ua = cfg && cfg->user_agent ? cfg->user_agent : L"";
     st->referer = cfg && cfg->referer ? cfg->referer : L"";
+    st->media_referer = st->referer;
     st->timeout_ms = cfg && cfg->timeout_ms > 0 ? cfg->timeout_ms : 8000;
     st->options = cfg && cfg->options ? cfg->options : L"";
     ParseOptions(st->options.c_str(), &st->parses);

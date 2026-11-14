@@ -202,14 +202,36 @@ bool RunSetup(const std::wstring& path) {
 WebView2RuntimePlan PlanWebView2Runtime() {
     WebView2RuntimePlan plan;
     plan.tier = CurrentTier();
+    {
+        const wchar_t* tier_name = plan.tier == WebView2OsTier::kWin10Plus
+                                       ? L"Win10Plus"
+                                       : plan.tier == WebView2OsTier::kLegacy
+                                             ? L"Legacy(6.1-6.3)"
+                                             : L"Unsupported(5.x)";
+        TraceLine(std::wstring(L"PlanWebView2Runtime tier=") + tier_name);
+    }
     if (plan.tier == WebView2OsTier::kUnsupported) {
         plan.detail = L"XP 或更早系统不支持 WebView2，回退原生界面";
+        TraceLine(L"PlanWebView2Runtime -> 不可用（系统不支持）");
         return plan;
     }
 
     const std::wstring pv = ReadEvergreenPv();
     const unsigned major = MajorOf(pv);
     const std::wstring bundled = FindBundledRuntime();
+    TraceLine(L"PlanWebView2Runtime pv=\"" + pv + L"\" bundled=\"" + bundled +
+              L"\"");
+
+    // 防 shim 谎报：系统被兼容性 shim（如 WIN7RTM，注册表
+    // AppCompatFlags\Layers，常由程序兼容性助手或安装包自动挂上）改写后，
+    // RtlGetVersion 会返回 6.x，导致 Win10/11 被误判成 Win7。Evergreen
+    // 110+ 的安装器在真实 Win7/8 上无法安装——已装 110+ 就证明系统不是
+    // 旧系统，把 tier 纠正回 Win10Plus。
+    if (plan.tier == WebView2OsTier::kLegacy && major > 109) {
+        plan.tier = WebView2OsTier::kWin10Plus;
+        TraceLine(L"PlanWebView2Runtime 检测到 shim 谎报（pv>109 但系统报旧），"
+                  L"纠正为 Win10Plus");
+    }
 
     // 随包 Fixed Version 优先级最高：不依赖安装、不需要管理员权限，Win7 上
     // 只要放好 109 目录就能用（离线机器也行）。
@@ -229,9 +251,11 @@ WebView2RuntimePlan PlanWebView2Runtime() {
                 major >= 128 ? kModernCompat : kLegacyCompat;
             plan.available = true;
             plan.detail = L"系统 Evergreen Runtime " + pv;
-        } else {
-            plan.detail = L"Win10+ 未安装 WebView2 Runtime，需自动安装";
+            TraceLine(L"PlanWebView2Runtime -> 可用：" + plan.detail);
+            return plan;
         }
+        plan.detail = L"Win10+ 未安装 WebView2 Runtime，需自动安装";
+        TraceLine(L"PlanWebView2Runtime -> 不可用：pv 为空或 0.0.0.0");
         return plan;
     }
 
@@ -241,10 +265,13 @@ WebView2RuntimePlan PlanWebView2Runtime() {
         plan.compatible_version = kLegacyCompat;
         plan.available = true;
         plan.detail = L"已装旧系统兼容 Evergreen Runtime " + pv;
+        TraceLine(L"PlanWebView2Runtime -> 可用（旧系统 109）：pv=" + pv);
     } else if (major > 109) {
         plan.detail = L"已装 Runtime " + pv + L" 高于 109，旧系统无法运行";
+        TraceLine(L"PlanWebView2Runtime -> 不可用：系统被判为旧系统且 pv>109");
     } else {
         plan.detail = L"未安装 WebView2 Runtime，需自动安装 109";
+        TraceLine(L"PlanWebView2Runtime -> 不可用：旧系统且 pv 为空");
     }
     return plan;
 }

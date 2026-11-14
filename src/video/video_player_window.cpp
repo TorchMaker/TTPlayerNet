@@ -35,6 +35,7 @@
 #include "ttplayer/musicfree/musicfree_http.h"   // DownloadText / DownloadBinary（HLS 拼接）
 #include "ttplayer/musicfree/musicfree_types.h"  // NetworkConfig
 #include "ttplayer/video/video_types.h"          // VideoParse（解析接口）
+#include "ttplayer/video/video_history.h"        // 观看历史 / 续播进度
 #include "ttplayer/video/video_resolve.h"        // ResolveVideoUrl（解析接口 + 播放页爬虫）
 #include "ttplayer/video/video_player_js.h"      // IsBuiltinPlayerFlag（flag 派发）
 #include "ttplayer/video/video_protocol_registry.h"  // 协议插件（HLS 本地代理等）
@@ -445,6 +446,11 @@ struct PlayerState {
     // 核心库只持有纯接口指针；web_mode 为真时不再画「播放失败」浮层。
     std::unique_ptr<VideoWebHost> web_host;
     bool web_mode = false;
+    // 「先隐藏嗅探、超时再显示」：网页线路兜底时先把 WebView2 挂在 0×0 区域，
+    // 让页面脚本自己算出/请求到媒体直链（TTPMS 回推），命中就切原生播放；
+    // 7 秒内没命中才把网页显示出来（用户仍能点页面播放器）。
+    bool web_resolve_hidden = false;
+    DWORD web_resolve_deadline = 0;
     // 网页播放形态下 <video> 的状态（脚本 250ms 回推）。自绘进度条/播放键
     // 与原生形态共用同一套状态读取与 Seek 路径。
     VideoWebState web_state{};
@@ -456,8 +462,31 @@ struct PlayerState {
     // 打开当前源时携带的请求头（切源时复用）。
     std::vector<VideoPlayerSource> sources;
     int source_index = 0;
+    // 同集多线路自动兜底：首条线路失效（DNS/403/token 过期）时自动换下一条，
+    // 计数到 sources.size()-1 为止，避免在死线路之间无限循环。
+    int auto_source_tried = 0;
+    // 同源重新解析：网页线路（WEB 插件）每次打开都会重新抓播放页换新令牌。
+    // 401/402（hhplayer 这类单次令牌/限流）失败时先原样重开一次同一线路。
+    int same_src_retry_index = -1;   // 已经重试过的线路下标
+    bool resolve_retry_pending = false;
     std::map<std::string, std::string> open_headers;
     RECT source_btn{};        // 「切换源」按钮（标题栏，全屏药丸左侧）
+    // 剧集切换：整部剧的选集列表（含每集自己的多线路）。电影为空 → 不显示
+    // 「选集」按钮。切换时重开同一个播放窗（ShowVideoPlayer 的复用分支）。
+    std::vector<VideoPlayerEpisode> episodes;
+    RECT episode_btn{};       // 「选集」按钮（控制栏，切换源左侧）
+    std::wstring base_title;  // 片名（不含「千千静听 · 」前缀，切集时复用）
+    // ── 观看历史 / 续播 ───────────────────────────────────────────
+    // history_id 由宿主（音乐窗桥 / 播放列表「视频」栏目）提供；非空时按
+    // 3 秒节奏把「当前集 + 播放进度」写回 <exe>\video\history.json。
+    std::wstring history_id;
+    int current_ep = -1;        // 当前集在 episodes 里的下标（电影 -1）
+    int pending_start_ms = 0;   // 首帧就绪后要跳到的位置（续播）
+    bool start_applied = false;
+    DWORD last_history_save = 0;
+    // 单击画面中间 = 暂停/继续（与双击全屏共存：先挂起，确认不是双击再执行）。
+    bool pending_content_toggle = false;
+    bool content_double_clicked = false;  // 刚发生了双击全屏，本次抬起不暂停
     // HLS（m3u8）拼接：Media Foundation 在 Win10 1803+ 已移除内置 HLS 源，
     // m3u8 直链无法直接播。后台线程把全部 ts 分段拼成本地 .ts 再交给 MF。
     std::atomic<int> hls_percent{0};     // 0..100
@@ -559,6 +588,13 @@ void LayoutFooterControls(PlayerState* st) {
     } else {
         st->source_btn = {};
     }
+    // 「选集」按钮：剧集（episodes > 1）时放在切换源左侧，点开列出全部集数。
+    if (st->episodes.size() > 1) {
+        st->episode_btn = {x - 62, cy - 15, x, cy + 15};
+        x = st->episode_btn.left - 12;
+    } else {
+        st->episode_btn = {};
+    }
     st->vol_slider = {x - 70, cy - 3, x, cy + 3};
     x = st->vol_slider.left - 10;
     st->vol_btn = {x - 46, cy - 15, x, cy + 15};
@@ -571,6 +607,7 @@ void LayoutFooterControls(PlayerState* st) {
         st->time_text = {};
         st->vol_btn = {};
         st->source_btn = {};   // 窄窗：优先保进度条与全屏键
+        st->episode_btn = {};
         st->vol_slider = {st->fs_btn.left - 12 - 70, cy - 3,
                           st->fs_btn.left - 12, cy + 3};
         progress_right = st->vol_slider.left - 12;
@@ -607,6 +644,7 @@ void LayoutFooterControls(PlayerState* st) {
     };
     clamp_rect(st->fs_btn);
     clamp_rect(st->source_btn);
+    clamp_rect(st->episode_btn);
     clamp_rect(st->vol_slider);
     clamp_rect(st->vol_btn);
     clamp_rect(st->time_text);
@@ -758,6 +796,71 @@ void AppendUiLog(const std::string& text) {
     std::fclose(f);
 }
 
+// ───────────── 播放窗位置/大小持久化：<exe>\video\player_window.json ─────────────
+// 以前每次都用 CW_USEDEFAULT 创建，播放窗总是从系统默认位置（左上角附近）出现。
+// 这里独立存一份，不动主程序配置（视频模块属于 ttplayer_video.dll）。
+std::wstring VideoWindowStatePath() {
+    wchar_t exe[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return {};
+    std::wstring dir(exe);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    return dir.substr(0, slash) + L"\\video\\player_window.json";
+}
+
+// 读取上次的还原态矩形与「是否最大化」。文件缺失/损坏一律返回 false。
+bool LoadVideoWindowPlacement(RECT* out, bool* maximized) {
+    if (out) *out = RECT{};
+    if (maximized) *maximized = false;
+    const std::wstring path = VideoWindowStatePath();
+    if (path.empty()) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    nlohmann::json j;
+    try {
+        in >> j;
+    } catch (...) {
+        return false;   // 损坏的文件直接当没有，下次会重写
+    }
+    if (!j.is_object()) return false;
+    RECT r{};
+    r.left = j.value("left", 0);
+    r.top = j.value("top", 0);
+    const int w = j.value("width", 0);
+    const int h = j.value("height", 0);
+    if (w <= 0 || h <= 0) return false;
+    r.right = r.left + w;
+    r.bottom = r.top + h;
+    if (maximized) *maximized = j.value("maximized", false);
+    if (out) *out = r;
+    return true;
+}
+
+void SaveVideoWindowPlacement(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(wp);
+    if (!GetWindowPlacement(hwnd, &wp)) return;
+    // rcNormalPosition 是「还原态」矩形：最大化/最小化时也保存它，下次先还原
+    // 到该位置再按需最大化。
+    const RECT r = wp.rcNormalPosition;
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    nlohmann::json j;
+    j["left"] = r.left;
+    j["top"] = r.top;
+    j["width"] = r.right - r.left;
+    j["height"] = r.bottom - r.top;
+    j["maximized"] = (wp.showCmd == SW_SHOWMAXIMIZED);
+    const std::wstring path = VideoWindowStatePath();
+    if (path.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(path).parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out << j.dump();
+}
+
 // 刷新「最后操作时间」并在隐藏时唤出控制条。
 // ★ 调用方必须是有意义的输入：明确点击/按键，或 WM_TIMER 轮询到真实光标位移。
 //   WM_MOUSEMOVE **不再无条件调用**：hide 时若改变渲染子窗口几何，Windows 会
@@ -791,6 +894,7 @@ int HitTestId(PlayerState* st, const POINT& p) {
     if (PtInRect(&st->vol_btn, p)) return 3;
     if (PtInRect(&st->fs_btn, p)) return 4;
     if (PtInRect(&st->source_btn, p)) return 7;
+    if (PtInRect(&st->episode_btn, p)) return 8;
     if (PtInInflated(st->progress, p, 14)) return 5;
     if (PtInInflated(st->vol_slider, p, 11)) return 6;
     return 0;
@@ -1231,6 +1335,8 @@ void CloseProtocolSession(PlayerState* st);
 void SwitchSource(PlayerState* st);
 // 控制栏「切换源」弹出全部线路名供选择（定义在 ShowVideoPlayer 附近）。
 void ShowSourceMenu(PlayerState* st);
+// 控制栏「选集」弹出剧集列表（定义在 ShowVideoPlayer 附近）。
+void ShowEpisodeMenu(PlayerState* st);
 
 namespace {
 
@@ -1276,12 +1382,16 @@ bool TryStartWebFallback(PlayerState* st) {
     AppendUiLog("MODE web=1 native-controls=1 url=" +
                 RedactUrl(core::WideToUtf8(url)).substr(0, 160));
     LayoutPlayer(st);
-    st->web_host = factory(st->hwnd, st->content, url);
+    // 先按 0×0 创建：页面照常执行 JS/发请求，但不闪网页；嗅探命中会切原生。
+    RECT hidden{};
+    st->web_host = factory(st->hwnd, hidden, url);
     if (!st->web_host) {
         st->web_mode = false;
         LayoutPlayer(st);
         return false;
     }
+    st->web_resolve_hidden = true;
+    st->web_resolve_deadline = GetTickCount() + 7000;
     {
         const HWND host = st->hwnd;
         // 页面播放器点全屏 → 宿主播放窗进入真全屏（否则只是窗口内最大化）。
@@ -1295,6 +1405,16 @@ bool TryStartWebFallback(PlayerState* st) {
                 if (!::IsWindow(host)) return;
                 auto* copy = new VideoWebState(s);
                 if (!::PostMessageW(host, WM_USER + 14, 0,
+                                    reinterpret_cast<LPARAM>(copy)))
+                    delete copy;
+            });
+        // 直链嗅探：网页自己算出 m3u8 后自动切回原生播放（Bttwoo 这类站的
+        // 地址由页面 WASM 现算，HTTP 层拿不到）。
+        st->web_host->SetMediaSniffCallback(
+            [host](const std::string& media) {
+                if (!::IsWindow(host) || media.empty()) return;
+                auto* copy = new std::string(media);
+                if (!::PostMessageW(host, WM_USER + 15, 0,
                                     reinterpret_cast<LPARAM>(copy)))
                     delete copy;
             });
@@ -1357,6 +1477,24 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 delete state;
             }
+            return 0;
+        }
+        case WM_USER + 15: {  // 网页直链嗅探命中：lp = new std::string(媒体地址)
+            auto* sniffed = reinterpret_cast<std::string*>(lp);
+            if (!sniffed) return 0;
+            const std::string media = *sniffed;
+            delete sniffed;
+            if (!st || !st->web_mode || media.empty()) return 0;
+            AppendUiLog("SNIFF media=" + RedactUrl(media).substr(0, 160));
+            // 拿到真实直链：把网页线路换成这条直链，走原生播放链
+            //（OpenSourceAt 内部会拆网页宿主、恢复原生控制条、重新解析/HLS 代理）。
+            VideoPlayerSource sniff_src;
+            sniff_src.url = core::Utf8ToWide(media);
+            sniff_src.name = L"网页嗅探";
+            st->sources.push_back(std::move(sniff_src));
+            const int idx = static_cast<int>(st->sources.size()) - 1;
+            st->web_resolve_hidden = false;
+            OpenSourceAt(st, idx);
             return 0;
         }
         case WM_USER + 5:  // HLS 拼接进度（百分比）
@@ -1485,6 +1623,50 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            core::WideToUtf8(st->sources[i].name) + " -> " +
                            core::WideToUtf8(st->sources[i].url) + "\n";
                 AppendPlayFailLog(log);
+                // 同源重新解析：网页线路每次打开都会重新抓播放页、拿新令牌
+                //（hhplayer 的 auth_key 是一次性/限流，重开即可恢复）。
+                // 每条线路只重试一次，仍失败才进入自动换线。
+                if (st->source_index >= 0 &&
+                    st->same_src_retry_index != st->source_index &&
+                    st->source_index <
+                        static_cast<int>(st->sources.size())) {
+                    const std::wstring& current =
+                        st->sources[st->source_index].url;
+                    const std::string current_utf8 = core::WideToUtf8(current);
+                    // 网盘分享页 / JSON 数据接口重开多少次都一样，别浪费一次
+                    // 重新抓页+解析，直接进入自动换线。
+                    if (!LooksPlayableMediaUrl(current) &&
+                        !LooksLikeHlsUrl(current) &&
+                        !IsCloudShareUrl(current_utf8) &&
+                        !LooksLikeJsonApiUrl(current_utf8)) {
+                        st->same_src_retry_index = st->source_index;
+                        st->resolve_retry_pending = true;
+                        SetTimer(hwnd, 2, 700, nullptr);
+                        AppendUiLog(
+                            "RETRY same-source resolve #" +
+                            std::to_string(st->source_index + 1) + " " +
+                            core::WideToUtf8(st->sources[st->source_index].name));
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+                // 同一集的其它线路先试一遍再去开网页：影视仓的「多线」里经常
+                // 只有首条线路挂了（域名停用 / token 过期），以前会直接退回
+                // 内嵌网页，看起来就是「一开播就变网页、而且根本播不了」。
+                if (st->sources.size() > 1 && st->source_index >= 0 &&
+                    st->auto_source_tried + 1 <
+                        static_cast<int>(st->sources.size())) {
+                    ++st->auto_source_tried;
+                    const int next =
+                        (st->source_index + 1) %
+                        static_cast<int>(st->sources.size());
+                    AppendUiLog("AUTO next source #" +
+                                std::to_string(next + 1) + " " +
+                                core::WideToUtf8(st->sources[next].name));
+                    OpenSourceAt(st, next);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 // 所有解析接口都失败：官方网页线路直接在播放窗内加载网页播放，
                 // 不再只显示「播放失败」。（直链媒体 / 无工厂时返回 false）
                 if (TryStartWebFallback(st)) {
@@ -1511,6 +1693,21 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DESTROY:
+            // 关闭时记住位置/大小。GetWindowPlacement 的 rcNormalPosition 是
+            // 「还原态」矩形，全屏/最大化时保存的也仍是上次的窗口位置。
+            SaveVideoWindowPlacement(hwnd);
+            KillTimer(hwnd, 3);
+            if (st && !st->history_id.empty()) {
+                const double pos = CurrentPosition(st);
+                const double dur = EffectiveDuration(st);
+                UpdateVideoHistoryProgress(
+                    st->history_id, st->current_ep,
+                    pos > 0.0 ? static_cast<int>(pos * 1000) : 0,
+                    dur > 0.0 ? static_cast<int>(dur * 1000) : 0);
+                AppendUiLog("HISTORY close save id=" +
+                            core::WideToUtf8(st->history_id) + " pos=" +
+                            std::to_string(static_cast<int>(pos)) + "s");
+            }
             if (st && st->hls_shared) st->hls_shared->cancel = true;
             if (st) CloseProtocolSession(st);   // 协议插件会话（VPClose 内部 join）
             if (st && st->backend) st->backend->Close();
@@ -1521,6 +1718,25 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st) {
                 st->got_ready = true;
                 st->playing = true;
+                st->auto_source_tried = 0;   // 出画面即视为本条线路可用
+                st->same_src_retry_index = -1;   // 下一条故障线路仍可同源重试
+                st->resolve_retry_pending = false;
+                KillTimer(hwnd, 2);
+                // 续播：首帧就绪后跳到上次位置（只跳一次；换集/换片会重置）。
+                if (!st->start_applied && st->pending_start_ms > 1) {
+                    st->start_applied = true;
+                    double target = st->pending_start_ms / 1000.0;
+                    const double dur = EffectiveDuration(st);
+                    if (dur > 0.0)
+                        target = std::min(target, std::max(0.0, dur - 2.0));
+                    if (target > 1.0) {
+                        SeekTo(st, target);
+                        AppendUiLog("HISTORY resume " +
+                                    std::to_string(static_cast<int>(target)) +
+                                    "s id=" + core::WideToUtf8(st->history_id));
+                    }
+                    st->pending_start_ms = 0;
+                }
                 // 协议插件解析/缓冲期间用过这两个标志；出画面后必须清掉，
                 // 否则中央浮层会一直盖着「正在解析…/正在缓冲 0%」。
                 st->resolving = false;
@@ -1634,6 +1850,26 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             L"也可点标题栏「切换源」换一条 m3u8/mp4 直链线路。";
                     }
                 }
+                // 同集还有其它线路时，解码/网络错误也自动换下一条：这类错误
+                // 同样常是本条线路的问题（直播看板分片 404、CDN 丢包），
+                // 以前只提示错误、要用户手动点「切换源」。
+                // 只在「这一条从没出过画面」或「重开一次后仍失败」时换，
+                // 避免把偶发的解码抖动当成线路故障。
+                if (!st->web_mode && (!st->got_ready || st->error_retried) &&
+                    st->sources.size() > 1 && st->source_index >= 0 &&
+                    st->auto_source_tried + 1 <
+                        static_cast<int>(st->sources.size())) {
+                    ++st->auto_source_tried;
+                    const int next =
+                        (st->source_index + 1) %
+                        static_cast<int>(st->sources.size());
+                    AppendUiLog("AUTO next source after play error #" +
+                                std::to_string(next + 1) + " " +
+                                core::WideToUtf8(st->sources[next].name));
+                    OpenSourceAt(st, next);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 // 网页线路解析/代理播放失败：同样回退到内嵌网页播放。
                 if (TryStartWebFallback(st)) {
                     InvalidateRect(hwnd, nullptr, FALSE);
@@ -1643,6 +1879,10 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+        case WM_EXITSIZEMOVE:
+            // 拖动/缩放结束就落盘：即使进程随后被强杀，下次仍回到这个位置。
+            SaveVideoWindowPlacement(hwnd);
+            break;
         case WM_SIZE:
             LayoutPlayer(st);
             ApplyWindowRegionForState(st);  // 与 ToggleFullscreen 同一个入口，不再三处重复
@@ -1931,6 +2171,30 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const int vx = std::max(fill.right, st->vol_slider.left);
                     FillEllipseAA(dc, {vx - 6, cy - 6, vx + 6, cy + 6}, kVidText);
                 }
+                // 选集（剧集才有）：显示当前集名，点开列出全部集数。
+                if (st->episodes.size() > 1 &&
+                    st->episode_btn.right > st->episode_btn.left) {
+                    const bool hot = st->hover_id == 8;
+                    theme::DrawRoundedBox(dc, st->episode_btn,
+                                          hot ? kVidAccentHot : kVidHot,
+                                          kVidBarLine, 4);
+                    std::wstring label = L"选集";
+                    // 当前集：按 URL 匹配，匹配不到就只显示「选集」。
+                    for (const auto& ep : st->episodes) {
+                        if (st->source_index >= 0 &&
+                            st->source_index <
+                                static_cast<int>(st->sources.size()) &&
+                            ep.url == st->sources[st->source_index].url &&
+                            !ep.title.empty()) {
+                            label = ep.title;
+                            break;
+                        }
+                    }
+                    if (label.size() > 8) label = label.substr(0, 7) + L"…";
+                    theme::DrawTextIn(dc, st->episode_btn, label.c_str(),
+                                      kVidText, PlayerSmallFont(),
+                                      theme::kCenterFormat);
+                }
                 // 切换源（控制栏内，紧挨全屏键）：按钮直接显示当前线路名，
                 // 点击弹菜单列出全部线路名供选择，不再只是循环切下一个。
                 if (st->sources.size() > 1 &&
@@ -2058,9 +2322,17 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (PtInRect(&st->content, p)) {
                 // 双击画面切换全屏（渲染子窗口已禁用，点击能落到这里）。
                 const DWORD now = GetMessageTime();
-                if (st->last_click_time != 0 &&
-                    now - st->last_click_time < GetDoubleClickTime())
+                const bool double_clicked =
+                    st->last_click_time != 0 &&
+                    now - st->last_click_time < GetDoubleClickTime();
+                if (double_clicked) {
+                    // 双击不是「单击暂停」：取消已挂起的切换，且本次抬起不再
+                    // 触发暂停（否则双击会「暂停→继续」闪一下）。
+                    st->pending_content_toggle = false;
+                    st->content_double_clicked = true;
+                    KillTimer(hwnd, 3);
                     ToggleFullscreen(st);
+                }
                 st->last_click_time = now;
             }
             break;
@@ -2099,10 +2371,20 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == 1 && PtInRect(&st->close_btn, p)) DestroyWindow(hwnd);
             else if (id == 4 && PtInRect(&st->fs_btn, p)) ToggleFullscreen(st);
             else if (id == 7 && PtInRect(&st->source_btn, p)) ShowSourceMenu(st);
+            else if (id == 8 && PtInRect(&st->episode_btn, p)) ShowEpisodeMenu(st);
             else if (id == 2 && PtInRect(&st->play_btn, p)) {
                 SetPlayingNow(st, !IsPlayingNow(st));
             } else if (id == 3 && PtInRect(&st->vol_btn, p)) {
                 ToggleMuteNow(st);
+            } else if (id == 0 && PtInRect(&st->content, p)) {
+                // 单击画面中间：暂停 / 继续。延后一个双击间隔再执行，避免与
+                // 「双击全屏」抢同一次点击（双击时由 WM_LBUTTONDOWN 取消）。
+                if (st->content_double_clicked) {
+                    st->content_double_clicked = false;
+                } else {
+                    st->pending_content_toggle = true;
+                    SetTimer(hwnd, 3, GetDoubleClickTime(), nullptr);
+                }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
@@ -2156,7 +2438,53 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case WM_TIMER:
+            if (st && wp == 3) {
+                // 单击画面的延迟动作：双击已被取消时这里不会执行。
+                KillTimer(hwnd, 3);
+                if (st->pending_content_toggle) {
+                    st->pending_content_toggle = false;
+                    SetPlayingNow(st, !IsPlayingNow(st));
+                    AppendUiLog(std::string("CLICK center toggle playing=") +
+                                (IsPlayingNow(st) ? "1" : "0"));
+                    if (st->footer.bottom > st->footer.top)
+                        InvalidateRect(hwnd, &st->footer, FALSE);
+                }
+                return 0;
+            }
+            if (st && wp == 2) {
+                // 同源重试定时器：与主刷新定时器（id=1）分开，避免互相顶掉。
+                KillTimer(hwnd, 2);
+                if (st->resolve_retry_pending) {
+                    st->resolve_retry_pending = false;
+                    AppendUiLog("RETRY reopen source #" +
+                                std::to_string(st->source_index + 1));
+                    OpenSourceAt(st, st->source_index);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (st) {
+                // 观看历史进度（播放列表「视频」栏目续播）：10 秒落盘一次，
+                // 关窗时再补一次。写失败/没有 id 时静默忽略。
+                if (!st->history_id.empty() &&
+                    GetTickCount() - st->last_history_save > 10000) {
+                    st->last_history_save = GetTickCount();
+                    const double pos = CurrentPosition(st);
+                    const double dur = EffectiveDuration(st);
+                    UpdateVideoHistoryProgress(
+                        st->history_id, st->current_ep,
+                        pos > 0.0 ? static_cast<int>(pos * 1000) : 0,
+                        dur > 0.0 ? static_cast<int>(dur * 1000) : 0);
+                }
+                // 隐藏嗅探窗口超时：页面脚本没能自己算出直链 → 显示网页，
+                // 退回原来的「内嵌网页播放」形态（不额外提示，行为不变）。
+                if (st->web_mode && st->web_resolve_hidden &&
+                    GetTickCount() >= st->web_resolve_deadline) {
+                    st->web_resolve_hidden = false;
+                    if (st->web_host) st->web_host->Resize(st->content);
+                    AppendUiLog("WEB reveal after sniff timeout");
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 AdvancePlayClock(st);
                 // 视频元数据（DAR）可能晚于首帧到达：轮询到变化时重排渲染窗口，
                 // 否则视频会用「比例未知 = 铺满」的旧几何一直拉伸下去。
@@ -2576,6 +2904,15 @@ std::wstring BuildProtocolOptions(const PlayerState* st) {
         e["type"] = p.type;
         root["parses"].push_back(std::move(e));
     }
+    // 播放地址的内联请求头（Referer/Cookie/Origin…）：MEDIA 中转插件按原样带给上游。
+    // 网页/HLS 插件只用 user_agent/referer，不认识这个字段也无害。
+    if (!st->open_headers.empty()) {
+        nlohmann::json headers = nlohmann::json::object();
+        for (const auto& kv : st->open_headers)
+            if (!kv.first.empty() && !kv.second.empty())
+                headers[kv.first] = kv.second;
+        root["headers"] = std::move(headers);
+    }
     return core::Utf8ToWide(root.dump());
 }
 
@@ -2709,6 +3046,9 @@ bool StartProtocolPlayback(PlayerState* st, ProtocolSession* session,
 // 切到下一条线路并重新打开（保留给键盘/其它调用；控制栏按钮已改走菜单）。
 void SwitchSource(PlayerState* st) {
     if (!st || st->sources.size() < 2) return;
+    st->auto_source_tried = 0;   // 用户手动换线：重置自动兜底计数
+    st->same_src_retry_index = -1;
+    st->resolve_retry_pending = false;
     const int next = (st->source_index + 1) %
                      static_cast<int>(st->sources.size());
     OpenSourceAt(st, next);
@@ -2744,9 +3084,91 @@ void ShowSourceMenu(PlayerState* st) {
             AppendUiLog("SOURCE menu pick=" + std::to_string(index) +
                         " name=" + core::WideToUtf8(
                             st->sources[index].name));
+            st->auto_source_tried = 0;   // 用户手动选线：重置自动兜底计数
+            st->same_src_retry_index = -1;
+            st->resolve_retry_pending = false;
             OpenSourceAt(st, index);
         }
     }
+}
+
+// 控制栏「选集」：列出整部剧的集数，选中后**在同一个播放窗内**切集。
+// 以前切换到新一集只能回音乐窗的「剧集」再点一次；电影只有切换源，剧集
+// 在播放窗里没有任何换集入口。
+void ShowEpisodeMenu(PlayerState* st) {
+    if (!st || !st->hwnd || st->episodes.size() < 2) return;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    // 菜单过长时 Windows 会滚动；这里再限 400 条，避免极端剧集把菜单撑爆。
+    const std::size_t limit = std::min<std::size_t>(st->episodes.size(), 400);
+    // 当前正在播的集：按「当前源地址 == 集地址」精确匹配（换源后地址可能变化，
+    // 只有真正同一集才该打勾，不能简单用下标兜底）。
+    int current_episode = -1;
+    {
+        std::wstring playing_url;
+        if (st->source_index >= 0 &&
+            st->source_index < static_cast<int>(st->sources.size()))
+            playing_url = st->sources[static_cast<std::size_t>(st->source_index)].url;
+        // 一集可能有多个线路地址：当前播的地址命中任意一条都算这一集
+        // （否则在「切换源」换过线之后，选集菜单会丢掉勾选）。
+        for (std::size_t i = 0; i < limit && !playing_url.empty(); ++i) {
+            if (st->episodes[i].url == playing_url) {
+                current_episode = static_cast<int>(i);
+                break;
+            }
+            for (const auto& source : st->episodes[i].sources) {
+                if (source.url == playing_url) {
+                    current_episode = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (current_episode >= 0) break;
+        }
+        // 地址被清洗/解析改写过时按记录的下标兜底。
+        if (current_episode < 0 && st->current_ep >= 0 &&
+            st->current_ep < static_cast<int>(limit))
+            current_episode = st->current_ep;
+    }
+    for (std::size_t i = 0; i < limit; ++i) {
+        std::wstring label = st->episodes[i].title.empty()
+                                 ? L"第 " + std::to_wstring(i + 1) + L" 集"
+                                 : st->episodes[i].title;
+        if (label.size() > 48) label = label.substr(0, 47) + L"…";
+        UINT flags = MF_STRING | MF_ENABLED;
+        // 与「切换源」菜单同款：当前播放的集前面打勾。
+        if (static_cast<int>(i) == current_episode) flags |= MF_CHECKED;
+        AppendMenuW(menu, flags, static_cast<UINT_PTR>(i + 1), label.c_str());
+    }
+    POINT pt{st->episode_btn.left, st->episode_btn.top};
+    ClientToScreen(st->hwnd, &pt);
+    TouchInput(st);
+    AppendUiLog("EPISODE menu items=" + std::to_string(limit) + " checked=" +
+                std::to_string(current_episode) + " first=" +
+                core::WideToUtf8(st->episodes.front().title));
+    // 复用「菜单打开」标志：菜单期间控制条不自动隐藏（与切换源一致）。
+    st->source_menu_open = true;
+    const int cmd = static_cast<int>(TrackPopupMenu(
+        menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x, pt.y, 0, st->hwnd, nullptr));
+    st->source_menu_open = false;
+    DestroyMenu(menu);
+    if (cmd <= 0) return;
+    const std::size_t index = static_cast<std::size_t>(cmd - 1);
+    if (index >= st->episodes.size()) return;
+    // 拷贝一份：ShowVideoPlayer 复用同一窗口时会整体覆盖 st->episodes。
+    const VideoPlayerEpisode ep = st->episodes[index];
+    if (ep.url.empty()) return;
+    AppendUiLog("EPISODE pick=" + std::to_string(index) + " name=" +
+                core::WideToUtf8(ep.title));
+    const std::wstring history_id = st->history_id;
+    ShowVideoPlayer(
+        st->hwnd, ep.url, st->base_title, ep.line, st->browser_skin,
+        st->open_headers, ep.sources.empty() ? st->sources : ep.sources,
+        st->parses, st->player_url, st->player_base_url, st->episodes,
+        0, history_id);
+    // 换集后进度从 0 开始：立即落盘，避免历史里仍是上一集的位置。
+    if (!history_id.empty())
+        UpdateVideoHistoryProgress(history_id, static_cast<int>(index), 0, 0);
 }
 
 namespace {
@@ -2820,6 +3242,7 @@ void OpenSourceAt(PlayerState* st, int index) {
     st->source_index = index;
     // 换线路 / 重新打开源：先拆掉上一条线路的网页宿主，否则旧网页会盖在新源上。
     st->web_host.reset();
+    st->web_resolve_hidden = false;
     const bool was_web = st->web_mode;
     st->web_mode = false;
     if (was_web) AppendUiLog("MODE web=0 (switch to native)");
@@ -3176,13 +3599,31 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
                      const std::vector<VideoPlayerSource>& sources,
                      const std::vector<VideoParse>& parses,
                      const std::string& player_url,
-                     const std::string& player_base_url) {
+                     const std::string& player_base_url,
+                     const std::vector<VideoPlayerEpisode>& episodes,
+                     int start_ms, const std::wstring& history_id) {
+    // 当前集下标：历史记录用它续播「第 N 集」，切集后也据此更新。
+    auto find_episode = [](const std::vector<VideoPlayerEpisode>& eps,
+                           const std::wstring& target) -> int {
+        for (size_t i = 0; i < eps.size(); ++i)
+            if (!eps[i].url.empty() && eps[i].url == target)
+                return static_cast<int>(i);
+        return eps.empty() ? -1 : 0;
+    };
     // ── 复用已打开的播放窗 ──────────────────────────────────────────
     // 点另一集 / 另一部片时不再叠一个新窗口：直接让现有播放窗切到新地址、
     // 更新标题与线路表，并置于前台（用户要求「在原有窗口播放」）。
     if (g_player && IsWindow(g_player->hwnd)) {
         PlayerState* st = g_player;
         st->owner = owner;
+        st->base_title = title;
+        // 选集列表：切集/切片都要刷新（电影传空 → 隐藏「选集」按钮）。
+        st->episodes = episodes;
+        st->current_ep = find_episode(episodes, url);
+        st->history_id = history_id;
+        st->pending_start_ms = start_ms;
+        st->start_applied = false;
+        st->last_history_save = GetTickCount();
         st->title_text = L"千千静听 · " +
                          (title.empty() ? std::wstring(L"视频播放") : title);
         st->open_headers = headers;
@@ -3224,6 +3665,10 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
             }
         }
         st->line_label = line_label;
+        st->auto_source_tried = 0;   // 新一集/新片：重新允许自动换线兜底
+        st->same_src_retry_index = -1;
+        st->resolve_retry_pending = false;
+        KillTimer(st->hwnd, 2);
         st->error_text.clear();
         st->web_host.reset();
         st->web_mode = false;
@@ -3260,6 +3705,12 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
     auto* st = new PlayerState();
     st->owner = owner;
     st->app_icon = app_icon;
+    st->base_title = title;
+    st->episodes = episodes;   // 剧集选集列表（电影为空）
+    st->current_ep = find_episode(episodes, url);
+    st->history_id = history_id;
+    st->pending_start_ms = start_ms;
+    st->last_history_save = GetTickCount();
     // 标题栏带应用名前缀，左上角（图标 + 应用名 + 片名）形成完整窗口标识。
     st->title_text = L"千千静听 · " +
                      (title.empty() ? std::wstring(L"视频播放") : title);
@@ -3307,15 +3758,56 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
     }
     if (st->skinned)
         st->skin_transparent = frame::TransparentColor(nullptr, *browser_skin);
+    st->auto_source_tried = 0;   // 新一集/新片：重新允许自动换线兜底
+    st->same_src_retry_index = -1;
+    st->resolve_retry_pending = false;
     // WS_CLIPCHILDREN：video_host（MF 渲染面子窗口）区域不被父窗重绘覆盖，
     // 否则播放中任何一次窗口重绘都会先把画面刷黑再恢复（肉眼可见的闪烁）。
     const DWORD style = (st->skinned ? (WS_POPUP | WS_VISIBLE)
                                      : (WS_POPUP | WS_VISIBLE | WS_THICKFRAME)) |
                         WS_CLIPCHILDREN;
+    // 恢复上次的位置/大小（首次运行仍用系统默认位置）。保存的坐标可能因换
+    // 显示器/分辨率整体落在屏幕外，这时夹回主屏工作区，避免「打开了却看不见」。
+    int win_x = CW_USEDEFAULT, win_y = CW_USEDEFAULT, win_w = 880, win_h = 540;
+    bool restore_maximized = false;
+    RECT saved{};
+    if (LoadVideoWindowPlacement(&saved, &restore_maximized)) {
+        const int w = saved.right - saved.left;
+        const int h = saved.bottom - saved.top;
+        if (!MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(
+                    MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY),
+                    &mi)) {
+                const int work_w = mi.rcWork.right - mi.rcWork.left;
+                const int work_h = mi.rcWork.bottom - mi.rcWork.top;
+                win_w = std::min(w, work_w - 48);
+                win_h = std::min(h, work_h - 48);
+                win_x = mi.rcWork.left + 24;
+                win_y = mi.rcWork.top + 24;
+            }
+        } else {
+            win_x = saved.left;
+            win_y = saved.top;
+            win_w = w;
+            win_h = h;
+        }
+    }
+    // ⚠ 父/属主窗口传 nullptr：主窗口最小化时不能把播放窗一起最小化
+    // （用户要求「最小化主窗口，播放窗继续显示」）。WS_EX_APPWINDOW 仍让
+    // 它出现在任务栏；owner 参数只保留给「选集」菜单之类的弹窗归属。
     st->hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"TTPlayerVideoPlayerWnd", L"",
-        style, CW_USEDEFAULT, CW_USEDEFAULT, 880, 540, owner, nullptr,
+        style, win_x, win_y, win_w, win_h, nullptr, nullptr,
         GetModuleHandleW(nullptr), st);
     if (!st->hwnd) { delete st; return; }
+    // 诊断：入口 / 皮肤 / 选集数量（排查「两个入口样式不一致」时先看这行）。
+    AppendUiLog(std::string("PLAYER open skinned=") +
+                (st->skinned ? "1" : "0") + " episodes=" +
+                std::to_string(st->episodes.size()) + " history=" +
+                (st->history_id.empty() ? "0" : "1") + " resume=" +
+                std::to_string(st->pending_start_ms));
+    if (restore_maximized) ShowWindow(st->hwnd, SW_MAXIMIZE);
     if (app_icon) {
         SendMessageW(st->hwnd, WM_SETICON, ICON_SMALL,
                      reinterpret_cast<LPARAM>(app_icon));

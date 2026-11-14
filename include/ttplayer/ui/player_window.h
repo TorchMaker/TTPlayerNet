@@ -104,6 +104,8 @@ public:
     // 必须在 musicfree 音源挂载之后调用（见 app/application.cpp 的
     // LoadMusicFreeSourcesOnStartup），否则音乐窗里一个可用音源都没有。
     void RestoreStartupMusicBrowserWindow();
+    // 自动恢复的音乐窗在音源挂载完成前打开，页面数据可能为空：就绪后重载一次。
+    void RefreshAutoRestoredMusicBrowser();
     [[nodiscard]] bool PreTranslateMessage(const MSG& message) const;
     // 幂等。由启动消息补建三个辅助窗口；用户更早输入时消息过滤器也会调用。
     void CreateStartupAuxWindows();
@@ -709,10 +711,22 @@ private:
     void CancelPlaylistScrollbarInteraction(bool release_capture);
     void LoadStoredPlaylist();
     void SaveStoredPlaylist();
+    // 播放列表里的「视频」栏目（不可删除）：内容来自 <exe>\video\history.json，
+    // 看过的视频/剧集自动进入这里，双击按保存的解析结果 + 进度续播。
+    void EnsureVideoPlaylist();
+    void RefreshVideoPlaylist();
+    [[nodiscard]] std::optional<size_t> VideoPlaylistIndex() const;
+    [[nodiscard]] bool IsVideoPlaylist(size_t index) const;
     void CaptureWindowState();
     void SaveCurrentSkinProfile();
     [[nodiscard]] std::filesystem::path CurrentSkinProfilePath() const;
     void PersistWindowState();
+    // 只把「布局/可见性」写回磁盘（不含播放身份等退出时字段）。音乐窗
+    // 移动/关闭后立即调用，保证进程被强杀也能恢复上次的位置与开关状态。
+    void SaveWindowStateSnapshot();
+    // 音乐窗移动/关闭后的延迟落盘（合并连续拖动产生的大量 WM_MOVE）。
+    void ScheduleMusicBrowserStateSave();
+    void PersistMusicBrowserState();
     void RefreshPlaybackUi();
     void UpdateDiscordPresence();
     void RebuildSkinInfoItems(bool include_audio_details);
@@ -1044,6 +1058,8 @@ private:
     bool context_menu_open_{};
     HWND main_context_menu_origin_{};
     bool window_state_saved_{};
+    // 本次启动是「自动恢复」开的音乐窗（音源就绪后需要刷新页面数据）。
+    bool music_browser_auto_restored_{};
     int volume_before_mute_{100};
     int transparency_percent_{};
     BYTE skin_window_alpha_{255};

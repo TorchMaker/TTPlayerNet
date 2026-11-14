@@ -227,6 +227,7 @@ set(TTPLAYER_VIDEO_SOURCES
   src/video/video_source_manager.cpp
   src/video/video_source_dialog.cpp
   src/video/video_player_window.cpp
+  src/video/video_history.cpp
   src/video/video_protocol_registry.cpp
   src/video/video_module.cpp
   src/video/spider/spider_api.cpp
@@ -303,6 +304,15 @@ target_compile_definitions(video_protocol_m3u PRIVATE UNICODE _UNICODE NOMINMAX 
 target_compile_options(video_protocol_m3u PRIVATE /W4 /permissive- /EHsc /utf-8)
 target_link_libraries(video_protocol_m3u PRIVATE ws2_32 winhttp)
 
+# 直链媒体中转：mp4/flv/mkv… + 自定义请求头（Referer/Cookie）→ 本地 Range 代理。
+# MF 窗口化引擎不能带请求头，B 站等防盗链 CDN 必须经由这层。
+add_library(video_protocol_media SHARED src/video/protocols/protocol_media.cpp)
+set_target_properties(video_protocol_media PROPERTIES OUTPUT_NAME "ttp_v_media")
+target_include_directories(video_protocol_media PUBLIC include)
+target_compile_definitions(video_protocol_media PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(video_protocol_media PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_link_libraries(video_protocol_media PRIVATE ws2_32 winhttp)
+
 # 视频协议插件全链路自测：加载 ttp_v_hls / ttp_v_web，打开会话、轮询就绪、
 # 抓取最终媒体地址（TS 本地流）的字节并校验 MPEG-TS 同步字节。
 add_executable(selftest_video tools/selftest_video.cpp)
@@ -324,7 +334,7 @@ add_executable(video_search_probe tools/video_search_probe.cpp)
 target_include_directories(video_search_probe PRIVATE include)
 target_compile_definitions(video_search_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(video_search_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
-target_link_libraries(video_search_probe PRIVATE ttplayer_core)
+target_link_libraries(video_search_probe PRIVATE ttplayer_core ttplayer_video)
 
 # 图片解码插件自测：加载 ttp_i_webp.dll，解码真实缓存封面并校验/导出 BMP。
 add_executable(selftest_image tools/selftest_image.cpp)
@@ -1225,7 +1235,8 @@ add_custom_target(ttpres_resources ALL
 # Keep the intermediate resource products for tests/inspection, then stage the
 # exact runtime layout into every single- or multi-config output directory.
 add_dependencies(ttplayer_rebuild ttpres_resources video_protocol_hls
-                 video_protocol_web video_protocol_dash video_protocol_m3u)
+                 video_protocol_web video_protocol_dash video_protocol_m3u
+                 video_protocol_media)
 add_custom_command(TARGET ttplayer_rebuild POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/../ttpcomm.dll"

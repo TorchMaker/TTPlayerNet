@@ -381,6 +381,91 @@ public:
     }
 };
 
+// 页面直链嗅探脚本：hook fetch / XHR / <video src> / hls.js，把发现的媒体
+// 地址回推给宿主（TTPMS:<url>）。Bttwoo 这类站的播放地址由页面里的 WASM
+// build_play_url() 现算，HTTP 层抓不到；在页面里盯住最终请求即可拿到。
+const wchar_t* kMediaSniffScript = LR"TTPJS(
+(function () {
+  'use strict';
+  var sent = {};
+  function report(u) {
+    try {
+      if (!u || typeof u !== 'string') return;
+      var s = u.trim();
+      if (!s) return;
+      if (s.indexOf('//') === 0) s = (location.protocol || 'https:') + s;
+      if (!/^https?:/i.test(s)) return;
+      if (!/\.(m3u8|mp4|flv|m4v)(\?|#|$)/i.test(s)) return;
+      if (sent[s]) return;
+      sent[s] = 1;
+      if (window.chrome && window.chrome.webview)
+        window.chrome.webview.postMessage('TTPMS:' + s);
+    } catch (e) {}
+  }
+  function scanText(t) {
+    try {
+      var s = String(t || '').replace(/\\\//g, '/');
+      var m = s.match(/https?:\/\/[^"'\s\\]+?\.(?:m3u8|mp4|flv|m4v)[^"'\s\\]*/i);
+      if (m) report(m[0]);
+    } catch (e) {}
+  }
+  try {
+    var of = window.fetch;
+    if (typeof of === 'function') {
+      window.fetch = function (input) {
+        try {
+          var u = typeof input === 'string' ? input : (input && input.url);
+          if (u) report(new URL(u, location.href).href);
+        } catch (e) {}
+        var p = of.apply(this, arguments);
+        try {
+          p.then(function (res) {
+            try {
+              if (!res || !res.clone) return;
+              var ct = (res.headers && res.headers.get('content-type')) || '';
+              if (ct.indexOf('json') < 0 && ct.indexOf('text') < 0 &&
+                  ct.indexOf('javascript') < 0) return;
+              res.clone().text().then(scanText).catch(function () {});
+            } catch (e) {}
+          }).catch(function () {});
+        } catch (e) {}
+        return p;
+      };
+    }
+  } catch (e) {}
+  try {
+    var xo = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      try { if (u) report(new URL(u, location.href).href); } catch (e) {}
+      return xo.apply(this, arguments);
+    };
+    var xs = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function () {
+      var self = this;
+      try {
+        self.addEventListener('load', function () {
+          try { scanText(self.responseText); } catch (e) {}
+        });
+      } catch (e) {}
+      return xs.apply(this, arguments);
+    };
+  } catch (e) {}
+  try {
+    var d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (d && d.set) {
+      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+        configurable: true,
+        get: d.get,
+        set: function (v) {
+          try { report(v); } catch (e) {}
+          return d.set.call(this, v);
+        }
+      });
+    }
+  } catch (e) {}
+})();
+)TTPJS";
+
 // 每个文档创建时注入。站点播放器（ArtPlayer / DPlayer / xgplayer / Plyr /
 // bilibili / 腾讯 / 优酷…）的进度条、播放框、全屏按钮一律隐藏；只留 <video>
 // 画面。宿主的自绘控制条通过 window.__ttpVideo() 拿元素并操控。
@@ -526,6 +611,9 @@ struct Impl : std::enable_shared_from_this<Impl> {
     EventRegistrationToken tok_ctx{};
     bool has_ctx = false;
     std::function<void(bool)> fullscreen_cb;
+    // 页面直链嗅探回调（TTPMS: 消息）。宿主播放窗用它把网页切换成原生播放。
+    std::function<void(const std::string&)> sniff_cb;
+    bool sniff_sent = false;   // 只回推第一条媒体地址，避免连续切源
     std::function<void(const ttplayer::video::VideoWebState&)> state_cb;
     // AddScriptToExecuteOnDocumentCreated 也会注入同源/跨域子 iframe。没有
     // <video> 的框架同样每 250ms 回推 has_video=0，若不屏蔽会把主框架报的
@@ -676,6 +764,18 @@ void Impl::OnController(HRESULT hr, ICoreWebView2Controller* c) {
     }
     inject_cb->Release();
 
+    // 直链嗅探脚本：必须尽早注入（在页面自己的脚本之前 hook fetch）。
+    ComAddScriptDone* sniff_inject = new ComAddScriptDone(
+        [](HRESULT hr, LPCWSTR) {
+            if (FAILED(hr))
+                AppendVideoHostLog("注入直链嗅探脚本失败" + HrText(hr));
+        });
+    if (FAILED(core->AddScriptToExecuteOnDocumentCreated(
+            kMediaSniffScript, sniff_inject))) {
+        AppendVideoHostLog("注册直链嗅探脚本失败（网页无法自动切原生）");
+    }
+    sniff_inject->Release();
+
     msg_evt = new ComWebMsg(
         [self](ICoreWebView2WebMessageReceivedEventArgs* a) {
             self->OnWebMessage(a);
@@ -761,6 +861,34 @@ void Impl::OnWebMessage(ICoreWebView2WebMessageReceivedEventArgs* args) {
     if (FAILED(args->get_WebMessageAsJson(&raw)) || !raw) return;
     const std::wstring text(raw);
     CoTaskMemFree(raw);
+    // 直链嗅探回推：注入脚本发 'TTPMS:<url>'，get_WebMessageAsJson 会包成
+    // JSON 字符串（两侧引号、`/` 可能被转义）。只认第一条，之后忽略。
+    if (const std::size_t mp = text.find(L"TTPMS:");
+        mp != std::wstring::npos) {
+        if (sniff_sent) return;
+        std::wstring u = text.substr(mp + 6);
+        std::wstring fixed;
+        fixed.reserve(u.size());
+        for (std::size_t i = 0; i < u.size(); ++i) {
+            if (u[i] == L'\\' && i + 1 < u.size() && u[i + 1] == L'/') {
+                fixed.push_back(L'/');
+                ++i;
+            } else {
+                fixed.push_back(u[i]);
+            }
+        }
+        while (!fixed.empty() && (fixed.back() == L'"' || fixed.back() == L'\r' ||
+                                  fixed.back() == L'\n' || fixed.back() == L' '))
+            fixed.pop_back();
+        if (!fixed.empty() && sniff_cb) {
+            sniff_sent = true;
+            try {
+                sniff_cb(WideToUtf8(fixed));
+            } catch (...) {
+            }
+        }
+        return;
+    }
     const std::wstring prefix = L"TTPVS:";
     const std::size_t at = text.find(prefix);
     if (at == std::wstring::npos) return;
@@ -851,6 +979,10 @@ public:
     }
     void SetFullscreenCallback(std::function<void(bool)> fn) override {
         if (impl_) impl_->fullscreen_cb = std::move(fn);
+    }
+    void SetMediaSniffCallback(
+        std::function<void(const std::string&)> fn) override {
+        if (impl_) impl_->sniff_cb = std::move(fn);
     }
 
     void Seek(double seconds) override {

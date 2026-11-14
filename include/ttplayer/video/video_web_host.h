@@ -31,6 +31,12 @@ class VideoWebHost {
   virtual void SetFullscreenCallback(std::function<void(bool)> fn) {
     (void)fn;
   }
+  // 页面直链嗅探：注入脚本 hook fetch/XHR/<video src>/hls.js，发现 m3u8、mp4
+  // 等媒体地址就回推。宿主播放窗拿到后关掉网页、切回原生播放（Bttwoo 这类
+  // 「直链由页面 WASM/JS 现算」的站点只靠 HTTP 解析拿不到地址）。
+  virtual void SetMediaSniffCallback(std::function<void(const std::string&)> fn) {
+    (void)fn;
+  }
   // ── 自定义控制条驱动网页播放器 ──────────────────────────────────────
   // 用户要求「不要使用 web 视频的进度条和播放框，使用自定义的」：
   // WebView2 仍只当渲染面，站点自带控件由注入脚本隐藏；播放/暂停/跳转/音量

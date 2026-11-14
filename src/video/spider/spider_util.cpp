@@ -355,6 +355,34 @@ std::string Md5Hex(std::string_view data) { return HashHex(CALG_MD5, data); }
 std::string Sha1Hex(std::string_view data) { return HashHex(CALG_SHA1, data); }
 std::string Sha256Hex(std::string_view data) { return HashHex(CALG_SHA_256, data); }
 
+std::string HmacSha256Hex(std::string_view key, std::string_view data) {
+    // 不依赖 CALG_HMAC（部分 Crypto provider 不支持）。按 RFC 2104 手工拼：
+    //   K' = SHA256(K)（K>64B）否则补零到 64B
+    //   HMAC = SHA256((K'^opad) || SHA256((K'^ipad) || data))
+    std::string k(key);
+    if (k.size() > 64) {
+        const std::string digest = Sha256Hex(k);
+        std::string bytes;
+        if (!HexDecode(digest, &bytes)) return {};
+        k = std::move(bytes);
+    }
+    k.resize(64, '\0');
+    std::string ipad = k;
+    std::string opad = k;
+    for (size_t i = 0; i < 64; ++i) {
+        ipad[i] = static_cast<char>(ipad[i] ^ 0x36);
+        opad[i] = static_cast<char>(opad[i] ^ 0x5c);
+    }
+    std::string inner_input = ipad;
+    inner_input.append(data);
+    const std::string inner_hex = Sha256Hex(inner_input);
+    std::string inner;
+    if (!HexDecode(inner_hex, &inner)) return {};
+    std::string outer_input = opad;
+    outer_input.append(inner);
+    return Sha256Hex(outer_input);
+}
+
 std::string AesCbcDecrypt(std::string_view key, std::string_view iv,
                           std::string_view ciphertext) {
     if (key.empty() || iv.empty() || ciphertext.empty()) return {};

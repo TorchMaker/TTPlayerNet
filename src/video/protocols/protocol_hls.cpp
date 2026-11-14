@@ -216,6 +216,26 @@ HINTERNET OpenGetRequest(HINTERNET con, const std::wstring& path, bool https,
     return req;
 }
 
+// 播放列表/分片地址里可能出现未编码的中文（如 .../hls/峡谷.m3u8）。WinHTTP
+// 的请求行必须是 ASCII，直接把宽字符塞进去会失败（表现为「拉取 m3u8 播放列表
+// 失败」）。这里按 UTF-8 把非 ASCII 字节转成 %XX，与浏览器行为一致。
+std::wstring EscapeNonAsciiUrl(const std::wstring& url) {
+    static const char* kHex = "0123456789ABCDEF";
+    const std::string utf8 = WideToAscii(url);
+    std::string out;
+    out.reserve(utf8.size() + 16);
+    for (unsigned char c : utf8) {
+        if (c >= 0x80) {
+            out += '%';
+            out += kHex[(c >> 4) & 0xF];
+            out += kHex[c & 0xF];
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return AsciiToWide(out);
+}
+
 // 通用 GET：跟随重定向（≤4 跳，跨协议重建连接）。
 bool HttpGet(const std::wstring& url, const std::wstring& user_agent,
              const std::wstring& referer, int timeout_ms, HttpResult* out) {
@@ -228,7 +248,7 @@ bool HttpGet(const std::wstring& url, const std::wstring& user_agent,
     uc.dwHostNameLength = 1;
     uc.dwUrlPathLength = 1;
     uc.dwExtraInfoLength = 1;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
+    if (!WinHttpCrackUrl(EscapeNonAsciiUrl(url).c_str(), 0, 0, &uc)) return false;
     bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
     std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
     std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
@@ -288,7 +308,7 @@ bool HttpGet(const std::wstring& url, const std::wstring& user_agent,
                 uc2.dwHostNameLength = 1;
                 uc2.dwUrlPathLength = 1;
                 uc2.dwExtraInfoLength = 1;
-                if (WinHttpCrackUrl(next.c_str(), 0, 0, &uc2)) {
+                if (WinHttpCrackUrl(EscapeNonAsciiUrl(next).c_str(), 0, 0, &uc2)) {
                     https = uc2.nScheme == INTERNET_SCHEME_HTTPS;
                     host.assign(uc2.lpszHostName, uc2.dwHostNameLength);
                     path.assign(uc2.lpszUrlPath, uc2.dwUrlPathLength);
@@ -341,7 +361,7 @@ bool HttpProbeSize(const std::wstring& url, const std::wstring& user_agent,
     uc.dwHostNameLength = 1;
     uc.dwUrlPathLength = 1;
     uc.dwExtraInfoLength = 1;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
+    if (!WinHttpCrackUrl(EscapeNonAsciiUrl(url).c_str(), 0, 0, &uc)) return false;
     const bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
     std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
     std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
@@ -438,6 +458,50 @@ bool HasFmp4BoxSignature(const std::vector<std::uint8_t>& d) {
         for (const char* t : kTypes)
             if (std::memcmp(d.data() + off, t, 4) == 0) return true;
     return false;
+}
+
+// 部分站点给分片套一层 PNG/JPEG 外壳反盗链：文件是合法图片，真正的 TS 数据
+// 追加在 IEND/EOI 之后（Content-Type 也是 image/png）。hls.js 不校验容器，
+// 但我们的 0x47 校验会判失败 → 整片「响应体为空」。这里在解密后、校验前
+// 找到 TS 同步起点并去掉外壳。
+void StripImageWrapper(std::vector<std::uint8_t>* data) {
+    if (!data || data->size() < 1024) return;
+    const auto& d = *data;
+    size_t from = 0;
+    bool image = false;
+    if (d.size() > 8 && d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E &&
+        d[3] == 0x47) {   // PNG: 找 IEND 块（len4+type4+data+crc4）
+        for (size_t i = 8; i + 12 <= d.size() && i < 65536; ++i) {
+            if (d[i] == 'I' && d[i + 1] == 'E' && d[i + 2] == 'N' &&
+                d[i + 3] == 'D') {
+                from = i + 12;
+                break;
+            }
+        }
+        image = true;
+    } else if (d[0] == 0xFF && d[1] == 0xD8) {   // JPEG: 找 EOI
+        for (size_t i = 2; i + 2 <= d.size() && i < (1u << 20); ++i) {
+            if (d[i] == 0xFF && d[i + 1] == 0xD9) {
+                from = i + 2;
+                break;
+            }
+        }
+        image = true;
+    }
+    if (!image) return;
+    // 在图片尾部 64KB 内找连续 3 个 188 字节对齐的 0x47。
+    size_t ts = std::string::npos;
+    const size_t limit = std::min(d.size(), from + 65536);
+    for (size_t off = from; off + 188 * 3 < d.size() && off < limit; ++off) {
+        if (d[off] != 0x47) continue;
+        if (d[off + 188] == 0x47 && d[off + 376] == 0x47) {
+            ts = off;
+            break;
+        }
+    }
+    if (ts == std::string::npos) return;
+    data->erase(data->begin(), data->begin() + static_cast<std::ptrdiff_t>(ts));
+    DBG("SEG 去掉图片外壳：offset=%zu 后按 TS 处理\n", ts);
 }
 
 // 分片合法性按容器分流：fMP4（有 #EXT-X-MAP）必须是 box 序列；
@@ -657,11 +721,29 @@ std::shared_ptr<std::vector<std::uint8_t>> WaitSegReady(
 bool FetchPlaylist(const std::wstring& url, const HlsState* st,
                    std::string* out) {
     HttpResult r;
-    if (!HttpGet(url, st->user_agent, st->referer, st->timeout_ms, &r))
+    const bool got = HttpGet(url, st->user_agent, st->referer,
+                             st->timeout_ms, &r);
+    // 解析失败的源必须能复盘：记下确实是哪一跳、什么状态码/字节数。
+    if (!got || r.body.empty()) {
+        ErrLog("PLAYLIST 抓取失败 url=%s got=%d status=%u bytes=%zu\n",
+               WideToAscii(url).substr(0, 200).c_str(),
+               got ? 1 : 0, static_cast<unsigned>(r.status),
+               r.body.size());
         return false;
-    if (r.body.size() > 4 * 1024 * 1024) return false;
+    }
+    if (r.body.size() > 4 * 1024 * 1024) {
+        ErrLog("PLAYLIST 过大 bytes=%zu url=%s\n", r.body.size(),
+               WideToAscii(url).substr(0, 200).c_str());
+        return false;
+    }
     out->assign(r.body.begin(), r.body.end());
-    return out->find("#EXTM3U") != std::string::npos;
+    if (out->find("#EXTM3U") == std::string::npos) {
+        ErrLog("PLAYLIST 非 m3u8 status=%u bytes=%zu head=%.120s\n",
+               static_cast<unsigned>(r.status), r.body.size(),
+               r.body.data());
+        return false;
+    }
+    return true;
 }
 
 // 按需获取并缓存 AES-128 key。key 文件常见尾部换行（先裁空白）；也有源
@@ -926,6 +1008,7 @@ void DownloadLoop(std::shared_ptr<HlsState> st) {
                 seg->index, (int)ok, data.size(), (int)seg->iv_explicit);
         }
         // 容器分流校验（解密之后）：fMP4 看 box 特征，TS 看 0x47 同步
+        if (ok) StripImageWrapper(&data);
         if (ok && !ValidateSegment(st->is_fmp4.load(), data)) ok = false;
         if (ok && !data.empty()) {
             // 记录解密去填充后的真实长度，供本地代理按字节范围拼接。

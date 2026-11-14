@@ -62,6 +62,7 @@
 #include "ttplayer/musicfree/musicfree_source_manager.h"
 #include "ttplayer/skin/skin.h"
 #include "ttplayer/video/video_cms.h"
+#include "ttplayer/video/video_history.h"
 #include "ttplayer/video/spider/spider_api.h"
 #include "ttplayer/video/video_player_js.h"
 #include "ttplayer/video/video_player_window.h"
@@ -195,12 +196,139 @@ std::atomic<bool> g_dialog_open{false};
 //
 // 字段按任务约定：id/title/cover/rate/from 必带（有值才带），site 是回传
 // video.open 做详情定位用的站点键，remarks/type/year 供卡片角标与筛选。
+// 影视源常用第三方图片代理（wsrv.nl / wsrv.io）包一层豆瓣等图床；实测本机
+// 到该代理经常 20s 超时，而原图直连 0.7s 就 200——表现为「有些封面空白」。
+// 这里把代理前缀剥掉，直接给原始图片地址。
+std::string UnwrapImageProxy(const std::string& url) {
+    std::string low = url;
+    for (auto& ch : low)
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    if (low.find("wsrv.nl") == std::string::npos &&
+        low.find("wsrv.io") == std::string::npos)
+        return url;
+    const std::size_t q = low.find("?url=");
+    if (q == std::string::npos) return url;
+    std::string inner = url.substr(q + 5);
+    if (const std::size_t amp = inner.find('&'); amp != std::string::npos)
+        inner.resize(amp);
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(inner.size());
+    for (std::size_t i = 0; i < inner.size(); ++i) {
+        if (inner[i] == '%' && i + 2 < inner.size()) {
+            const int h = hexval(inner[i + 1]), l = hexval(inner[i + 2]);
+            if (h >= 0 && l >= 0) {
+                out.push_back(static_cast<char>(h * 16 + l));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(inner[i]);
+    }
+    if (out.size() > 8 &&
+        (out.rfind("http://", 0) == 0 || out.rfind("https://", 0) == 0))
+        return out;
+    return url;
+}
+
+// ───────────────────────── 纯网盘源（学习型黑名单） ─────────────────
+//
+// 部分「搜搜」类源（优汐 / 抠抠 …）只有网盘分享链接（百度 / 夸克 / UC），
+// 详情永远拿不到可播放直链，点开必然失败。首次检测到（详情有线路、但经过
+// 网盘剔除后一行不剩）就把站点 key 记到 <exe>\video\cloud_sites.json，
+// 之后首页聚合 / 搜索 / 跨源扫描都跳过它，用户不会再点到「注定播不了」的卡片。
+// 想恢复这些源：删掉 cloud_sites.json 即可（下次点开还会重新学习）。
+std::mutex g_cloud_sites_mtx;
+std::set<std::string> g_cloud_sites;
+bool g_cloud_sites_loaded = false;
+
+std::filesystem::path CloudSitesPath() {
+    std::wstring exe_w(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, exe_w.data(),
+                                       static_cast<DWORD>(exe_w.size()));
+    if (n == 0 || n >= exe_w.size()) return {};
+    exe_w.resize(n);
+    return std::filesystem::path(exe_w).parent_path() / L"video" /
+           L"cloud_sites.json";
+}
+
+// 已学习的纯网盘源 key 集合（拷贝返回，调用方无需持锁）。
+std::set<std::string> LoadedCloudSites() {
+    std::lock_guard<std::mutex> lk(g_cloud_sites_mtx);
+    if (!g_cloud_sites_loaded) {
+        g_cloud_sites_loaded = true;
+        try {
+            std::ifstream in(CloudSitesPath(), std::ios::binary);
+            if (in) {
+                json root;
+                in >> root;
+                if (root.contains("sites") && root["sites"].is_array())
+                    for (const auto& v : root["sites"])
+                        if (v.is_string())
+                            g_cloud_sites.insert(v.get<std::string>());
+            }
+        } catch (...) {
+        }
+    }
+    return g_cloud_sites;
+}
+
+// 记一个纯网盘源（幂等；写盘失败不影响本次运行内的过滤）。
+void MarkCloudSite(const std::string& key) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lk(g_cloud_sites_mtx);
+    if (!g_cloud_sites_loaded) {
+        g_cloud_sites_loaded = true;
+        try {
+            std::ifstream in(CloudSitesPath(), std::ios::binary);
+            if (in) {
+                json root;
+                in >> root;
+                if (root.contains("sites") && root["sites"].is_array())
+                    for (const auto& v : root["sites"])
+                        if (v.is_string())
+                            g_cloud_sites.insert(v.get<std::string>());
+            }
+        } catch (...) {
+        }
+    }
+    if (!g_cloud_sites.insert(key).second) return;
+    try {
+        json root;
+        root["sites"] = json::array();
+        for (const auto& k : g_cloud_sites) root["sites"].push_back(k);
+        std::ofstream out(CloudSitesPath(),
+                          std::ios::binary | std::ios::trunc);
+        if (out) out << root.dump(2);
+    } catch (...) {
+    }
+}
+
+// 从站点列表里剔除已学习的纯网盘源。
+void DropCloudSites(std::vector<ttplayer::video::VideoSite>* sites) {
+    if (!sites || sites->empty()) return;
+    const std::set<std::string> cloud = LoadedCloudSites();
+    if (cloud.empty()) return;
+    sites->erase(std::remove_if(sites->begin(), sites->end(),
+                                [&](const ttplayer::video::VideoSite& s) {
+                                    const std::string k =
+                                        s.key.empty() ? s.name : s.key;
+                                    return cloud.count(k) > 0;
+                                }),
+                 sites->end());
+}
+
 json CardToJson(const ttplayer::video::VideoItem& it) {
     json c;
     c["id"] = it.id;
     if (!it.site_key.empty()) c["site"] = it.site_key;
     c["title"] = it.title;
-    if (!it.pic.empty()) c["cover"] = it.pic;
+    if (!it.pic.empty()) c["cover"] = UnwrapImageProxy(it.pic);
     if (!it.score.empty()) c["rate"] = it.score;
     if (!it.site_name.empty()) c["from"] = it.site_name;
     if (!it.remarks.empty()) c["remarks"] = it.remarks;
@@ -240,7 +368,16 @@ json BuildSectionsFromFlow(const std::vector<ttplayer::video::VideoItem>& flow) 
             title = FriendlySectionTitle(it.type_name);
         if (title.empty() && !it.site_name.empty()) {
             const std::wstring site = core::Utf8ToWide(it.site_name);
-            if (!site.empty()) title = L"源 · " + site;
+            if (!site.empty()) {
+                // 原生 spider 源不带 CMS 分类名（type_name），过去只能退回
+                // 「源 · 站名」，首页就变成一堆按源罗列的块，看不到影视仓式
+                // 推荐流。站点名通常带类型（「巴士┃动漫」「XX┃电影」），先按
+                // 同一套 FriendlySectionTitle 归一；识别不出类型的并入「推荐」
+                // 混合流（与影视仓「最近更新」同观感），不再每源占一块。
+                const std::wstring guess =
+                    FriendlySectionTitle(core::WideToUtf8(site));
+                title = (guess.empty() || guess == site) ? L"推荐" : guess;
+            }
         }
         if (title.empty()) title = FriendlySectionTitle(std::string("推荐"));
         if (buckets.find(title) == buckets.end()) order.push_back(title);
@@ -292,8 +429,13 @@ json AggregateVideoHome(ttplayer::video::VideoSourceManager* mgr) {
         out["error"] = std::string("读取视频源失败: ") + e.what();
         return out;
     }
+    const bool had_sites = !sites.empty();
+    DropCloudSites(&sites);   // 已学习的纯网盘源不参与首页推荐
     if (sites.empty()) {
-        out["error"] = "尚未导入视频源：请先点「导入」添加影视仓 / TVBox 配置地址";
+        out["error"] = had_sites
+                           ? "可用的视频源都只有网盘资源（已全部隐藏），"
+                             "请导入带直链的影视仓配置"
+                           : "尚未导入视频源：请先点「导入」添加影视仓 / TVBox 配置地址";
         return out;
     }
 
@@ -406,6 +548,7 @@ json AggregateVideoCategory(ttplayer::video::VideoSourceManager* mgr,
         out["error"] = std::string("读取视频源失败: ") + e.what();
         return out;
     }
+    DropCloudSites(&sites);   // 纯网盘源不参与分类聚合
     if (!sources.is_array() || sources.empty()) {
         out["error"] = "分类缺少 sources（站点/分类 id 映射）";
         return out;
@@ -585,7 +728,105 @@ VideoPlayContext BuildVideoPlayContext(
     return ctx;
 }
 
-// ───────────────────────── 打开 C++ 视频播放窗（供自动播复用） ─────────────
+// 把详情里的选集整理成播放窗的「选集」菜单数据：以 pick_line 这条线路为
+// 准取集名/地址，同时按相同下标收集其它线路的同集地址（换集后仍可切换源）。
+std::vector<ttplayer::video::VideoPlayerEpisode> BuildPlayerEpisodes(
+    const ttplayer::video::VideoDetail& detail,
+    const ttplayer::video::VideoSite& site, int pick_line) {
+    std::vector<ttplayer::video::VideoPlayerEpisode> out;
+    if (pick_line < 0 ||
+        static_cast<std::size_t>(pick_line) >= detail.lines.size())
+        return out;
+    auto abs_url = [&site](std::string u) {
+        if (!site.play_url.empty() && u.find("://") == std::string::npos)
+            u = site.play_url + u;
+        return u;
+    };
+    const auto& base = detail.lines[static_cast<std::size_t>(pick_line)];
+    const std::size_t count = std::min<std::size_t>(base.episodes.size(), 400);
+    for (std::size_t ei = 0; ei < count; ++ei) {
+        ttplayer::video::VideoPlayerEpisode ep;
+        ep.title = core::Utf8ToWide(base.episodes[ei].name);
+        ep.line = core::Utf8ToWide(base.name);
+        ep.url = core::Utf8ToWide(abs_url(base.episodes[ei].url));
+        if (ep.url.empty()) continue;
+        for (const auto& ln : detail.lines) {
+            if (ei >= ln.episodes.size()) continue;
+            const std::string u = abs_url(ln.episodes[ei].url);
+            if (u.empty()) continue;
+            ttplayer::video::VideoPlayerSource s;
+            s.url = core::Utf8ToWide(u);
+            s.name = core::Utf8ToWide(ln.name);
+            ep.sources.push_back(std::move(s));
+        }
+        out.push_back(std::move(ep));
+    }
+    return out;
+}
+
+// ───────────────────────── 观看历史（播放列表「视频」栏目） ─────────────────
+//
+// 打开任何视频都往 <exe>\video\history.json 记一条：整部剧的选集 / 每集线路 /
+// 当前集 / 进度，不是单一播放直链。主窗口播放列表的「视频」栏目读同一份文件；
+// 直链失效时 OpenVideoFromHistory 还能用 site + detail_id 重新取详情解析。
+std::wstring RecordVideoHistory(
+    const std::string& title, const std::string& site_key,
+    const std::string& detail_id, const std::string& cover,
+    const std::string& line,
+    const std::vector<ttplayer::video::VideoPlayerEpisode>& episodes,
+    const std::wstring& url) {
+    using namespace ttplayer::video;
+    VideoHistoryEntry entry;
+    entry.title = core::Utf8ToWide(title);
+    entry.site = core::Utf8ToWide(site_key);
+    entry.detail_id = core::Utf8ToWide(detail_id);
+    entry.cover = core::Utf8ToWide(cover);
+    entry.line = core::Utf8ToWide(line);
+    entry.episodes = episodes;
+    // 电影没有选集时也存成「一条一条目」，播放列表 / 续播才能统一处理。
+    if (entry.episodes.empty() && !url.empty()) {
+        VideoPlayerEpisode ep;
+        ep.url = url;
+        ep.line = entry.line;
+        entry.episodes.push_back(std::move(ep));
+    }
+    if (entry.episodes.empty()) return {};
+    entry.current_index = 0;
+    for (std::size_t i = 0; i < entry.episodes.size(); ++i) {
+        if (entry.episodes[i].url == url) {
+            entry.current_index = static_cast<int>(i);
+            break;
+        }
+    }
+    // 与播放窗「选集」菜单同口径：最多 400 集，避免 history.json 被长剧撑大。
+    // 当前集若在 400 之后，交换到第 400 位再截断，保证下次打开播的仍是这一集。
+    if (entry.episodes.size() > 400) {
+        if (entry.current_index >= 400) {
+            std::swap(entry.episodes[399],
+                      entry.episodes[static_cast<std::size_t>(entry.current_index)]);
+            entry.current_index = 399;
+        }
+        entry.episodes.resize(400);
+    }
+    const std::wstring key = entry.detail_id.empty() ? url : entry.detail_id;
+    entry.id = MakeVideoHistoryId(entry.site, key);
+    if (entry.id.empty() || entry.id == L"|") return {};
+    // 同一部片、同一集再次打开：沿用上次进度；换集则从头开始。
+    VideoHistoryEntry old;
+    if (FindVideoHistory(entry.id, &old) &&
+        old.current_index == entry.current_index) {
+        entry.position_ms = old.position_ms;
+        entry.duration_ms = old.duration_ms;
+    }
+    const std::wstring id = entry.id;
+    UpsertVideoHistory(std::move(entry));
+    VideoHistoryLog("RECORD id=" + core::WideToUtf8(id) + " title=" + title +
+                    " site=" + site_key + " detail=" + detail_id + " eps=" +
+                    std::to_string(episodes.size()) + " line=" + line);
+    return id;
+}
+
+// 打开 C++ 视频播放窗（供自动播复用）。
 // 口径与上方 video.open 的 url 分支完全一致（作品皮肤外框 / parses 聚合 /
 // 线路数组原样透传）。抽成函数是为了让「点卡片自动播第 1 集」不必复制一份
 // 相同的参数装配逻辑；**必须在 UI 线程调用**（内部会创建窗口）。
@@ -595,10 +836,30 @@ std::string OpenVideoPlayerNow(
     const std::map<std::string, std::string>& headers,
     const std::vector<ttplayer::video::VideoPlayerSource>& sources,
     const std::string& player_url = {},
-    const std::string& player_base_url = {}) {
+    const std::string& player_base_url = {},
+    const std::vector<ttplayer::video::VideoPlayerEpisode>& episodes = {},
+    const std::string& site = {}, const std::string& detail_id = {},
+    const std::string& cover = {}, int start_ms = 0,
+    const std::wstring& history_id = {}) {
     if (url.empty()) return "缺少播放地址";
     const HWND owner = MusicFreeBrowserWindow();
     if (!owner) return "音乐窗已关闭，无法打开播放窗";
+    // 未显式给出历史 id → 本次打开先记一条（整部剧选集 + 当前集）。
+    std::wstring hid = history_id;
+    if (hid.empty())
+        hid = RecordVideoHistory(title, site, detail_id, cover, line, episodes,
+                                 core::Utf8ToWide(url));
+    // 续播：同一集有旧进度就从那里开始；快播完（离结尾 <5 秒）则从头来。
+    if (start_ms <= 0) {
+        ttplayer::video::VideoHistoryEntry saved;
+        if (!hid.empty() &&
+            ttplayer::video::FindVideoHistory(hid, &saved) &&
+            saved.position_ms > 0) {
+            const bool near_end = saved.duration_ms > 0 &&
+                saved.position_ms + 5000 >= saved.duration_ms;
+            start_ms = near_end ? 0 : saved.position_ms;
+        }
+    }
     const skin::LegacySkin* legacy = MusicFreeBrowserLegacySkin();
     const skin::BrowserSkin* browser =
         (legacy && legacy->Browser().valid) ? &legacy->Browser() : nullptr;
@@ -612,7 +873,7 @@ std::string OpenVideoPlayerNow(
         ttplayer::video::ShowVideoPlayer(
             owner, core::Utf8ToWide(url), core::Utf8ToWide(title),
             core::Utf8ToWide(line), browser, headers, sources, parses,
-            player_url, player_base_url);
+            player_url, player_base_url, episodes, start_ms, hid);
         return {};
     } catch (const std::exception& e) {
         return std::string("打开播放窗失败: ") + e.what();
@@ -791,6 +1052,7 @@ CrossSourceOutcome FindCrossSourceDirectLines(
         out.elapsed_ms = elapsed_ms();
         return out;
     }
+    DropCloudSites(&sites);   // 纯网盘源不参与直链扫描
     for (const auto& s : sites) {
         const std::string skey = s.key.empty() ? s.name : s.key;
         if (skey != current_key) ++out.candidates;
@@ -891,40 +1153,72 @@ CrossDetailOutcome FindCrossSourceDetail(
     } catch (...) {
         return out;
     }
+    DropCloudSites(&sites);   // 纯网盘源不参与跨源详情回退
 
     // 原请求最多已花 6s、页面 video.open 超时 30s：回退段预算压到 18s。
-    constexpr long long kBudgetMs = 18000;
-    constexpr long long kRequestMs = 6000;
+    // 但 36 个源串行扫、每站最长 6s 时实测要 18~23s——用户看到的就是
+    // 「点开影片半天不出选集」。改成 6 线程并行抢答：谁先拿到同名详情就用谁，
+    // 其余 worker 见到 stop 立即退出，整段预算压到 8s。
+    constexpr long long kBudgetMs = 8000;
+    constexpr int kWorkers = 6;
+    constexpr int kMaxScan = 24;
+    std::atomic<bool> stop{false};
+    std::atomic<int> scanned{0};
+    std::atomic<std::size_t> cursor{0};
+    std::mutex out_mtx;
     const std::string want = NormalizeVideoTitle(title, "");
-    for (const auto& s : sites) {
-        if (out.scanned >= 20) break;
-        if (elapsed_ms() + kRequestMs > kBudgetMs) break;
-        if (IsMusicFreeShuttingDown()) break;
-        const std::string skey = s.key.empty() ? s.name : s.key;
-        if (skey == current_key) continue;
-        ++out.scanned;
-        try {
-            const ttplayer::video::VideoListing listing =
-                ttplayer::video::FetchSearch(s, title, 1, mgr->network());
-            const ttplayer::video::VideoItem* hit = nullptr;
-            for (const auto& it : listing.items) {
-                if (SameVideoTitle(it, title, want)) { hit = &it; break; }
+
+    auto worker = [&] {
+        // ScopedHttpTimeout 是每线程覆盖值：各 worker 独立设置互不影响。
+        ttplayer::musicfree::ScopedHttpTimeout guard(6000);
+        for (;;) {
+            if (stop.load(std::memory_order_relaxed) ||
+                IsMusicFreeShuttingDown())
+                return;
+            if (elapsed_ms() > kBudgetMs) return;
+            if (scanned.load(std::memory_order_relaxed) >= kMaxScan) return;
+            const std::size_t i = cursor.fetch_add(1);
+            if (i >= sites.size()) return;
+            const auto& s = sites[i];
+            const std::string skey = s.key.empty() ? s.name : s.key;
+            if (skey == current_key) continue;
+            scanned.fetch_add(1, std::memory_order_relaxed);
+            try {
+                const ttplayer::video::VideoListing listing =
+                    ttplayer::video::FetchSearch(s, title, 1, mgr->network());
+                const ttplayer::video::VideoItem* hit = nullptr;
+                for (const auto& it : listing.items) {
+                    if (SameVideoTitle(it, title, want)) {
+                        hit = &it;
+                        break;
+                    }
+                }
+                if (!hit) continue;
+                if (stop.load(std::memory_order_relaxed)) return;
+                ttplayer::video::VideoDetail detail =
+                    ttplayer::video::FetchDetail(s, *hit, mgr->network());
+                if (detail.lines.empty()) continue;
+                if (detail.title.empty()) detail.title = hit->title;
+                if (detail.pic.empty()) detail.pic = hit->pic;
+                std::lock_guard<std::mutex> lk(out_mtx);
+                if (out.found) return;   // 别的 worker 抢先拿到
+                out.found = true;
+                out.site = s;
+                out.detail = std::move(detail);
+                stop.store(true, std::memory_order_relaxed);
+                return;
+            } catch (...) {
+                // 单个站点搜索 / 详情失败继续看下一个源。
             }
-            if (!hit) continue;
-            if (elapsed_ms() + kRequestMs > kBudgetMs) break;
-            ttplayer::video::VideoDetail detail =
-                ttplayer::video::FetchDetail(s, *hit, mgr->network());
-            if (detail.lines.empty()) continue;
-            if (detail.title.empty()) detail.title = hit->title;
-            if (detail.pic.empty()) detail.pic = hit->pic;
-            out.found = true;
-            out.site = s;
-            out.detail = std::move(detail);
-            break;
-        } catch (...) {
-            // 单个站点搜索 / 详情失败继续看下一个源。
         }
-    }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(kWorkers);
+    for (int i = 0; i < kWorkers && i < static_cast<int>(sites.size()); ++i)
+        pool.emplace_back(worker);
+    for (auto& t : pool)
+        if (t.joinable()) t.join();
+    out.scanned = scanned.load();
     out.elapsed_ms = elapsed_ms();
     return out;
 }
@@ -1031,6 +1325,24 @@ bool ReadHomeCacheFile(const std::filesystem::path& path,
     if (sections == it->end() || !sections->is_array() || sections->empty())
         return false;
     *out = *it;
+    // 旧缓存里可能残留第三方图片代理地址（wsrv.nl，本机连不通，表现为
+    // 「有的封面空白」）：读出时统一解包，不必等 TTL 过期重新聚合。
+    if (auto secs = out->find("sections");
+        secs != out->end() && secs->is_array()) {
+        for (auto& sec : *secs) {
+            if (!sec.is_object()) continue;
+            auto cards = sec.find("cards");
+            if (cards == sec.end() || !cards->is_array()) continue;
+            for (auto& c : *cards) {
+                if (!c.is_object()) continue;
+                auto cov = c.find("cover");
+                if (cov == c.end() || !cov->is_string()) continue;
+                const std::string v = cov->get<std::string>();
+                const std::string u = UnwrapImageProxy(v);
+                if (u != v) *cov = u;
+            }
+        }
+    }
     // 旧版本缓存里的失败站点列表不再使用（页面不再展示该横幅）。
     out->erase("errors");
     if (saved_at) *saved_at = saved;
@@ -1241,6 +1553,50 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                         sources.push_back(std::move(src));
                                     }
                                 }
+                                // 剧集选集：页面点某一集时会把整部剧的选集/
+                                // 每集线路一起带上来，播放窗据此显示「选集」。
+                                std::vector<ttplayer::video::VideoPlayerEpisode>
+                                    episodes;
+                                if (payload.contains("episodes") &&
+                                    payload.at("episodes").is_array()) {
+                                    for (const auto& e : payload.at("episodes")) {
+                                        if (!e.is_object() || !e.contains("url") ||
+                                            !e["url"].is_string())
+                                            continue;
+                                        ttplayer::video::VideoPlayerEpisode ep;
+                                        ep.url = core::Utf8ToWide(
+                                            e["url"].get<std::string>());
+                                        if (ep.url.empty()) continue;
+                                        if (e.contains("title") &&
+                                            e["title"].is_string())
+                                            ep.title = core::Utf8ToWide(
+                                                e["title"].get<std::string>());
+                                        if (e.contains("line") &&
+                                            e["line"].is_string())
+                                            ep.line = core::Utf8ToWide(
+                                                e["line"].get<std::string>());
+                                        if (e.contains("sources") &&
+                                            e["sources"].is_array()) {
+                                            for (const auto& s : e["sources"]) {
+                                                if (!s.is_object() ||
+                                                    !s.contains("url") ||
+                                                    !s["url"].is_string())
+                                                    continue;
+                                                ttplayer::video::VideoPlayerSource
+                                                    src;
+                                                src.url = core::Utf8ToWide(
+                                                    s["url"].get<std::string>());
+                                                if (s.contains("name") &&
+                                                    s["name"].is_string())
+                                                    src.name = core::Utf8ToWide(
+                                                        s["name"].get<std::string>());
+                                                ep.sources.push_back(
+                                                    std::move(src));
+                                            }
+                                        }
+                                        episodes.push_back(std::move(ep));
+                                    }
+                                }
                                 const std::string title = JsonStr(payload, "title");
                                 // 线路名取页面给的 line（没有则回退站点名），
                                 // 不拿 title 顶替——播放窗标题栏按「线路」显示。
@@ -1272,12 +1628,19 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                           "音乐窗已关闭，无法打开播放窗");
                                     return;
                                 }
+                                // 观看历史：整部剧选集 + 当前集（播放列表「视频」
+                                // 栏目与续播都读这一条；直链失效可按 site+id 重解析）。
+                                const std::wstring history_id = RecordVideoHistory(
+                                    title, JsonStr(payload, "site"),
+                                    JsonStr(payload, "id"), {}, line, episodes,
+                                    core::Utf8ToWide(url));
                                 ttplayer::video::ShowVideoPlayer(
                                     owner, core::Utf8ToWide(url),
                                     core::Utf8ToWide(title),
                                     core::Utf8ToWide(line), browser,
                                     pctx.headers, sources, parses,
-                                    pctx.player_url, pctx.base_url);
+                                    pctx.player_url, pctx.base_url, episodes,
+                                    0, history_id);
                                 reply(true,
                                       json{{"mode", "play"}, {"opened", true}},
                                       {});
@@ -1362,6 +1725,31 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                     ttplayer::video::VideoDetail detail;
                                     std::string first_error;
                                     bool got = false;
+                                    // 聚合卡片/旧缓存常缺详情编号（vod_id）：先在
+                                    // 该站按片名搜一次拿真实编号，再取详情。以前
+                                    // 缺编号直接进跨源扫描，本可以 1 次请求解决。
+                                    if (found && item.id.empty() &&
+                                        !item.title.empty()) {
+                                        try {
+                                            const auto listing =
+                                                ttplayer::video::FetchSearch(
+                                                    site, item.title, 1,
+                                                    mgr->network());
+                                            const std::string want_key =
+                                                NormalizeVideoTitle(item.title, "");
+                                            for (const auto& it : listing.items) {
+                                                if (it.id.empty()) continue;
+                                                if (!SameVideoTitle(it, item.title,
+                                                                    want_key))
+                                                    continue;
+                                                item.id = it.id;
+                                                if (!it.raw.is_null())
+                                                    item.raw = it.raw;
+                                                break;
+                                            }
+                                        } catch (...) {
+                                        }
+                                    }
                                     try {
                                         if (found) {
                                             detail = ttplayer::video::FetchDetail(
@@ -1369,19 +1757,57 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                             got = true;
                                         } else {
                                             first_error = site_missing_error;
+                                            // 诊断：卡片里的 site 已不在当前源清单
+                                            // 时，把清单前 8 个 key(名字) 打出来，
+                                            // 便于判断是「key 变了」还是「源被删了」。
+                                            std::string sample;
+                                            int total = 0;
+                                            try {
+                                                for (const auto& s : mgr->AllSites()) {
+                                                    ++total;
+                                                    if (sample.size() > 400) continue;
+                                                    if (!sample.empty()) sample += ", ";
+                                                    sample +=
+                                                        (s.key.empty() ? s.name : s.key) +
+                                                        "(" + s.name + ")";
+                                                }
+                                            } catch (...) {
+                                            }
+                                            AppendCrossSourceLog(
+                                                "[" + NowStamp() +
+                                                "] OPEN site-miss site=" + site_key +
+                                                " total=" + std::to_string(total) +
+                                                " list=" + sample);
                                         }
                                     } catch (const std::exception& e) {
                                         first_error = e.what();
                                     } catch (...) {
                                         first_error = "未知错误";
                                     }
+                                    // 诊断：详情链路每一段的真实结果（用户反馈
+                                    // 「无法得到任何选集」时，看这一行就能分清是
+                                    // 站点没匹配上、详情接口空、还是跨源也没命中）。
+                                    AppendCrossSourceLog(
+                                        "[" + NowStamp() + "] OPEN 《" + title +
+                                        "》 id=" + id + " site=" + site_key +
+                                        (found ? " found=1(" + site.name + ")"
+                                               : " found=0") +
+                                        " detail=" + (got ? "ok" : "fail") +
+                                        " lines=" +
+                                        std::to_string(detail.lines.size()) +
+                                        (first_error.empty()
+                                             ? ""
+                                             : " err=" + first_error));
                                     // 网盘线路剔除（用户：「需要登录的源都不要」）：
                                     // 玩偶哥哥这类「网盘资源站」的选集全是夸克/UC
                                     // 分享链接，线路名形如「复制《xx》xx地址」——
                                     // 整条线路的选集全是网盘页就剔除；全被剔光则
                                     // lines.empty() 触发下面的跨源同名回退，去其它
                                     // CMS 源找直链。空线路一并剔除（无用）。
+                                    bool cloud_only = false;
                                     if (got) {
+                                        const size_t before =
+                                            detail.lines.size();
                                         detail.lines.erase(
                                             std::remove_if(
                                                 detail.lines.begin(),
@@ -1394,6 +1820,26 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                                     return true;
                                                 }),
                                             detail.lines.end());
+                                        cloud_only = before > 0 &&
+                                                     detail.lines.empty();
+                                        // 原站有线路、但全是网盘分享页：这不是
+                                        // 「站点坏了」，而是该源本身就是网盘资源
+                                        // 站。把原因说清楚，避免用户以为程序坏了。
+                                        if (cloud_only) {
+                                            first_error =
+                                                "该片在当前源只有网盘分享链接"
+                                                "（百度/夸克/UC 等），需要登录网盘"
+                                                "客户端才能播放，播放器无法直接播放";
+                                            // 学习：这个源只有网盘资源，之后首页 /
+                                            // 搜索 / 跨源扫描都跳过它。同时删掉首页
+                                            // 缓存，下次聚合就不会再出现它的卡片。
+                                            MarkCloudSite(site_key);
+                                            std::error_code rmec;
+                                            std::filesystem::remove(
+                                                CloudSitesPath().parent_path() /
+                                                    L"home_cache.json",
+                                                rmec);
+                                        }
                                     }
                                     const std::string match_title =
                                         title.empty() ? detail.title : title;
@@ -1402,6 +1848,15 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                         !match_title.empty()) {
                                         alt = FindCrossSourceDetail(
                                             mgr, site_key, match_title);
+                                        if (!alt.found)
+                                            AppendCrossSourceLog(
+                                                "[" + NowStamp() +
+                                                "] OPEN cross-miss 《" +
+                                                match_title + "》 scanned:" +
+                                                std::to_string(alt.scanned) +
+                                                " 耗时:" +
+                                                std::to_string(alt.elapsed_ms) +
+                                                "ms");
                                         if (alt.found) {
                                             detail = std::move(alt.detail);
                                             use_site = alt.site;
@@ -1422,7 +1877,11 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                                      : first_error));
                                         }
                                     }
-                                    if (!got) {
+                                    // 剔除网盘线路后一行不剩（cloud_only）时
+                                    // 也要报错：以前只判 !got，结果 reply 成功但
+                                    // lines=[]，页面只显示空列表，用户以为「选集
+                                    // 没了」却看不到原因。
+                                    if (!got || detail.lines.empty()) {
                                         throw std::runtime_error(
                                             first_error.empty()
                                                 ? "当前站点没有返回可用选集"
@@ -1576,19 +2035,31 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                         result["autoPlayed"] = true;
                                         result["autoEpisode"] = play_ep;
                                         const std::string final_line = pl.name;
+                                        // 整部剧的选集列表：播放窗里可直接切集
+                                        // （以前只有电影有入口，剧集必须回音乐窗点）。
+                                        const auto player_episodes =
+                                            BuildPlayerEpisodes(detail, use_site,
+                                                                pick_line);
                                         // 自动播第一集也必须带站点头 / player：
                                         // 以前这里传 {}，等于把 Referer 全丢了。
                                         const VideoPlayContext pctx =
                                             BuildVideoPlayContext(
                                                 mgr, site_key, final_line, {});
                                         if (!play_url.empty() && bridge.poster) {
+                                            const std::string detail_id = item.id;
+                                            const std::string detail_pic = detail.pic;
                                             bridge.poster([play_url, play_title,
-                                                           final_line, srcs, pctx] {
+                                                           final_line, srcs, pctx,
+                                                           player_episodes,
+                                                           site_key, detail_id,
+                                                           detail_pic] {
                                                 OpenVideoPlayerNow(
                                                     play_url, play_title,
                                                     final_line, pctx.headers, srcs,
                                                     pctx.player_url,
-                                                    pctx.base_url);
+                                                    pctx.base_url,
+                                                    player_episodes, site_key,
+                                                    detail_id, detail_pic);
                                             });
                                         }
                                     }
@@ -1657,6 +2128,7 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                         bridge.PushEvent("video.search", out);
                                     return;
                                 }
+                                DropCloudSites(&sites);   // 纯网盘源不出现在搜索结果
                                 if (sites.empty()) {
                                     out["cards"] = json::array();
                                     out["error"] =

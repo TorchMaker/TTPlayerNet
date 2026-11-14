@@ -706,6 +706,18 @@ constexpr const char* kBiliUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36";
 
+// bilivideo 直链强制校验 Referer/UA，MF 的窗口化引擎带不了请求头 → 403。
+// 把请求头以播放器支持的「URL 内联头」后缀交给播放层：MEDIA 中转插件会拆出来
+// 并原样转发（同时支持 Range，可拖动）。
+std::string WithBiliPlayHeaders(std::string url) {
+    if (url.empty()) return url;
+    if (url.find('{') != std::string::npos) return url;   // 已有内联头
+    return url +
+           "{\"Referer\":\"https://www.bilibili.com/\","
+           "\"Origin\":\"https://www.bilibili.com\","
+           "\"User-Agent\":\"" + std::string(kBiliUserAgent) + "\"}";
+}
+
 // 旧 cookie 仅作兜底；B 站对 playurl 的风控按 IP+设备指纹，实测旧的固定
 // buvid3 会被 412 拒绝，重新向 /x/frontend/finger/spi 申请 b_3/b_4 即可恢复。
 std::string FetchBiliGuestCookie(const SpiderContext& ctx) {
@@ -980,7 +992,7 @@ std::string BiliEngine::Player(const SpiderContext& ctx,
     };
 
     std::string media = pick_media(FetchJson(run, episode.url, "player"));
-    if (!media.empty()) return media;
+    if (!media.empty()) return WithBiliPlayHeaders(std::move(media));
 
     // durl 取不到（登录/清晰度限制）时退回 DASH（fnval=4048）。
     const std::string avid = su::QueryParam(episode.url, "avid");
@@ -990,9 +1002,9 @@ std::string BiliEngine::Player(const SpiderContext& ctx,
             "https://api.bilibili.com/x/player/playurl?avid=" + avid +
             "&cid=" + cid + "&qn=127&fnval=4048&fourk=1";
         media = pick_media(FetchJson(run, dash_url, "player"));
-        if (!media.empty()) return media;
+        if (!media.empty()) return WithBiliPlayHeaders(std::move(media));
     }
-    return episode.url;
+    return WithBiliPlayHeaders(episode.url);
 }
 
 // ---------- DouDou（豆瓣片单） ----------

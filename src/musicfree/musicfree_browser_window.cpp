@@ -5149,6 +5149,16 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
             // 拉宽时的文字变形由 PaintFrame 的 1:1 标题区重绘消除。
             return 0;
         }
+        case WM_MOVE:
+            // 位置/大小变化就回写宿主（主窗侧有 800ms 合并落盘）：这样即使用
+            // 「最大化/还原」或程序化移动，下次启动也能回到用户最后看到的样子。
+            if (state && state->host.store_bounds) {
+                RECT bounds{};
+                GetWindowRect(hwnd, &bounds);
+                if (bounds.right > bounds.left && bounds.bottom > bounds.top)
+                    state->host.store_bounds(bounds);
+            }
+            break;
         case WM_SIZE: {
             // 缩放时跟着重排：内容区、右侧锚定的框体按钮、底部行都要按新客户区
             // 重新算一遍，窗口区域也要同步（否则拉伸后的边角会被旧掩码裁掉）。
@@ -5162,6 +5172,12 @@ LRESULT CALLBACK BrowserProc(HWND hwnd, UINT message, WPARAM wparam,
                     if (client.right - client.left != natural.cx ||
                         client.bottom - client.top != natural.cy)
                         state->user_resized = true;
+                }
+                if (state && state->host.store_bounds) {
+                    RECT bounds{};
+                    GetWindowRect(hwnd, &bounds);
+                    if (bounds.right > bounds.left && bounds.bottom > bounds.top)
+                        state->host.store_bounds(bounds);
                 }
             }
             return 0;
@@ -6179,6 +6195,12 @@ HWND MusicFreeBrowserWindow() {
     return g_browser ? g_browser->hwnd : nullptr;
 }
 
+void ReloadMusicFreeBrowser() {
+    if (!g_browser || !g_browser->hwnd || !IsWindow(g_browser->hwnd)) return;
+    if (g_browser->webview && g_browser->webview->Ready())
+        g_browser->webview->Reload();
+}
+
 // 打开「导入音源」对话框 —— 与 Win32 界面「导入…」按钮（kIdImport 音乐分支）
 // 走完全相同的实现：同一个模态对话框、同一套导入后刷新（重建音源下拉框、
 // 失效发现页缓存并重新加载）。WebView 页面经 bridge 的 music.import 调用它。
@@ -6275,6 +6297,25 @@ void ShowMusicFreeBrowser(HWND owner, MusicFreeSourceManager* mgr,
             height = std::max<int>(saved.bottom - saved.top, minimum.cy);
             bounds.right = saved.left + width;
             bounds.bottom = saved.top + height;
+        }
+    }
+    // 上次的坐标可能整体落在屏幕外（换了显示器 / 分辨率变小 / 缩放变化）。
+    // 那样窗口其实创建了却看不见，用户观感就是「音乐窗没自动打开」。
+    // 恢复后若与所有显示器都不相交，就挪回主屏工作区左上角。
+    if (!MonitorFromRect(&bounds, MONITOR_DEFAULTTONULL)) {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (GetMonitorInfoW(
+                MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY),
+                &monitor)) {
+            const int work_w = monitor.rcWork.right - monitor.rcWork.left;
+            const int work_h = monitor.rcWork.bottom - monitor.rcWork.top;
+            width = std::min(width, work_w - 48);
+            height = std::min(height, work_h - 48);
+            bounds.left = monitor.rcWork.left + 24;
+            bounds.top = monitor.rcWork.top + 24;
+            bounds.right = bounds.left + width;
+            bounds.bottom = bounds.top + height;
         }
     }
 
