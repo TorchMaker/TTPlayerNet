@@ -844,10 +844,14 @@
         };
         // 整部剧的选集一起带上：播放窗的「选集」按钮据此在同一窗口里切集
         // （以前只有电影能切源，剧集在播放窗里没有任何换集入口）。
+        // 只取与当前点击集同一线路的集数：videoEpisodes 是跨线路铺平的，
+        // 全带上会让播放窗菜单里每集重复出现（线路1·第1集、线路2·第1集…）。
         var allEps = [];
+        var pickLine = it.line || "";
         for (var ei = 0; ei < videoEpisodes.length; ei++) {
             var v = videoEpisodes[ei];
             if (!v || !v.ep || !v.ep.url) continue;
+            if (pickLine && v.line && v.line !== pickLine) continue;
             allEps.push({
                 title: v.ep.name || "",
                 url: v.ep.url,
