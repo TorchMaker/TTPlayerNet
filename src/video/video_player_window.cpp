@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1371,6 +1372,28 @@ bool TryStartWebFallback(PlayerState* st) {
             L"该线路是数据接口（返回 JSON），不是网页播放页，已跳过。\n\n"
             L"请点标题栏「切换源」换一条线路，或换一个片源。";
         return false;
+    }
+    {
+        // 豆瓣资料页（豆瓣片单源给的 sharing_url / subject 页 / doubanapp
+        // dispatch）：不是播放页，弹出来也没有播放器（用户明确反馈「这种的
+        // 不能要」）。桥层已优先剔除并跨源找直链，这里是兜底。
+        const std::string url8 = core::WideToUtf8(url);
+        std::string lower;
+        lower.reserve(url8.size());
+        for (unsigned char c : url8)
+            lower.push_back(static_cast<char>(tolower(c)));
+        if (lower.find("douban.com") != std::string::npos ||
+            lower.find("doubanapp.com") != std::string::npos) {
+            st->error_text =
+                L"该线路是豆瓣资料页（只是介绍页，不是播放页），已跳过。\n\n"
+                L"请点标题栏「切换源」换其它线路，或换一个片源。";
+            AppendPlayFailLog(
+                "类型: 拒绝豆瓣资料页兜底\n影片/集名: " +
+                core::WideToUtf8(st->title_text) + "\n当前线路: " +
+                core::WideToUtf8(st->line_label) + "\n当前地址: " + url8 +
+                "\n");
+            return false;
+        }
     }
 
     st->web_host.reset();

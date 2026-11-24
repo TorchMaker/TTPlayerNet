@@ -48,6 +48,34 @@ void ThrowJs(JSContext* ctx, const char* where) {
     throw std::runtime_error(std::string(where) + ": " + ExceptionText(ctx));
 }
 
+// setTimeout / setInterval 等：原版 MusicFree 运行在 RN/Electron 全局环境里，
+// 音源用它们实现「请求超时竞速」。QuickJS 默认没有这些全局函数，缺了会让
+// 整条取链同步抛错（最终只看到「所有可用源均未取得播放链接」）。
+JSValue JsSetTimeout(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
+    if (!eng || argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_UNDEFINED;
+    int delay = 0;
+    if (argc >= 2 && JS_IsNumber(argv[1])) JS_ToInt32(ctx, &delay, argv[1]);
+    return JS_NewInt32(ctx, eng->AddTimer(argv[0], delay, false));
+}
+
+JSValue JsSetInterval(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
+    if (!eng || argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_UNDEFINED;
+    int delay = 0;
+    if (argc >= 2 && JS_IsNumber(argv[1])) JS_ToInt32(ctx, &delay, argv[1]);
+    return JS_NewInt32(ctx, eng->AddTimer(argv[0], delay, true));
+}
+
+JSValue JsClearTimer(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
+    int id = 0;
+    if (eng && argc >= 1 && JS_IsNumber(argv[0]) &&
+        JS_ToInt32(ctx, &id, argv[0]) == 0)
+        eng->ClearTimer(id);
+    return JS_UNDEFINED;
+}
+
 // URL 全局的轻量 polyfill（Node 风格，够用即可）。
 const char kUrlPolyfill[] = R"js(
 (function () {
@@ -220,6 +248,10 @@ QuickJsEngine::QuickJsEngine() {
 QuickJsEngine::~QuickJsEngine() {
     for (auto& kv : resolved_) JS_FreeValue(ctx_, kv.second);
     resolved_.clear();
+    for (auto& timer : timers_) {
+        if (ctx_ && !JS_IsUndefined(timer.fn)) JS_FreeValue(ctx_, timer.fn);
+    }
+    timers_.clear();
     if (ctx_) JS_FreeContext(ctx_);
     if (rt_) JS_FreeRuntime(rt_);
 }
@@ -351,7 +383,9 @@ JSValue QuickJsEngine::Await(JSValue promise) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(1500);
     while (!state.done) {
+        RunDueTimers();
         int rc = JS_ExecutePendingJob(rt_, &pctx);
+        RunDueTimers();
         if (rc > 0) { ++jobs; continue; }
         // rc < 0 表示某个微任务抛了未捕获异常：把异常文本取出来报告，
         // 否则 state.result 会一直保持初值 JS_UNDEFINED，上层只看到「返回 null」。
@@ -388,7 +422,66 @@ JSValue QuickJsEngine::Await(JSValue promise) {
 
 void QuickJsEngine::Pump() {
     JSContext* pctx = nullptr;
-    while (JS_ExecutePendingJob(rt_, &pctx) > 0) {}
+    for (;;) {
+        RunDueTimers();
+        if (JS_ExecutePendingJob(rt_, &pctx) > 0) continue;
+        RunDueTimers();
+        break;
+    }
+}
+
+int QuickJsEngine::AddTimer(JSValueConst fn, int delay_ms, bool repeat) {
+    if (!ctx_ || !JS_IsFunction(ctx_, fn)) return 0;
+    if (delay_ms < 0) delay_ms = 0;
+    Timer timer;
+    timer.id = next_timer_id_++;
+    timer.repeat = repeat;
+    timer.interval_ms = repeat ? (delay_ms > 0 ? delay_ms : 1) : 0;
+    timer.due = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(delay_ms);
+    timer.fn = JS_DupValue(ctx_, fn);
+    timers_.push_back(timer);
+    return timer.id;
+}
+
+void QuickJsEngine::ClearTimer(int id) {
+    for (auto it = timers_.begin(); it != timers_.end(); ++it) {
+        if (it->id != id) continue;
+        if (!JS_IsUndefined(it->fn)) JS_FreeValue(ctx_, it->fn);
+        timers_.erase(it);
+        return;
+    }
+}
+
+void QuickJsEngine::RunDueTimers() {
+    if (!ctx_ || timers_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<Timer> due;
+    for (auto it = timers_.begin(); it != timers_.end();) {
+        if (it->due > now) {
+            ++it;
+            continue;
+        }
+        Timer fired = *it;
+        if (it->repeat) {
+            fired.fn = JS_DupValue(ctx_, it->fn);
+            it->due = now + std::chrono::milliseconds(it->interval_ms);
+            ++it;
+        } else {
+            it = timers_.erase(it);
+        }
+        due.push_back(fired);
+    }
+    for (auto& timer : due) {
+        JSValue ret = JS_Call(ctx_, timer.fn, JS_UNDEFINED, 0, nullptr);
+        if (JS_IsException(ret)) {
+            // 定时器回调异常不应打断 await 泵：取走异常并记录一行日志。
+            const std::string text = ExceptionText(ctx_);
+            Log("warn", "timer callback exception: " + text);
+        }
+        JS_FreeValue(ctx_, ret);
+        if (!JS_IsUndefined(timer.fn)) JS_FreeValue(ctx_, timer.fn);
+    }
 }
 
 void QuickJsEngine::RegisterRequire(std::string name, RequireFactory factory) {
@@ -450,6 +543,14 @@ void QuickJsEngine::InitGlobals() {
     JS_SetPropertyStr(ctx_, process, "version", JS_NewString(ctx_, app_version_.c_str()));
     JS_SetPropertyStr(ctx_, process, "env", JS_DupValue(ctx_, env));
     SetGlobal("process", process);
+
+    // 定时器：原版 MusicFree 跑在 RN/Electron 全局环境里，音源用
+    // `Promise.race([请求, new Promise(r => setTimeout(...))])` 做超时竞速。
+    // QuickJS 默认没有这些全局函数，缺了会让取链在同步阶段就抛错。
+    SetGlobal("setTimeout", JS_NewCFunction(ctx_, &JsSetTimeout, "setTimeout", 2));
+    SetGlobal("clearTimeout", JS_NewCFunction(ctx_, &JsClearTimer, "clearTimeout", 1));
+    SetGlobal("setInterval", JS_NewCFunction(ctx_, &JsSetInterval, "setInterval", 2));
+    SetGlobal("clearInterval", JS_NewCFunction(ctx_, &JsClearTimer, "clearInterval", 1));
 }
 
 void QuickJsEngine::InitRequireRegistry() {

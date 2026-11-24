@@ -689,11 +689,52 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
     // 「加到列表很久才播放」的元凶（实测 16~29s），原版根本没有这条路径。
     auto* mgr = AppMusicFreeManager();
     MusicFreePlugin* plugin = mgr ? mgr->FindPlugin(platform) : nullptr;
-    if (plugin && plugin->IsMounted()) {
+    const bool has_plugin = plugin && plugin->IsMounted();
+    if (has_plugin) {
+        // 旧播放列表条目只存了 platform/id/title/artist/album（没有音源原始
+        // 对象）。音源取链要读 raw 里的 songmid/hash 等私有字段，空 raw 会
+        // 同步抛错（表现为 0 秒「所有可用源均未取得播放链接」）。这里按同平台
+        // 同歌名重搜一次补全 raw，兼容升级前入列的条目。
+        nlohmann::json effective_raw =
+            item_raw.is_object() ? item_raw : nlohmann::json::object();
+        const bool thin_raw = [&effective_raw]() {
+            if (effective_raw.empty()) return true;
+            for (auto it = effective_raw.begin(); it != effective_raw.end(); ++it) {
+                const std::string& key = it.key();
+                if (key != "platform" && key != "id" && key != "title" &&
+                    key != "artist" && key != "album")
+                    return false;
+            }
+            return true;
+        }();
+        if (thin_raw && !track.title.empty()) {
+            const std::string query =
+                track.artist.empty() ? track.title
+                                     : track.title + " " + track.artist;
+            auto healed = plugin->Search(query, 1);
+            const MusicItem* pick = nullptr;
+            for (const auto& candidate : healed.items) {
+                if (candidate.id == id) { pick = &candidate; break; }
+            }
+            if (!pick) {
+                for (const auto& candidate : healed.items) {
+                    if (candidate.title == track.title) { pick = &candidate; break; }
+                }
+            }
+            if (!pick && !healed.items.empty()) pick = &healed.items.front();
+            if (pick && pick->raw.is_object() && !pick->raw.empty()) {
+                effective_raw = pick->raw;
+                AppendPlayLog("RESOLVE raw-heal platform=" + platform +
+                              " id=" + id + " query=" + query);
+            } else {
+                AppendPlayLog("RESOLVE raw-heal-miss platform=" + platform +
+                              " id=" + id + " err=" + healed.error);
+            }
+        }
         MusicItem item;
         item.id = id;
         item.platform = platform;
-        item.raw = item_raw;
+        item.raw = effective_raw;
         item.title = track.title;
         item.artist = track.artist;
         item.album = track.album;
@@ -704,26 +745,37 @@ std::optional<MediaSource> ResolvePlayUrlEx(const std::string& platform,
             QualityKey::kStandard, QualityKey::kHigh, QualityKey::kSuper,
             QualityKey::kLossless, QualityKey::kHires, QualityKey::kSurpass,
         };
-        for (QualityKey q : kQualityOrder) {
-            std::string perr;
-            if (auto ms = plugin->GetMediaSource(item, q, &perr)) {
-                ResolveCachePut(platform, id, *ms);
-                emit_timing("plugin", Clock::now(), Clock::now());
-                return *ms;
+        const auto try_plugin = [&]() -> std::optional<MediaSource> {
+            for (QualityKey q : kQualityOrder) {
+                std::string perr;
+                if (auto ms = plugin->GetMediaSource(item, q, &perr)) return ms;
+                if (primary_error.empty()) primary_error = perr;
             }
-            if (primary_error.empty()) primary_error = perr;
+            return std::nullopt;
+        };
+        if (auto ms = try_plugin()) {
+            ResolveCachePut(platform, id, *ms);
+            emit_timing("plugin", Clock::now(), Clock::now());
+            return *ms;
+        }
+        // 对齐原版 MusicFree 的 getMediaSource：失败后延时 150ms 重试一次。
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (auto ms = try_plugin()) {
+            ResolveCachePut(platform, id, *ms);
+            emit_timing("plugin", Clock::now(), Clock::now());
+            return *ms;
         }
     } else {
         primary_error = "找不到 MusicFree 音源「" + platform + "」";
     }
     const auto t_plugin_done = Clock::now();
 
-    // 第二路：其它协议音源。REST 音源本身就可能是曲目的来源平台；洛雪音源
-    // 则在 MusicFree 插件解析失败时按歌名/歌手/私有 id 补一条可用直链。
-    // 兜底脚本会串行试探多条线路（实测 28 个请求），失效线路若按全局 20s
-    // 超时等待会把一次解析拖到十几秒；这里只把兜底段的单请求超时压到 6s。
+    // 第二路：只有「不是 MusicFree 插件」的曲目（洛雪 / REST 音源）才走协议兜底。
+    // 原版 MusicFree 的 getMediaSource 只解析来源插件本身，不会拿一个平台的 id
+    // 去遍历其它平台；此前无条件兜底导致把 qq_xxx 当酷狗 hash 去请求（trace 里
+    // 可见），9 条链路必空、耗时 30s+ 且可能返回错误歌曲。
     std::string fallback_error;
-    {
+    if (!has_plugin) {
         ScopedHttpTimeout short_timeout(6000);
         if (auto* registry = AppSourceProtocolRegistry()) {
             try {

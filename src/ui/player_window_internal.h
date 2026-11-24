@@ -10,6 +10,7 @@
 #include <chrono>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -219,6 +220,10 @@ struct PlayResolvedPayload {
     // 把真实直链直接带回 UI 线程，不再依赖「重选行 → 查缓存」这条间接且
     // 受 same_item / 换轨淡出状态影响的路径（用户实测「入了列表但没声音」）。
     std::string url;
+    // getMediaSource 返回的自定义请求头 / User-Agent：部分 CDN（QQ、酷我、酷狗）
+    // 会校验 Referer/UA，缺失时直接 403。必须原样交给 HttpStreamSource。
+    std::map<std::string, std::string> headers;
+    std::string user_agent;
 };
 // 流式播放时后台落盘的本地副本就绪通知。若此刻播放没有真正推进（部分 CDN
 // 只建立了流会话却没吐数据），UI 线程用本地文件重播一次，用户无需手点播放。

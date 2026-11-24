@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -444,6 +445,21 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
                                      song_id);
             return;
         }
+        // 流式打开失败后 PlayCurrent 会再走一次解析；同一首歌在 10 秒窗口内最多
+        // 2 次，否则就是每秒一次的解析风暴（真机日志 serial=8..15）。
+        const ULONGLONG now = GetTickCount64();
+        if (online_resolve_attempt_key_ != key ||
+            now - online_resolve_attempt_tick_ > 10000ULL) {
+            online_resolve_attempt_key_ = key;
+            online_resolve_attempts_ = 0;
+        }
+        if (online_resolve_attempts_ >= 2) {
+            musicfree::AppendPlayLog("PLAYLIST give_up platform=" + platform +
+                                     " id=" + song_id);
+            return;
+        }
+        ++online_resolve_attempts_;
+        online_resolve_attempt_tick_ = now;
         g_online_resolve_inflight_key = key;
         serial = g_online_resolve_serial.fetch_add(1) + 1;
     }
@@ -453,12 +469,22 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
     musicfree::AppendPlayLog("PLAYLIST resolve thread start id=" + song_id +
                              " serial=" + std::to_string(serial));
     // 只解析并写 resolve_cache.json，绝不 DownloadTrackFile 完整下载；
-    // 完成后把真实直链带回 UI 线程直接起播（边下边播、不落盘）。
+    // 完成后把真实直链 + 自定义请求头带回 UI 线程直接起播（边下边播、不落盘）。
     std::thread([notify, platform, song_id, playlist_index, row,
                  source_raw, serial, key] {
         std::string reason;
-        const std::string url =
-            musicfree::ResolvePlayUrl(platform, song_id, &reason, &source_raw);
+        std::string url;
+        std::map<std::string, std::string> headers;
+        std::string user_agent;
+        // 必须用 ResolvePlayUrlEx：ResolvePlayUrl 只返回地址，会丢掉插件
+        // getMediaSource 给出的 Referer / User-Agent，QQ/酷我/酷狗 CDN 直接 403。
+        const auto media = musicfree::ResolvePlayUrlEx(
+            platform, song_id, &reason, &source_raw);
+        if (media) {
+            url = media->url;
+            headers = media->headers;
+            user_agent = media->user_agent;
+        }
         const bool ok = !url.empty();
         {
             std::lock_guard<std::mutex> lock(g_online_resolve_inflight_mutex);
@@ -468,9 +494,12 @@ void PlayerWindow::StartOnlineTrackResolveAndPlay(size_t playlist_index,
         musicfree::AppendPlayLog("PLAYLIST resolve done ok=" +
             std::string(ok ? "1" : "0") + " serial=" +
             std::to_string(serial) + " id=" + song_id +
+            " headers=" + std::to_string(headers.size()) +
+            " ua=" + std::string(user_agent.empty() ? "0" : "1") +
             (ok ? "" : " reason=" + reason.substr(0, 120)));
         auto* payload = new detail::PlayResolvedPayload{
-            playlist_index, row, serial, ok, url};
+            playlist_index, row, serial, ok, url, std::move(headers),
+            std::move(user_agent)};
         if (!PostMessageW(notify, detail::kMsgOnlinePlayResolved, 0,
                           reinterpret_cast<LPARAM>(payload)))
             delete payload;
@@ -485,6 +514,8 @@ bool PlayerWindow::HandleOnlinePlayResolved(LPARAM payload) {
     const unsigned long long serial = data->serial;
     const bool success = data->success;
     const std::string url = std::move(data->url);
+    const auto headers = std::move(data->headers);
+    const std::string user_agent = std::move(data->user_agent);
     delete data;
     musicfree::AppendPlayLog("PLAYLIST resolve msg ok=" +
         std::string(success ? "1" : "0") + " serial=" +
@@ -519,12 +550,15 @@ bool PlayerWindow::HandleOnlinePlayResolved(LPARAM payload) {
         const bool is_hls = url.size() >= 5 &&
             _stricmp(url.c_str() + url.size() - 5, ".m3u8") == 0;
         audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{
-            url, {}, "", is_hls});
+            url, headers, user_agent, is_hls});
         const bool ok = audio_->Play(core::Utf8ToWide(url), track.subtrack);
         musicfree::AppendPlayLog(std::string("PLAYLIST direct_play ok=") +
                                  (ok ? "1" : "0") + " hls=" +
-                                 std::to_string(is_hls));
+                                 std::to_string(is_hls) +
+                                 (ok ? "" : " error=" +
+                                     core::WideToUtf8(audio_->LastError())));
         if (ok) {
+            online_resolve_attempts_ = 0;
             playback_source_open_ = true;
             playback_was_active_ = true;
             opened_track_ = track;
@@ -590,10 +624,21 @@ void PlayerWindow::StartOnlineTrackBackgroundCache(
     if (target_dir.empty()) return;
 
     const std::wstring url_w = core::Utf8ToWide(resolved_url);
-    const std::wstring base =
+    std::wstring file_name =
         musicfree::DefaultDownloadName(track.title, track.artist, url_w);
-    const std::wstring target =
-        target_dir / (base + musicfree::GuessExtension(url_w));
+    // DefaultDownloadName 已经按地址猜过扩展名；这里只在缺失时补，避免出现
+    // 「xxx.mp3.mp3」这种双扩展名（旧版本真机目录里已经攒了一批）。
+    const std::wstring extension = musicfree::GuessExtension(url_w);
+    if (!extension.empty() &&
+        (file_name.size() <= extension.size() ||
+         _wcsicmp(file_name.c_str() + file_name.size() - extension.size(),
+                  extension.c_str()) != 0))
+        file_name += extension;
+    const std::filesystem::path final_target = target_dir / file_name;
+    // 先写 .part，完成后再原子改名：否则同名半成品文件会被
+    // ResolveOnlineTrackLocalCopy 当成「本地副本」打开，插件 reader 读到写入中的
+    // 文件就会失败（真机 error=reader slot 3 Open(IStream, flags) failed 0x8BDA000A）。
+    const std::filesystem::path temp_target = final_target.wstring() + L".part";
 
     // 单任务互斥：已经在后台缓存别的曲目就跳过这次，下次重播还会再触发。
     {
@@ -606,17 +651,32 @@ void PlayerWindow::StartOnlineTrackBackgroundCache(
     const HWND notify = window_;
     const size_t target_playlist = playlists_.ActiveIndex();
     const size_t target_row = current_.value_or(0);
-    std::thread([platform, song_id, target, resolved_url, notify,
-                 target_playlist, target_row] {
+    std::thread([platform, song_id, final_target, temp_target, resolved_url,
+                 notify, target_playlist, target_row] {
         std::string reason;
-        const bool ok = musicfree::DownloadTrackFile(
-            core::Utf8ToWide(resolved_url), std::filesystem::path(target),
-            &reason);
+        bool ok = musicfree::DownloadTrackFile(
+            core::Utf8ToWide(resolved_url), temp_target, &reason);
+        if (ok) {
+            std::error_code rename_error;
+            std::filesystem::rename(temp_target, final_target, rename_error);
+            if (rename_error) {
+                // 已有同名旧副本时 rename 会失败：保留旧文件即可，删掉半成品。
+                std::error_code remove_error;
+                std::filesystem::remove(temp_target, remove_error);
+                std::error_code exists_error;
+                ok = std::filesystem::exists(final_target, exists_error) &&
+                     !exists_error;
+                if (!ok) reason = "rename failed: " + rename_error.message();
+            }
+        } else {
+            std::error_code remove_error;
+            std::filesystem::remove(temp_target, remove_error);
+        }
         if (ok) {
             const std::string key = OnlineLocalKey(platform, song_id);
             {
                 const std::scoped_lock lock(g_online_local_mutex);
-                g_online_local_cache[key] = std::filesystem::path(target);
+                g_online_local_cache[key] = final_target;
             }
             // 本地副本就绪：让 UI 线程判断是否需要「用本地文件重播」兜底。
             auto* ready = new detail::CacheReadyPayload{
@@ -625,7 +685,8 @@ void PlayerWindow::StartOnlineTrackBackgroundCache(
                               reinterpret_cast<LPARAM>(ready)))
                 delete ready;
             musicfree::TraceDiagnostic("ONLINE_BACKGROUND_CACHE",
-                "ok=1 key=" + key + "\ntarget=" + core::WideToUtf8(target));
+                "ok=1 key=" + key +
+                "\ntarget=" + core::WideToUtf8(final_target.wstring()));
         } else {
             musicfree::TraceDiagnostic("ONLINE_BACKGROUND_CACHE",
                 "ok=0 key=" + OnlineLocalKey(platform, song_id) +

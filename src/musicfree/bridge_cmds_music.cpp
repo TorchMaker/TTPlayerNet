@@ -501,6 +501,11 @@ bool BuildTrackSpec(const json& item, TrackSpec& out, std::string& error) {
     if (out.hit.platform.empty() && item.is_object() &&
         item.contains("raw") && item.at("raw").is_object())
         out.hit.platform = JsonStr(item.at("raw"), "platform");
+    // 搜索结果把音源原始对象放在 extra.raw（见 BuildSearchGroups），页面点播时
+    // 可能只回传 extra；这里一并取出，否则 raw 变空对象 → 插件取链同步抛错。
+    if (out.hit.platform.empty() && item.is_object() &&
+        item.contains("extra") && item.at("extra").is_object())
+        out.hit.platform = JsonStr(item.at("extra"), "platform");
     out.hit.id = JsonStr(item, "id");
     out.hit.title = JsonStr(item, "title");
     out.hit.artist = JsonStr(item, "artist");
@@ -534,8 +539,14 @@ bool BuildTrackSpec(const json& item, TrackSpec& out, std::string& error) {
     std::string art = JsonStr(item, "cover");
     if (art.empty()) art = JsonStr(item, "art");
     out.hit.artwork = art;
-    if (item.is_object() && item.contains("raw") && item.at("raw").is_object())
+    if (item.is_object() && item.contains("raw") && item.at("raw").is_object() &&
+        !item.at("raw").empty())
         out.hit.raw = item.at("raw");
+    else if (item.is_object() && item.contains("extra") &&
+             item.at("extra").is_object() && item.at("extra").contains("raw") &&
+             item.at("extra").at("raw").is_object() &&
+             !item.at("extra").at("raw").empty())
+        out.hit.raw = item.at("extra").at("raw");
     else {
         // 没带音源原始对象：按 musicfree_app.h RestoreSourceRaw 的口径拼一个
         // 最小对象，洛雪 / REST 音源至少能按歌名+歌手兜底解析。

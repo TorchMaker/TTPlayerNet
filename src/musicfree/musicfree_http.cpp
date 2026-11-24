@@ -491,30 +491,53 @@ std::string ContentType(const std::map<std::string, std::vector<std::string>>& h
 // 'Content-Type'、我们兜底再补 'content-type'，请求里出现重复头，WinHTTP 在
 // WinHttpSendRequest 阶段直接报 ERROR_ALREADY_EXISTS(183)（真机二分实验证实：
 // QQ musicu.fcg 带重复对即 183，去重后 200）。
-std::map<std::string, std::string> MergeHeaders(JSContext* ctx, JSValueConst config) {
+std::map<std::string, std::string> MergeHeaders(JSContext* ctx, JSValueConst config,
+                                                JSValueConst base_config = JS_UNDEFINED,
+                                                const char* method = nullptr) {
     std::map<std::string, std::string> out;
-    if (JS_IsObject(config)) {
-        JSValue hdrs = JS_GetPropertyStr(ctx, config, "headers");
-        if (JS_IsObject(hdrs)) {
-            JSPropertyEnum* props = nullptr; uint32_t count = 0;
-            if (JS_GetOwnPropertyNames(ctx, &props, &count, hdrs,
-                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-                for (uint32_t i = 0; i < count; ++i) {
-                    const char* k = JS_AtomToCString(ctx, props[i].atom);
-                    if (!k) continue;
-                    std::string key = k;
-                    for (auto& c : key) c = (char)::tolower((unsigned char)c);
-                    JSValue v = JS_GetProperty(ctx, hdrs, props[i].atom);
-                    const char* cv = JS_ToCString(ctx, v);
-                    if (cv) out[key] = cv;
-                    if (cv) JS_FreeCString(ctx, cv);
-                    JS_FreeValue(ctx, v);
-                    JS_FreeCString(ctx, k);
-                    JS_FreeAtom(ctx, props[i].atom);
-                }
-                js_free(ctx, props);
+    // 与原版 axios 一致：实例级 headers.common / headers[method] 先合并，
+    // 单次请求的 headers 再覆盖。以前完全忽略实例配置 → 插件 axios.create({
+    // headers }) 设置的 Referer/UA/Cookie 全部丢失，取链请求被源站拒绝。
+    auto merge_object = [&out, ctx](JSValueConst headers) {
+        if (!JS_IsObject(headers)) return;
+        JSPropertyEnum* props = nullptr; uint32_t count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &count, headers,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) != 0)
+            return;
+        for (uint32_t i = 0; i < count; ++i) {
+            const char* k = JS_AtomToCString(ctx, props[i].atom);
+            if (!k) { JS_FreeAtom(ctx, props[i].atom); continue; }
+            std::string key = k;
+            for (auto& c : key) c = (char)::tolower((unsigned char)c);
+            JSValue v = JS_GetProperty(ctx, headers, props[i].atom);
+            if (JS_IsString(v) || JS_IsNumber(v)) {
+                const char* cv = JS_ToCString(ctx, v);
+                if (cv) out[key] = cv;
+                if (cv) JS_FreeCString(ctx, cv);
+            }
+            JS_FreeValue(ctx, v);
+            JS_FreeCString(ctx, k);
+            JS_FreeAtom(ctx, props[i].atom);
+        }
+        js_free(ctx, props);
+    };
+    if (JS_IsObject(base_config)) {
+        JSValue base_headers = JS_GetPropertyStr(ctx, base_config, "headers");
+        if (JS_IsObject(base_headers)) {
+            JSValue common = JS_GetPropertyStr(ctx, base_headers, "common");
+            merge_object(common);
+            JS_FreeValue(ctx, common);
+            if (method && *method) {
+                JSValue per_method = JS_GetPropertyStr(ctx, base_headers, method);
+                merge_object(per_method);
+                JS_FreeValue(ctx, per_method);
             }
         }
+        JS_FreeValue(ctx, base_headers);
+    }
+    if (JS_IsObject(config)) {
+        JSValue hdrs = JS_GetPropertyStr(ctx, config, "headers");
+        merge_object(hdrs);
         JS_FreeValue(ctx, hdrs);
     }
     return out;
@@ -574,6 +597,13 @@ JSValue BuildResponse(JSContext* ctx, const HttpResponse& r, const NetworkConfig
         // 与浏览器一致：responseType:'arraybuffer' 得到 ArrayBuffer（QuickJS 托管其内存）。
         JSValue ab = JS_NewArrayBufferCopy(ctx, r.body.data(), r.body.size());
         JS_SetPropertyStr(ctx, obj, "data", ab);
+    } else if (response_type == "text" || response_type == "stream") {
+        // 原版 axios：responseType:'text' 必须原样返回字符串。音源里大量存在
+        // `const res = await axios.get(url, {responseType:'text'}); JSON.parse(res.data)`
+        // 的写法——我们以前无视 responseType 一律 JSON.parse，data 变成对象后
+        // JSON.parse 直接抛错，表现就是「取链失败」，属于与原版的行为差异。
+        std::string body_str(r.body.begin(), r.body.end());
+        JS_SetPropertyStr(ctx, obj, "data", JS_NewString(ctx, body_str.c_str()));
     } else {
         std::string body_str(r.body.begin(), r.body.end());
         nlohmann::json parsed;
@@ -597,6 +627,7 @@ JSValue BuildResponse(JSContext* ctx, const HttpResponse& r, const NetworkConfig
     // headers 对象（set-cookie 等同名头保留数组）
     JSValue hdrs = JS_NewObject(ctx);
     for (const auto& kv : r.headers) {
+        if (kv.first == "set-cookie") continue;  // 下面按原版规则统一处理
         if (kv.second.size() == 1)
             JS_SetPropertyStr(ctx, hdrs, kv.first.c_str(), JS_NewString(ctx, kv.second.front().c_str()));
         else {
@@ -605,6 +636,35 @@ JSValue BuildResponse(JSContext* ctx, const HttpResponse& r, const NetworkConfig
                 JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewString(ctx, kv.second[i].c_str()));
             JS_SetPropertyStr(ctx, hdrs, kv.first.c_str(), arr);
         }
+    }
+    // 对齐原版 MusicFree 的 axios 响应拦截器：移动端 set-cookie 通常只有一条，
+    // 原版会按逗号拆成数组，并额外提供 x-set-cookie（音源用它拼 Cookie 头）。
+    // 这一层以前缺失 → 插件拿不到完整 cookie → 取链请求被服务端拒绝。
+    for (const auto& kv : r.headers) {
+        if (kv.first != "set-cookie") continue;
+        std::vector<std::string> cookies;
+        for (const auto& value : kv.second) {
+            if (kv.second.size() == 1) {
+                size_t begin = 0;
+                while (begin <= value.size()) {
+                    const size_t comma = value.find(',', begin);
+                    const std::string part = value.substr(
+                        begin, comma == std::string::npos ? std::string::npos
+                                                          : comma - begin);
+                    if (!part.empty()) cookies.push_back(part);
+                    if (comma == std::string::npos) break;
+                    begin = comma + 1;
+                }
+            } else {
+                cookies.push_back(value);
+            }
+        }
+        JSValue arr = JS_NewArray(ctx);
+        for (size_t i = 0; i < cookies.size(); ++i)
+            JS_SetPropertyUint32(ctx, arr, (uint32_t)i,
+                                 JS_NewString(ctx, cookies[i].c_str()));
+        JS_SetPropertyStr(ctx, hdrs, "set-cookie", JS_DupValue(ctx, arr));
+        JS_SetPropertyStr(ctx, hdrs, "x-set-cookie", arr);
     }
     JS_SetPropertyStr(ctx, obj, "headers", hdrs);
     JS_SetPropertyStr(ctx, obj, "config", JS_NewObject(ctx));
@@ -663,16 +723,58 @@ void TraceHttpFailure(const std::string& method, const std::string& url,
     std::fclose(file);
 }
 
+// 读 config 上的字符串/数字属性（axios 实例配置与单次请求配置共用）。
+std::string ReadConfigString(JSContext* ctx, JSValueConst config, const char* key) {
+    if (!JS_IsObject(config)) return {};
+    JSValue v = JS_GetPropertyStr(ctx, config, key);
+    std::string out;
+    if (JS_IsString(v)) {
+        const char* s = JS_ToCString(ctx, v);
+        if (s) out = s;
+        if (s) JS_FreeCString(ctx, s);
+    }
+    JS_FreeValue(ctx, v);
+    return out;
+}
+
+bool ReadConfigInt(JSContext* ctx, JSValueConst config, const char* key, int* out) {
+    if (!JS_IsObject(config) || !out) return false;
+    JSValue v = JS_GetPropertyStr(ctx, config, key);
+    int value = 0;
+    if (JS_IsNumber(v) && JS_ToInt32(ctx, &value, v) == 0 && value > 0) {
+        *out = value;
+        JS_FreeValue(ctx, v);
+        return true;
+    }
+    JS_FreeValue(ctx, v);
+    return false;
+}
+
+// 把相对路径拼到 baseURL 上（与原版 axios 的 combineURLs 一致）。
+std::string CombineUrl(std::string base, std::string url) {
+    if (url.empty()) return base;
+    if (url.find("://") != std::string::npos) return url;
+    if (base.empty()) return url;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (!url.empty() && url.front() != '/') url.insert(url.begin(), '/');
+    return base + url;
+}
+
 // 核心实现：url 字符串，config 对象（可为 undefined），data 作为可选请求体。
+// base_config 为 axios 实例级配置（axios.create(config) 的 config），
+// 与原版 axios 一致：baseURL / headers / timeout / responseType 都要生效。
 // 注意 axios 的调用约定差异：
 //   get(url, config)              -> data = undefined
 //   post(url, data, config)       -> data 为 argv[1]
 //   request(config)               -> url/data 都从 config 里取
-JSValue AxiosCore(JSContext* ctx, std::string url, JSValueConst config,
-                  JSValueConst data, const NetworkConfig& cfg, bool is_post) {
+JSValue AxiosCore(JSContext* ctx, std::string url, JSValueConst base_config,
+                  JSValueConst config, JSValueConst data, const NetworkConfig& cfg,
+                  bool is_post, const char* method) {
     if (url.empty()) return JS_Throw(ctx, JS_NewString(ctx, "axios: url 为空"));
 
-    std::map<std::string, std::string> headers = MergeHeaders(ctx, config);
+    url = CombineUrl(ReadConfigString(ctx, base_config, "baseURL"), std::move(url));
+    std::map<std::string, std::string> headers =
+        MergeHeaders(ctx, config, base_config, method);
     if (cfg.user_agent.empty() && headers.find("user-agent") == headers.end())
         headers["user-agent"] = "Mozilla/5.0 (compatible; TTPlayerMusicFree/0.1)";
     else if (!cfg.user_agent.empty())
@@ -699,21 +801,26 @@ JSValue AxiosCore(JSContext* ctx, std::string url, JSValueConst config,
 
     std::wstring wurl = BuildQuery(ctx, config, ToWide(url));
 
-    std::string response_type;
-    if (JS_IsObject(config)) {
-        JSValue rt = JS_GetPropertyStr(ctx, config, "responseType");
-        if (JS_IsString(rt)) {
-            const char* c = JS_ToCString(ctx, rt);
-            if (c) response_type = c;
-            if (c) JS_FreeCString(ctx, c);
-        }
-        JS_FreeValue(ctx, rt);
-    }
+    std::string response_type =
+        ReadConfigString(ctx, config, "responseType");
+    if (response_type.empty())
+        response_type = ReadConfigString(ctx, base_config, "responseType");
+
+    // 超时对齐原版 MusicFree：axios.defaults.timeout = 2000；
+    // 单次请求 / 实例配置里显式给的 timeout 优先。
+    NetworkConfig local_cfg = cfg;
+    int timeout = cfg.timeout_ms > 0 ? cfg.timeout_ms : 2000;
+    int override_timeout = 0;
+    if (ReadConfigInt(ctx, config, "timeout", &override_timeout))
+        timeout = override_timeout;
+    else if (ReadConfigInt(ctx, base_config, "timeout", &override_timeout))
+        timeout = override_timeout;
+    local_cfg.timeout_ms = timeout;
 
     // 执行同步请求
     HttpResponse r;
     try {
-        r = WinHttpBlocking(wurl, is_post, post_body, headers, cfg);
+        r = WinHttpBlocking(wurl, is_post, post_body, headers, local_cfg);
     } catch (const std::exception& e) {
         TraceHttpFailure(is_post ? "POST" : "GET", ToUtf8(wurl), e.what());
         return JS_Throw(ctx, JS_NewString(ctx, ("axios 请求失败: " + std::string(e.what())).c_str()));
@@ -721,14 +828,44 @@ JSValue AxiosCore(JSContext* ctx, std::string url, JSValueConst config,
 
     TraceHttpRequest(is_post ? "POST" : "GET", url, wurl, is_post, headers, post_body, r);
 
-    // 构造 Promise 并同步 resolve（让 Await 用微任务泵出 await 链）
+    // 与原版 axios 一致：默认 validateStatus = 2xx，否则 Promise reject。
+    // 以前所有状态码都 resolve，插件会把错误页当成功结果继续解析。
+    bool status_ok = r.status >= 200 && r.status < 300;
+    {
+        JSValue validate = JS_UNDEFINED;
+        if (JS_IsObject(config)) validate = JS_GetPropertyStr(ctx, config, "validateStatus");
+        if (!JS_IsFunction(ctx, validate) && JS_IsObject(base_config))
+            validate = JS_GetPropertyStr(ctx, base_config, "validateStatus");
+        if (JS_IsFunction(ctx, validate)) {
+            JSValue arg = JS_NewInt32(ctx, static_cast<int>(r.status));
+            JSValue ret = JS_Call(ctx, validate, JS_UNDEFINED, 1, &arg);
+            if (!JS_IsException(ret)) status_ok = JS_ToBool(ctx, ret) != 0;
+            JS_FreeValue(ctx, ret);
+            JS_FreeValue(ctx, arg);
+        }
+        JS_FreeValue(ctx, validate);
+    }
+
+    // 构造 Promise（同步 resolve / reject，让 Await 用微任务泵出 await 链）
     JSValue resolve[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolve);
     if (JS_IsException(promise)) {
         JS_FreeValue(ctx, resolve[0]); JS_FreeValue(ctx, resolve[1]);
         return promise;
     }
-    JSValue resp = BuildResponse(ctx, r, cfg, response_type);
+    if (!status_ok) {
+        std::string message = "Request failed with status code " +
+                              std::to_string(r.status);
+        JSValue error = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, message.c_str()));
+        JSValue arg = error;
+        JS_Call(ctx, resolve[1], JS_UNDEFINED, 1, &arg);
+        JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, resolve[0]);
+        JS_FreeValue(ctx, resolve[1]);
+        return promise;
+    }
+    JSValue resp = BuildResponse(ctx, r, local_cfg, response_type);
     JSValue arg = resp;
     JS_Call(ctx, resolve[0], JS_UNDEFINED, 1, &arg);
     JS_FreeValue(ctx, resp);
@@ -737,29 +874,43 @@ JSValue AxiosCore(JSContext* ctx, std::string url, JSValueConst config,
     return promise;
 }
 
+// 从 axios 实例（函数对象）上取它自己的 base config。
+JSValue InstanceBaseConfig(JSContext* ctx, JSValueConst self) {
+    if (!JS_IsObject(self)) return JS_UNDEFINED;
+    return JS_GetPropertyStr(ctx, self, "__mf_base");  // 调用方释放
+}
+
 // axios.get(url, config)
-JSValue AxiosGet(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+JSValue AxiosGet(JSContext* ctx, JSValueConst self, int argc, JSValueConst* argv) {
     auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
     const char* url_c = (argc >= 1) ? JS_ToCString(ctx, argv[0]) : nullptr;
     std::string url = url_c ? url_c : "";
     if (url_c) JS_FreeCString(ctx, url_c);
     JSValueConst config = (argc >= 2 && !JS_IsUndefined(argv[1])) ? argv[1] : JS_UNDEFINED;
-    return AxiosCore(ctx, url, config, JS_UNDEFINED, eng ? eng->network() : NetworkConfig{}, false);
+    JSValue base = InstanceBaseConfig(ctx, self);
+    JSValue result = AxiosCore(ctx, url, base, config, JS_UNDEFINED,
+                               eng ? eng->network() : NetworkConfig{}, false, "get");
+    JS_FreeValue(ctx, base);
+    return result;
 }
 
 // axios.post(url, data, config)
-JSValue AxiosPost(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+JSValue AxiosPost(JSContext* ctx, JSValueConst self, int argc, JSValueConst* argv) {
     auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
     const char* url_c = (argc >= 1) ? JS_ToCString(ctx, argv[0]) : nullptr;
     std::string url = url_c ? url_c : "";
     if (url_c) JS_FreeCString(ctx, url_c);
     JSValueConst data = (argc >= 2) ? argv[1] : JS_UNDEFINED;
     JSValueConst config = (argc >= 3 && !JS_IsUndefined(argv[2])) ? argv[2] : JS_UNDEFINED;
-    return AxiosCore(ctx, url, config, data, eng ? eng->network() : NetworkConfig{}, true);
+    JSValue base = InstanceBaseConfig(ctx, self);
+    JSValue result = AxiosCore(ctx, url, base, config, data,
+                               eng ? eng->network() : NetworkConfig{}, true, "post");
+    JS_FreeValue(ctx, base);
+    return result;
 }
 
 // axios.request(config)：从 config.url / config.method / config.data 取参数
-JSValue AxiosRequest(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+JSValue AxiosRequest(JSContext* ctx, JSValueConst self, int argc, JSValueConst* argv) {
     auto* eng = static_cast<QuickJsEngine*>(JS_GetContextOpaque(ctx));
     JSValueConst config = (argc >= 1 && !JS_IsUndefined(argv[0])) ? argv[0] : JS_UNDEFINED;
     if (!JS_IsObject(config)) return JS_Throw(ctx, JS_NewString(ctx, "axios.request: 缺少 config"));
@@ -776,42 +927,57 @@ JSValue AxiosRequest(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     bool is_post = !method.empty() &&
         (method == "post" || method == "POST" || method == "put" || method == "PUT" || method == "delete" || method == "DELETE");
     JSValue data = JS_GetPropertyStr(ctx, config, "data");
-    JSValue result = AxiosCore(ctx, url, config, data, eng ? eng->network() : NetworkConfig{}, is_post);
+    JSValue base = InstanceBaseConfig(ctx, self);
+    const char* method_key = is_post ? (method == "put" || method == "PUT" ? "put" : "post") : "get";
+    JSValue result = AxiosCore(ctx, url, base, config, data,
+                               eng ? eng->network() : NetworkConfig{}, is_post, method_key);
+    JS_FreeValue(ctx, base);
     JS_FreeValue(ctx, data);
     return result;
 }
 
 // axios(config) 或 axios(url) —— 复刻 MusicFree：require('axios') 返回的对象本身
 // 可调用，且其 .default 指向自身（插件经 _interopRequireDefault 后通过 .default 调用）。
-JSValue AxiosBase(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+JSValue AxiosBase(JSContext* ctx, JSValueConst self, int argc, JSValueConst* argv) {
     if (argc >= 1 && JS_IsString(argv[0]))
-        return AxiosGet(ctx, JS_UNDEFINED, argc, argv); // axios(url) -> GET
-    return AxiosRequest(ctx, JS_UNDEFINED, argc, argv); // axios(config)
+        return AxiosGet(ctx, self, argc, argv); // axios(url) -> GET
+    return AxiosRequest(ctx, self, argc, argv); // axios(config)
 }
 
 // 构造一个 axios 实例（本身可调用，并带 get/post/request/defaults/create/interceptors）。
-JSValue MakeAxios(JSContext* ctx, const NetworkConfig& cfg) {
+// base_config 对应 axios.create(config) 的 config（全局 axios 为 undefined）。
+JSValue MakeAxios(JSContext* ctx, const NetworkConfig& cfg,
+                  JSValueConst base_config = JS_UNDEFINED) {
     JSValue axios = JS_NewCFunction(ctx, &AxiosBase, "axios", 1);
     JS_SetPropertyStr(ctx, axios, "get", JS_NewCFunction(ctx, &AxiosGet, "get", 2));
     JS_SetPropertyStr(ctx, axios, "post", JS_NewCFunction(ctx, &AxiosPost, "post", 3));
     JS_SetPropertyStr(ctx, axios, "request", JS_NewCFunction(ctx, &AxiosRequest, "request", 1));
+    // 实例级配置：get/post/request 通过 this 上的 __mf_base 读取（baseURL/headers/timeout）。
+    JS_SetPropertyStr(ctx, axios, "__mf_base",
+                      JS_IsObject(base_config) ? JS_DupValue(ctx, base_config)
+                                               : JS_UNDEFINED);
 
+    // 对齐原版 MusicFree：axios.defaults.timeout = 2000（毫秒）。
     JSValue defaults = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, defaults, "timeout", JS_NewInt32(ctx, (int)cfg.timeout_ms));
+    JS_SetPropertyStr(ctx, defaults, "timeout", JS_NewInt32(ctx, 2000));
     JSValue dheaders = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, dheaders, "common", JS_NewObject(ctx));
     JS_SetPropertyStr(ctx, defaults, "headers", dheaders);
     JS_SetPropertyStr(ctx, axios, "defaults", defaults);
 
-    // create(config) -> 新实例（此处忽略 config 差异，复用同一后端）
+    // create(config) -> 新实例：config 必须生效（原版 axios 语义）。
     JS_SetPropertyStr(ctx, axios, "create",
         JS_NewCFunction(ctx,
-            [](JSContext* c, JSValueConst, int, JSValueConst*) -> JSValue {
+            [](JSContext* c, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
                 auto* e = static_cast<QuickJsEngine*>(JS_GetContextOpaque(c));
-                return MakeAxios(c, e ? e->network() : NetworkConfig{});
+                JSValueConst config =
+                    (argc >= 1 && JS_IsObject(argv[0])) ? argv[0] : JS_UNDEFINED;
+                return MakeAxios(c, e ? e->network() : NetworkConfig{}, config);
             }, "create", 1));
 
-    // interceptors.response.use(onFulfilled) —— 仅记录第一个回调（尽力）
+    // interceptors.response.use —— 原版由宿主注册 set-cookie 归一化；这里已在
+    // BuildResponse 里原生实现（set-cookie 数组 + x-set-cookie），插件再注册的
+    // 回调保持 no-op（与原版一致地返回 undefined）。
     JSValue interceptors = JS_NewObject(ctx);
     JSValue response = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, response, "use",

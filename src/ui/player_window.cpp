@@ -6584,10 +6584,46 @@ bool PlayerWindow::PlayCurrent() {
     }
     // 走到这里说明已有真实可播源，pending 结束。
     pending_online_resolve_ = false;
-    const bool play_ok = audio_->Play(play_path, requested_track.subtrack);
+    bool play_ok = audio_->Play(play_path, requested_track.subtrack);
     musicfree::AppendPlayLog(std::string("PLAYLIST audio_play ok=") +
                              (play_ok ? "1" : "0") + " network=" +
-                             (play_path.wstring().rfind(L"http", 0) == 0 ? "1" : "0"));
+                             (play_path.wstring().rfind(L"http", 0) == 0 ? "1" : "0") +
+                             (play_ok ? "" : " error=" +
+                                 core::WideToUtf8(audio_->LastError())));
+    // 在线条目的本地副本打不开（插件 reader 对同名文件再次 open 会失败：
+    // reader slot 3 Open(IStream, flags) 0x8BDA000A，常见于上一遍还在收尾或
+    // 文件刚被后台缓存写坏）时，不要直接报「无法打开网络媒体」，改走直链流式。
+    if (!play_ok && play_path.wstring().rfind(L"http", 0) != 0 &&
+        requested_track.path.wstring().rfind(L"http", 0) == 0) {
+        std::string fallback_platform, fallback_song_id;
+        if (OnlineTrackIdentity(requested_track, &fallback_platform,
+                                &fallback_song_id)) {
+            const auto stream = musicfree::PeekResolveCache(
+                fallback_platform, fallback_song_id);
+            if (stream && !stream->url.empty()) {
+                const bool stream_hls = stream->url.size() >= 5 &&
+                    _stricmp(stream->url.c_str() + stream->url.size() - 5,
+                             ".m3u8") == 0;
+                audio::SetPendingOnlineStream(audio::OnlineStreamDescriptor{
+                    stream->url, stream->headers, stream->user_agent,
+                    stream_hls});
+                play_ok = audio_->Play(core::Utf8ToWide(stream->url),
+                                       requested_track.subtrack);
+                musicfree::AppendPlayLog(
+                    std::string("PLAYLIST local_fail_stream ok=") +
+                    (play_ok ? "1" : "0") +
+                    (play_ok ? "" : " error=" +
+                        core::WideToUtf8(audio_->LastError())));
+                if (play_ok) {
+                    play_path = core::Utf8ToWide(stream->url);
+                    StartOnlineTrackBackgroundCache(requested_track,
+                                                    stream->url,
+                                                    stream->headers,
+                                                    stream->user_agent);
+                }
+            }
+        }
+    }
     if (!play_ok) {
         // 流式打开失败（如 HLS 系统不支持、链接已失效）→ 回退阻塞下载后本地播放。
         if (requested_track.path.wstring().rfind(L"http", 0) == 0 &&
@@ -6627,6 +6663,7 @@ bool PlayerWindow::PlayCurrent() {
     settings_.player.playing_time = 0;
     playback_source_open_ = true;
     opened_track_ = requested_track;
+    online_resolve_attempts_ = 0;
     const auto metadata = audio_->Metadata();
     taskbar_preview_.SetSource(window_, requested_track.path, metadata);
 #if !defined(TTPLAYER_LEGACY_WINDOWS)

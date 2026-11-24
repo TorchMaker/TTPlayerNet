@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -956,6 +957,20 @@ bool HasDirectLine(const ttplayer::video::VideoDetail& detail) {
     return false;
 }
 
+// 豆瓣资料页（豆瓣片单 DouDou spider 的详情只给一条「豆瓣页面」线路：
+// sharing_url / movie.douban.com/subject/... / doubanapp/dispatch/...）。
+// 这不是播放页：parses 解析接口拿不到直链，WebView2 兜底又会把豆瓣页面
+// 整个弹出来（用户反馈「这种的不能要」）。判定：非直链媒体 + douban 域名。
+bool IsDoubanReferencePage(const std::string& url) {
+    if (url.empty() || ttplayer::video::IsDirectMediaUrl(url)) return false;
+    std::string lower;
+    lower.reserve(url.size());
+    for (unsigned char c : url)
+        lower.push_back(static_cast<char>(tolower(c)));
+    return lower.find("douban.com") != std::string::npos ||
+           lower.find("doubanapp.com") != std::string::npos;
+}
+
 std::string NowStamp() {
     std::time_t now = std::time(nullptr);
     std::tm tm{};
@@ -966,7 +981,10 @@ std::string NowStamp() {
 }
 
 // 追加一段诊断日志到 <exe>\video\cross_source.log（失败静默，不影响播放）。
+// 跨源扫描是多线程并行的，这里必须串行化，否则多行会互相截断。
 void AppendCrossSourceLog(const std::string& text) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
     try {
         std::wstring exe_w(32768, L'\0');
         const DWORD n = GetModuleFileNameW(nullptr, exe_w.data(),
@@ -1028,6 +1046,11 @@ bool SameVideoTitle(const ttplayer::video::VideoItem& it,
 
 // 串行扫描其它站点找同名影片的直链线路。整体截止 25 秒、最多 40 个站点；
 // 拿到 ≥6 条直链线路或 ≥3 个可用站点即提前结束；单站点异常跳过。
+//
+// 2026-11-24 改并行：真机日志显示站点普遍变慢后，串行 25s 预算只够扫
+// 26 个候选中的 8 个（每次 6s 超时），命中率暴跌（11-14 扫 10 命中 /
+// 11-24 扫 8 未命中）。与 FindCrossSourceDetail 同构：6 线程抢答，
+// 逐站结果写 cross_source.log 供后续分析。
 CrossSourceOutcome FindCrossSourceDirectLines(
     ttplayer::video::VideoSourceManager* mgr, const std::string& current_key,
     const std::string& title) {
@@ -1059,60 +1082,128 @@ CrossSourceOutcome FindCrossSourceDirectLines(
     }
 
     const std::string want = NormalizeVideoTitle(title, "");
-    // 单个请求最长 6s（video_cms 内部也把单请求超时压到 6s）：只在剩余预算
-    // 还够一次请求时才发起下一个请求，保证整段 ≤ 25s 返回。
+    // 单个请求最长 6s（video_cms 内部也把单请求超时压到 6s）。
+    // 并行后每个 worker 发请求前都检查预算；最坏比预算多跑一个 6s 请求。
     constexpr long long kBudgetMs = 25000;
-    constexpr long long kRequestMs = 6000;
-    std::set<std::string> seen_urls;
-    int hit_sites = 0;
-    for (const auto& s : sites) {
-        if (out.scanned >= 40) break;
-        if (elapsed_ms() + kRequestMs > kBudgetMs) break;
-        if (IsMusicFreeShuttingDown()) break;
-        const std::string skey = s.key.empty() ? s.name : s.key;
-        if (skey == current_key) continue;
-        ++out.scanned;
-        try {
-            const ttplayer::video::VideoListing listing =
-                ttplayer::video::FetchSearch(s, title, 1, mgr->network());
-            const ttplayer::video::VideoItem* hit = nullptr;
-            for (const auto& it : listing.items) {
-                if (SameVideoTitle(it, title, want)) {
-                    hit = &it;
-                    break;
+    constexpr int kWorkers = 6;
+    constexpr int kMaxScan = 40;
+    std::atomic<bool> stop{false};
+    std::atomic<int> scanned{0};
+    std::atomic<int> hit_sites{0};
+    std::atomic<std::size_t> cursor{0};
+    std::mutex out_mtx;
+    std::set<std::string> seen_urls;   // guarded by out_mtx
+
+    auto worker = [&] {
+        // ScopedHttpTimeout 是每线程覆盖值：各 worker 独立设置互不影响。
+        ttplayer::musicfree::ScopedHttpTimeout guard(6000);
+        for (;;) {
+            if (stop.load(std::memory_order_relaxed) ||
+                IsMusicFreeShuttingDown())
+                return;
+            if (elapsed_ms() > kBudgetMs) return;
+            if (scanned.load(std::memory_order_relaxed) >= kMaxScan) return;
+            const std::size_t i = cursor.fetch_add(1);
+            if (i >= sites.size()) return;
+            const auto& s = sites[i];
+            const std::string skey = s.key.empty() ? s.name : s.key;
+            if (skey == current_key) continue;
+            scanned.fetch_add(1, std::memory_order_relaxed);
+            const auto site_started = std::chrono::steady_clock::now();
+            const auto site_ms = [&site_started] {
+                return static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - site_started)
+                        .count());
+            };
+            std::string result;
+            try {
+                const ttplayer::video::VideoListing listing =
+                    ttplayer::video::FetchSearch(s, title, 1, mgr->network());
+                const ttplayer::video::VideoItem* hit = nullptr;
+                for (const auto& it : listing.items) {
+                    if (SameVideoTitle(it, title, want)) {
+                        hit = &it;
+                        break;
+                    }
                 }
-            }
-            if (!hit) continue;
-            if (elapsed_ms() + kRequestMs > kBudgetMs) break;
-            const ttplayer::video::VideoDetail detail =
-                ttplayer::video::FetchDetail(s, *hit, mgr->network());
-            int new_lines = 0;
-            std::size_t new_eps = 0;
-            for (const auto& line : detail.lines) {
-                ttplayer::video::VideoLine cross;
-                cross.name = s.name + "·" + line.name;
-                for (const auto& ep : line.episodes) {
-                    if (ep.url.empty()) continue;
-                    if (!ttplayer::video::IsDirectMediaUrl(ep.url)) continue;
-                    if (!seen_urls.insert(ep.url).second) continue;
-                    cross.episodes.push_back(ep);
+                if (!hit) {
+                    result = "no-match";
+                } else if (stop.load(std::memory_order_relaxed)) {
+                    result = "skipped";
+                } else {
+                    const ttplayer::video::VideoDetail detail =
+                        ttplayer::video::FetchDetail(s, *hit, mgr->network());
+                    int new_lines = 0;
+                    std::size_t new_eps = 0;
+                    std::vector<ttplayer::video::VideoLine> my_lines;
+                    for (const auto& line : detail.lines) {
+                        ttplayer::video::VideoLine cross;
+                        cross.name = s.name + "·" + line.name;
+                        for (const auto& ep : line.episodes) {
+                            if (ep.url.empty()) continue;
+                            if (!ttplayer::video::IsDirectMediaUrl(ep.url))
+                                continue;
+                            cross.episodes.push_back(ep);
+                        }
+                        if (cross.episodes.empty()) continue;
+                        new_eps += cross.episodes.size();
+                        ++new_lines;
+                        my_lines.push_back(std::move(cross));
+                    }
+                    if (new_lines == 0) {
+                        result = "detail-no-direct";
+                    } else {
+                        std::lock_guard<std::mutex> lk(out_mtx);
+                        // URL 去重必须在锁内做（seen_urls 跨 worker 共享）：
+                        // 与原串行版一致，重复 URL 的选集丢弃、全重复则丢整条。
+                        int merged_lines = 0;
+                        std::size_t merged_eps = 0;
+                        for (auto& cross : my_lines) {
+                            std::vector<ttplayer::video::VideoEpisode> fresh;
+                            for (auto& ep : cross.episodes)
+                                if (seen_urls.insert(ep.url).second)
+                                    fresh.push_back(std::move(ep));
+                            if (fresh.empty()) continue;
+                            merged_eps += fresh.size();
+                            cross.episodes = std::move(fresh);
+                            out.lines.push_back(std::move(cross));
+                            ++merged_lines;
+                        }
+                        if (merged_lines > 0) {
+                            if (out.first_site.empty()) out.first_site = s.name;
+                            out.hits.push_back(
+                                s.name + "(线路" + std::to_string(merged_lines) +
+                                "/集" + std::to_string(merged_eps) + ")");
+                            hit_sites.fetch_add(1, std::memory_order_relaxed);
+                            result = "hit(线路" + std::to_string(merged_lines) +
+                                     "/集" + std::to_string(merged_eps) + ")";
+                            if (out.lines.size() >= 6 ||
+                                hit_sites.load(std::memory_order_relaxed) >= 3)
+                                stop.store(true, std::memory_order_relaxed);
+                        } else {
+                            result = "dup-only";   // 线路与已收录的完全重复
+                        }
+                    }
                 }
-                if (cross.episodes.empty()) continue;
-                new_eps += cross.episodes.size();
-                ++new_lines;
-                out.lines.push_back(std::move(cross));
+            } catch (const std::exception& e) {
+                result = std::string("error:") + e.what();
+            } catch (...) {
+                result = "error:unknown";
             }
-            if (new_lines > 0) {
-                ++hit_sites;
-                if (out.first_site.empty()) out.first_site = s.name;
-                out.hits.push_back(s.name + "(线路" + std::to_string(new_lines) +
-                                   "/集" + std::to_string(new_eps) + ")");
-            }
-        } catch (...) {
-            // 单个站点搜索 / 详情失败不影响其它源。
+            // 逐站结果：以后「哪个源扫了、为什么没命中、花了多久」看这里。
+            AppendCrossSourceLog(
+                "[" + NowStamp() + "] SCAN 《" + title + "》 site=" + s.name +
+                " 耗时:" + std::to_string(site_ms()) + "ms result=" + result);
         }
-        if (out.lines.size() >= 6 || hit_sites >= 3) break;
-    }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(kWorkers);
+    for (int i = 0; i < kWorkers && i < static_cast<int>(sites.size()); ++i)
+        pool.emplace_back(worker);
+    for (auto& t : pool)
+        if (t.joinable()) t.join();
+    out.scanned = scanned.load();
     out.elapsed_ms = elapsed_ms();
     return out;
 }
@@ -1197,6 +1288,19 @@ CrossDetailOutcome FindCrossSourceDetail(
                 if (stop.load(std::memory_order_relaxed)) return;
                 ttplayer::video::VideoDetail detail =
                     ttplayer::video::FetchDetail(s, *hit, mgr->network());
+                // 豆瓣资料页线路不算可用详情（与桥层剔除同规则）：否则抢答
+                // 会选中豆瓣片单自己，把「没有可播线路」原样带回来。
+                detail.lines.erase(
+                    std::remove_if(
+                        detail.lines.begin(), detail.lines.end(),
+                        [](const ttplayer::video::VideoLine& line) {
+                            if (line.episodes.empty()) return true;
+                            for (const auto& ep : line.episodes)
+                                if (!IsDoubanReferencePage(ep.url))
+                                    return false;
+                            return true;
+                        }),
+                    detail.lines.end());
                 if (detail.lines.empty()) continue;
                 if (detail.title.empty()) detail.title = hit->title;
                 if (detail.pic.empty()) detail.pic = hit->pic;
@@ -1806,8 +1910,28 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                     // CMS 源找直链。空线路一并剔除（无用）。
                                     bool cloud_only = false;
                                     if (got) {
-                                        const size_t before =
-                                            detail.lines.size();
+                                        // 网盘分享页 + 豆瓣资料页整条剔除：
+                                        // 前者要登录网盘、后者根本不是播放页
+                                        // （parses 拿不到直链，WebView2 兜底
+                                        //  会把豆瓣页面弹出来——用户明确说不能要）。
+                                        // 全被剔光则 lines.empty() 触发下面的
+                                        // 跨源同名回退，去其它 CMS 源找直链。
+                                        int douban_removed = 0;
+                                        int cloud_removed = 0;
+                                        for (const auto& line : detail.lines) {
+                                            if (line.episodes.empty()) continue;
+                                            bool all_douban = true;
+                                            bool all_cloud = true;
+                                            for (const auto& ep : line.episodes) {
+                                                if (!IsDoubanReferencePage(ep.url))
+                                                    all_douban = false;
+                                                if (!ttplayer::video::IsCloudShareUrl(
+                                                        ep.url))
+                                                    all_cloud = false;
+                                            }
+                                            if (all_douban) ++douban_removed;
+                                            else if (all_cloud) ++cloud_removed;
+                                        }
                                         detail.lines.erase(
                                             std::remove_if(
                                                 detail.lines.begin(),
@@ -1815,13 +1939,32 @@ void RegisterVideoCommands(MusicFreeBridge& bridge) {
                                                 [](const ttplayer::video::VideoLine& line) {
                                                     for (const auto& ep : line.episodes)
                                                         if (!ttplayer::video::IsCloudShareUrl(
-                                                                ep.url))
+                                                                ep.url) &&
+                                                            !IsDoubanReferencePage(ep.url))
                                                             return false;
                                                     return true;
                                                 }),
                                             detail.lines.end());
-                                        cloud_only = before > 0 &&
-                                                     detail.lines.empty();
+                                        // 只有「全是网盘线路被剔光」才按网盘资源
+                                        // 站学习；豆瓣资料页剔光不算（那是资料源，
+                                        // 不是网盘站，误标会让跨源扫描跳过它）。
+                                        cloud_only = cloud_removed > 0 &&
+                                                     detail.lines.empty() &&
+                                                     douban_removed == 0;
+                                        if (douban_removed > 0) {
+                                            AppendCrossSourceLog(
+                                                "[" + NowStamp() +
+                                                "] OPEN 《" + title +
+                                                "》 剔除豆瓣资料页线路 " +
+                                                std::to_string(douban_removed) +
+                                                " 条 → lines=" +
+                                                std::to_string(detail.lines.size()));
+                                            if (detail.lines.empty())
+                                                first_error =
+                                                    "当前片源只提供豆瓣资料页"
+                                                    "（不是播放页），已自动去其它"
+                                                    "片源找可播线路";
+                                        }
                                         // 原站有线路、但全是网盘分享页：这不是
                                         // 「站点坏了」，而是该源本身就是网盘资源
                                         // 站。把原因说清楚，避免用户以为程序坏了。

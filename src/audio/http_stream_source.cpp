@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <cstring>
 #include <map>
@@ -115,6 +116,32 @@ std::wstring HResultMessage(std::wstring_view operation, HRESULT result) {
     return message;
 }
 
+// 自定义 IMFByteStream 必须自带 MF_BYTESTREAM_CONTENT_TYPE，否则
+// MFCreateSourceReaderFromByteStream 找不到字节流处理器，返回
+// MF_E_UNSUPPORTED_BYTESTREAM_TYPE（0xC00D36C4）——真机上的「无法打开网络媒体」。
+// 以直链路径的扩展名为准（查询串/片段要先去掉）。
+std::wstring GuessMimeType(const std::string& url) {
+    std::string path = url;
+    const size_t stop = path.find_first_of("?#");
+    if (stop != std::string::npos) path.resize(stop);
+    const size_t slash = path.find_last_of('/');
+    const size_t dot = path.find_last_of('.');
+    std::string extension;
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        extension = path.substr(dot + 1);
+    for (char& c : extension)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (extension == "m4a" || extension == "mp4" || extension == "m4b")
+        return L"audio/mp4";
+    if (extension == "aac") return L"audio/aac";
+    if (extension == "flac") return L"audio/flac";
+    if (extension == "wav") return L"audio/wav";
+    if (extension == "ogg" || extension == "oga") return L"audio/ogg";
+    if (extension == "wma" || extension == "asf") return L"audio/x-ms-wma";
+    // mp3/mp2/mpa 及未知扩展名都按 MPEG 音频处理：绝大多数 CDN 直链是这一种。
+    return L"audio/mpeg";
+}
+
 uint16_t ReadBe16(const std::byte* value) {
     return static_cast<uint16_t>((std::to_integer<uint8_t>(value[0]) << 8) |
                                  std::to_integer<uint8_t>(value[1]));
@@ -205,8 +232,18 @@ public:
 
     // ISequentialStream / IStream
     HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
-        if (!pv || !pcbRead) return STG_E_INVALIDPOINTER;
+        if (!pcbRead) return STG_E_INVALIDPOINTER;
         std::unique_lock lock(mutex_);
+        // pb == NULL 是 IStream 的「跳过 cb 字节」约定：Media Foundation 在跳过
+        // ID3v2 头 / 探测帧同步时会这样调用。旧实现直接返回
+        // STG_E_INVALIDPOINTER，导致 MFCreateSourceReaderFromByteStream /
+        // 首次 ReadSample 立刻失败（真机表现为「取链成功但打不开网络媒体」）。
+        if (!pv) {
+            const size_t before = read_pos_;
+            read_pos_ = std::min<size_t>(read_pos_ + cb, write_pos_);
+            *pcbRead = static_cast<ULONG>(read_pos_ - before);
+            return S_OK;
+        }
         while (read_pos_ >= write_pos_ && !eof_ && SUCCEEDED(error_)) {
             if (cv_.wait_for(lock, std::chrono::milliseconds(200)) ==
                 std::cv_status::timeout)
@@ -263,16 +300,75 @@ public:
                                           DWORD) override {
         return E_NOTIMPL;
     }
-    HRESULT STDMETHODCALLTYPE Stat(STATSTG* pstatstg, DWORD) override {
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* pstatstg, DWORD grfMode) override {
         if (!pstatstg) return STG_E_INVALIDPOINTER;
+        std::scoped_lock lock(mutex_);
         std::memset(pstatstg, 0, sizeof(STATSTG));
         pstatstg->type = STGTY_STREAM;
         pstatstg->grfMode = STGM_READ;
-        // 流式：长度未知（0），让 MF 按无界顺序流处理，避免它试图 seek 到末尾探测时长。
-        pstatstg->cbSize.QuadPart = 0;
+        // 已知 Content-Length 时如实上报，便于 MF 推断容器/时长；未知（分块传输、
+        // 直播流）保持 0，让 MF 按无界顺序流处理，避免它 seek 到末尾探测长度。
+        pstatstg->cbSize.QuadPart = known_length_ ? total_length_ : 0;
+        // MF 会用名字做类型推断（扩展名）；STATFLAG_NONAME 时才省略。
+        if ((grfMode & STATFLAG_NONAME) == 0 && !url_.empty()) {
+            const std::wstring name = ToWide(url_);
+            const size_t bytes = (name.size() + 1) * sizeof(wchar_t);
+            pstatstg->pwcsName =
+                static_cast<wchar_t*>(CoTaskMemAlloc(bytes));
+            if (!pstatstg->pwcsName) return E_OUTOFMEMORY;
+            std::memcpy(pstatstg->pwcsName, name.c_str(), bytes);
+        }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+
+    // 下载线程记录的网络层失败原因（WinHTTP 错误码 / HTTP 状态码），由
+    // HttpStreamSource::Open 拼进 LastError，最终写进 play.log。
+    std::wstring Diagnostic() {
+        std::scoped_lock lock(mutex_);
+        return diagnostic_;
+    }
+
+    // 等首包：Media Foundation 在创建源读取器时会立刻探测长度并读取头部，
+    // 此时若 HTTP 响应还没到，会把字节流判定为「不支持的类型」
+    // （MF_E_UNSUPPORTED_BYTESTREAM_TYPE / 0xC00D36C4）。真机日志里同一首歌
+    // 有时能开、有时报这个错，就是这段竞态。先等数据/失败再交给 MF。
+    bool WaitReady(std::chrono::milliseconds budget) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, budget, [this] {
+            return write_pos_ > 0 || eof_ || FAILED(error_);
+        });
+    }
+
+    HRESULT StreamError() {
+        std::scoped_lock lock(mutex_);
+        return error_;
+    }
+
+    // 已缓冲数据的前 24 字节（十六进制 + 可打印字符）：用于判断 CDN 是否把
+    // 错误页（HTML/JSON）当成音频返回，导致 MF 认不出字节流类型。
+    std::wstring Preview() {
+        std::unique_lock lock(mutex_);
+        const size_t stop = cv_.wait_for(
+            lock, std::chrono::milliseconds(1500),
+            [this] { return write_pos_ > 0 || eof_; });
+        (void)stop;
+        const size_t count = std::min<size_t>(write_pos_, 24);
+        if (count == 0) return L"(no data)";
+        static const wchar_t* kHex = L"0123456789ABCDEF";
+        std::wstring hex;
+        std::wstring text;
+        for (size_t i = 0; i < count; ++i) {
+            const unsigned char b =
+                static_cast<unsigned char>(buffer_[i]);
+            hex.push_back(kHex[b >> 4]);
+            hex.push_back(kHex[b & 0x0F]);
+            hex.push_back(L' ');
+            text.push_back(b >= 0x20 && b < 0x7F ? static_cast<wchar_t>(b)
+                                                 : L'.');
+        }
+        return hex + L"|" + text;
+    }
 
 private:
     void DownloadLoop() {
@@ -320,7 +416,9 @@ private:
         DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
         WinHttpSetOption(request_, WINHTTP_OPTION_REDIRECT_POLICY, &redirect,
                          sizeof(redirect));
-        WinHttpSetTimeouts(request_, 20000, 20000, 20000, 20000);
+        // 与 AudioEngine 的 4 秒打开预算对齐：连接/首字节不再等 20 秒，
+        // 失败就尽快回退到本地副本，界面不长时间挂在「打不开」上。
+        WinHttpSetTimeouts(request_, 5000, 5000, 5000, 5000);
 
         std::wstring header_blob;
         for (const auto& kv : headers_) {
@@ -336,11 +434,26 @@ private:
 
         if (!WinHttpSendRequest(request_, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 nullptr, 0, 0, 0)) {
-            SetError(HRESULT_FROM_WIN32(GetLastError()));
+            SetError(HRESULT_FROM_WIN32(GetLastError()), L"WinHttpSendRequest");
             return;
         }
         if (!WinHttpReceiveResponse(request_, nullptr)) {
-            SetError(HRESULT_FROM_WIN32(GetLastError()));
+            SetError(HRESULT_FROM_WIN32(GetLastError()), L"WinHttpReceiveResponse");
+            return;
+        }
+
+        // 非 2xx（典型：直链需要 Referer/UA，CDN 回 403）必须立刻失败并记下状态码，
+        // 否则 MF 会拿着一段错误页当音频解，用户只看到笼统的「无法打开」。
+        DWORD status = 0, status_size = sizeof(status);
+        if (WinHttpQueryHeaders(
+                request_,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                WINHTTP_NO_HEADER_INDEX) &&
+            (status < 200 || status >= 300)) {
+            // 12159 = ERROR_HTTP_INVALID_STATUS_CODE（部分 SDK 的 winhttp.h 不导出）。
+            SetError(HRESULT_FROM_WIN32(12159),
+                     L"HTTP " + std::to_wstring(status));
             return;
         }
 
@@ -354,6 +467,24 @@ private:
             std::scoped_lock lock(mutex_);
             total_length_ = len;
             known_length_ = true;
+        }
+
+        // 记录响应概况（状态码 + Content-Type + 长度）：MF 报「字节流类型不支持」
+        // 时，多半是 CDN 用 200 返回了 HTML/JSON 错误页而不是音频。
+        {
+            wchar_t type_buffer[128]{};
+            DWORD type_size = sizeof(type_buffer) - sizeof(wchar_t);
+            std::wstring content_type;
+            if (WinHttpQueryHeaders(request_, WINHTTP_QUERY_CONTENT_TYPE,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, type_buffer,
+                                    &type_size, WINHTTP_NO_HEADER_INDEX))
+                content_type = type_buffer;
+            std::wstring detail = L"HTTP " + std::to_wstring(status);
+            if (!content_type.empty()) detail += L" " + content_type;
+            if (known_length_)
+                detail += L" len=" + std::to_wstring(total_length_);
+            std::scoped_lock lock(mutex_);
+            diagnostic_ = detail;
         }
 
         DWORD avail = 0;
@@ -382,9 +513,10 @@ private:
         cv_.notify_all();
     }
 
-    void SetError(HRESULT hr) {
+    void SetError(HRESULT hr, std::wstring detail = {}) {
         std::scoped_lock lock(mutex_);
         error_ = hr;
+        if (!detail.empty()) diagnostic_ = std::move(detail);
         eof_ = true;
         cv_.notify_all();
     }
@@ -400,6 +532,7 @@ private:
     bool known_length_ = false;
     bool eof_ = false;
     HRESULT error_ = S_OK;
+    std::wstring diagnostic_;
 
     HINTERNET session_ = nullptr;
     HINTERNET connect_ = nullptr;
@@ -422,7 +555,8 @@ bool HttpStreamSource::Fail(std::wstring_view operation, HRESULT result) {
 
 bool HttpStreamSource::Open(const std::filesystem::path& path,
                             const PlaybackOptions&) {
-    auto descriptor = TakePendingOnlineStream(ToUtf8(path.native()));
+    const auto descriptor = TakePendingOnlineStream(ToUtf8(path.native()));
+    WinHttpStream* http_stream_raw = nullptr;
 
     Microsoft::WRL::ComPtr<IMFAttributes> attributes;
     HRESULT result = platform::MFCreateAttributes(&attributes, 1);
@@ -433,15 +567,77 @@ bool HttpStreamSource::Open(const std::filesystem::path& path,
             Microsoft::WRL::ComPtr<IStream> istream(
                 static_cast<IStream*>(new WinHttpStream(
                     descriptor->url, descriptor->headers, descriptor->user_agent)));
-            if (!istream || !static_cast<WinHttpStream*>(istream.Get())->Start()) {
+            http_stream_raw = static_cast<WinHttpStream*>(istream.Get());
+            if (!istream || !http_stream_raw->Start()) {
                 result = E_FAIL;
+            } else if (!http_stream_raw->WaitReady(
+                           std::chrono::milliseconds(3000))) {
+                error_ = L"online stream produced no data within 3 seconds";
+                error_result_ = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                return false;
+            } else if (FAILED(http_stream_raw->StreamError())) {
+                const HRESULT stream_result = http_stream_raw->StreamError();
+                error_ = HResultMessage(L"online stream request", stream_result);
+                const std::wstring detail = http_stream_raw->Diagnostic();
+                if (!detail.empty()) {
+                    error_ += L" [";
+                    error_ += detail;
+                    error_ += L"]";
+                }
+                error_result_ = stream_result;
+                return false;
             } else {
                 http_stream_ = istream;
                 result = platform::MFCreateMFByteStreamOnStream(
                     istream.Get(), &http_byte_stream_);
-                if (SUCCEEDED(result))
-                    result = platform::MFCreateSourceReaderFromByteStream(
-                        http_byte_stream_.Get(), attributes.Get(), &reader_);
+                if (FAILED(result)) {
+                    error_ = HResultMessage(L"MFCreateMFByteStreamOnStream", result);
+                    error_result_ = result;
+                    return false;
+                }
+                // 包装出来的 IMFByteStream 没有内容类型/文件名，源读取器会以
+                // MF_E_UNSUPPORTED_BYTESTREAM_TYPE 拒绝。按直链扩展名补齐，
+                // 让 Media Foundation 能选中对应的字节流处理器。
+                const std::wstring mime = GuessMimeType(descriptor->url);
+                std::wstring origin = L"online_stream";
+                if (mime == L"audio/mp4") origin += L".m4a";
+                else if (mime == L"audio/aac") origin += L".aac";
+                else if (mime == L"audio/flac") origin += L".flac";
+                else if (mime == L"audio/wav") origin += L".wav";
+                else if (mime == L"audio/ogg") origin += L".ogg";
+                else if (mime == L"audio/x-ms-wma") origin += L".wma";
+                else origin += L".mp3";
+                // IMFByteStream 本身不带属性访问器，但其实现通常支持 QI 到
+                // IMFAttributes。QI 失败时把原因记进 LastError，避免再瞎猜。
+                Microsoft::WRL::ComPtr<IMFAttributes> stream_attributes;
+                const HRESULT attributes_result =
+                    http_byte_stream_.As(&stream_attributes);
+                if (SUCCEEDED(attributes_result) && stream_attributes) {
+                    stream_attributes->SetString(
+                        MF_BYTESTREAM_CONTENT_TYPE, mime.c_str());
+                    stream_attributes->SetString(
+                        MF_BYTESTREAM_ORIGIN_NAME, origin.c_str());
+                }
+                result = platform::MFCreateSourceReaderFromByteStream(
+                    http_byte_stream_.Get(), attributes.Get(), &reader_);
+                if (FAILED(result)) {
+                    error_ = HResultMessage(
+                        L"MFCreateSourceReaderFromByteStream", result);
+                    error_ += L" mime=" + mime;
+                    if (FAILED(attributes_result))
+                        error_ += L" QI(IMFAttributes)=0x" +
+                            std::to_wstring(static_cast<unsigned long>(
+                                attributes_result));
+                    const std::wstring detail = http_stream_raw->Diagnostic();
+                    if (!detail.empty()) {
+                        error_ += L" [";
+                        error_ += detail;
+                        error_ += L"]";
+                    }
+                    error_ += L" first=" + http_stream_raw->Preview();
+                    error_result_ = result;
+                    return false;
+                }
             }
         } else {
             // 无自定义头 / HLS：交给 MF 默认 URL reader（直链可流式；HLS 依赖系统支持）
@@ -449,7 +645,21 @@ bool HttpStreamSource::Open(const std::filesystem::path& path,
                                                           attributes.Get(), &reader_);
         }
     }
-    if (FAILED(result)) return Fail(L"MFCreateSourceReader", result);
+    if (FAILED(result)) {
+        // 把网络层真实原因（WinHTTP 错误 / HTTP 403 等）带进 LastError，最终
+        // 出现在 play.log 的 audio_play 行，便于区分「需要请求头」与「解码失败」。
+        error_ = HResultMessage(L"MFCreateSourceReader", result);
+        if (!descriptor) error_ += L" (no online stream descriptor)";
+        if (http_stream_raw) {
+            const std::wstring detail = http_stream_raw->Diagnostic();
+            if (!detail.empty()) {
+                error_ += L": ";
+                error_ += detail;
+            }
+        }
+        error_result_ = result;
+        return false;
+    }
 
     reader_->SetStreamSelection(
         static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);

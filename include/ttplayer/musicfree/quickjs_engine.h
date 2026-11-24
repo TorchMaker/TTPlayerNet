@@ -14,12 +14,14 @@
 // 这样整个 await 链（插件 await axios → 继续 async 函数 → resolve 顶层 Promise）
 // 都只依赖微任务队列，无需外部事件循环即可在 Await() 内被泵完。
 
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 // quickjs-ng 将 JSValue 定义为 typedef struct JSValue *JSValue（指针类型），
 // 单纯的前向声明会得到“不完整类型”。这里直接包含真实头文件。
@@ -104,6 +106,20 @@ public:
     // 设置纯 JS 依赖库目录（crypto-js/dayjs/qs/... 的 .js 文件所在处）。
     void SetLibDir(std::filesystem::path dir) { lib_dir_ = std::move(dir); }
 
+    // 定时器（对齐原版 MusicFree 运行环境的 setTimeout/clearTimeout/...）。
+    // 音源的取链兜底普遍用 `Promise.race([..., new Promise(r => setTimeout(...))])`
+    // 做超时；沙箱里没有 setTimeout 会让整条取链直接抛错（表现为「所有源都失败」）。
+    struct Timer {
+        int id{};
+        bool repeat{};
+        std::chrono::steady_clock::time_point due;
+        int interval_ms{};
+        JSValue fn{JS_UNDEFINED};
+    };
+    int AddTimer(JSValueConst fn, int delay_ms, bool repeat);
+    void ClearTimer(int id);
+    void RunDueTimers();
+
 private:
     void InitGlobals();
     void InitRequireRegistry();
@@ -112,6 +128,8 @@ private:
     JSContext* ctx_{};
 
     AwaitState* await_state_ = nullptr;
+    std::vector<Timer> timers_;
+    int next_timer_id_{1};
 
     std::unordered_map<std::string, RequireFactory> factories_;
     std::unordered_map<std::string, JSValue> resolved_; // 缓存的 require 模块

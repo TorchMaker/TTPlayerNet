@@ -1047,6 +1047,12 @@ private:
     // 在线曲目已入列、后台正在取链：此时没有打开任何音源，播放按钮不能走
     // Resume()，PlayCurrent 也不能重复启动解析线程（详见 2026-11-10 第五轮）。
     bool pending_online_resolve_{};
+    // 同一首在线曲目在 10 秒窗口内最多发起 2 次后台取链：流式打开失败后
+    // PlayCurrent 会再次解析，不加限制就是每秒一次的「解析风暴」
+    // （2026-11-15 真机日志 serial=8..15）。换歌或播放成功后清零。
+    std::string online_resolve_attempt_key_;
+    int online_resolve_attempts_{};
+    ULONGLONG online_resolve_attempt_tick_{};
     bool natural_completion_dispatch_{};
     bool pending_natural_play_{};
     std::optional<playlist::Track> pending_wave_track_change_;
