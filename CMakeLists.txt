@@ -125,6 +125,9 @@ add_library(ttplayer_core
   src/playlist/playlist_store.cpp
   src/platform/optional_windows_api.cpp
   src/plugins/plugin_manager.cpp
+  src/live/live_source_registry.cpp
+  src/book/book_source_registry.cpp
+  src/tts/tts_provider_registry.cpp
   src/settings/file_association.cpp
   src/settings/settings.cpp
   src/settings/runtime_settings.cpp
@@ -313,6 +316,50 @@ target_compile_definitions(video_protocol_media PRIVATE UNICODE _UNICODE NOMINMA
 target_compile_options(video_protocol_media PRIVATE /W4 /permissive- /EHsc /utf-8)
 target_link_libraries(video_protocol_media PRIVATE ws2_32 winhttp)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 内容插件（直播源 / 听书源 / TTS 引擎）：每种来源一个独立 DLL，
+# 部署到 <exe>\AddIn\，命名 ttp_l_* / ttp_b_* / ttp_t_*。
+# 宿主通过 LoadLibrary + GetProcAddress 加载（见 src/plugins/content_plugin_loader.h），
+# 插件缺失只影响对应标签页。Win7 约束：插件只链接 ws2_32 / winhttp / ole32 等
+# 系统库，不得引入 WebView2 或其它启动期依赖。
+#
+# ⚠ 插件实现（src/plugins/live/*、src/plugins/book/*、src/plugins/tts/*）尚未落地，
+#   先保留 ABI 头与宿主注册表；插件源文件就绪后再取消下面四个目标的注释。
+# add_library(live_source_m3u SHARED src/plugins/live/m3u_source.cpp)
+# set_target_properties(live_source_m3u PROPERTIES OUTPUT_NAME "ttp_l_m3u")
+# target_include_directories(live_source_m3u PRIVATE include)
+# target_compile_definitions(live_source_m3u PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+# target_compile_options(live_source_m3u PRIVATE /W4 /permissive- /EHsc /utf-8)
+# target_link_libraries(live_source_m3u PRIVATE ws2_32 winhttp)
+#
+# add_library(live_source_tvbox SHARED src/plugins/live/tvbox_source.cpp)
+# set_target_properties(live_source_tvbox PROPERTIES OUTPUT_NAME "ttp_l_tvbox")
+# target_include_directories(live_source_tvbox PRIVATE include)
+# target_compile_definitions(live_source_tvbox PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+# target_compile_options(live_source_tvbox PRIVATE /W4 /permissive- /EHsc /utf-8)
+# target_link_libraries(live_source_tvbox PRIVATE ws2_32 winhttp)
+#
+# add_library(book_source_radio SHARED src/plugins/book/radio_source.cpp)
+# set_target_properties(book_source_radio PROPERTIES OUTPUT_NAME "ttp_b_radio")
+# target_include_directories(book_source_radio PRIVATE include)
+# target_compile_definitions(book_source_radio PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+# target_compile_options(book_source_radio PRIVATE /W4 /permissive- /EHsc /utf-8)
+# target_link_libraries(book_source_radio PRIVATE ws2_32 winhttp)
+#
+# add_library(tts_provider_sapi SHARED src/plugins/tts/sapi_tts.cpp)
+# set_target_properties(tts_provider_sapi PROPERTIES OUTPUT_NAME "ttp_t_sapi")
+# target_include_directories(tts_provider_sapi PRIVATE include)
+# target_compile_definitions(tts_provider_sapi PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+# target_compile_options(tts_provider_sapi PRIVATE /W4 /permissive- /EHsc /utf-8)
+# target_link_libraries(tts_provider_sapi PRIVATE ole32 oleaut32)
+
+# 内容插件联调探针：加载 AddIn 下的 ttp_l_/ttp_b_/ttp_t_ 插件并跑一遍。
+add_executable(content_plugin_probe tools/content_plugin_probe.cpp)
+target_include_directories(content_plugin_probe PRIVATE include)
+target_compile_definitions(content_plugin_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(content_plugin_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(content_plugin_probe PRIVATE ttplayer_core)
+
 # 视频协议插件全链路自测：加载 ttp_v_hls / ttp_v_web，打开会话、轮询就绪、
 # 抓取最终媒体地址（TS 本地流）的字节并校验 MPEG-TS 同步字节。
 add_executable(selftest_video tools/selftest_video.cpp)
@@ -328,6 +375,13 @@ target_include_directories(music_search_probe PRIVATE include)
 target_compile_definitions(music_search_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(music_search_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
 target_link_libraries(music_search_probe PRIVATE ttplayer_core)
+
+# 按平台逐个取链的探针：定位「多个源都播不了」是普遍失败还是个别源问题。
+add_executable(music_resolve_probe tools/music_resolve_probe.cpp)
+target_include_directories(music_resolve_probe PRIVATE include)
+target_compile_definitions(music_resolve_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(music_resolve_probe PRIVATE /W3 /permissive- /EHsc /utf-8)
+target_link_libraries(music_resolve_probe PRIVATE ttplayer_core)
 
 # 视频全源搜索探针：与 video.search 同一实现（8 路并发 + 单站计时）。
 add_executable(video_search_probe tools/video_search_probe.cpp)
