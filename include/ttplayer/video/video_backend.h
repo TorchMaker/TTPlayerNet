@@ -22,6 +22,10 @@ struct VideoBackendCallbacks {
     std::function<void()> on_end;        // 播放结束
     std::function<void(const std::string&)> on_error;  // 出错
     std::function<void(bool)> on_playing; // 开始/暂停切换
+    // 数据不足进入等待 / 数据恢复（MF_MEDIA_ENGINE_EVENT_WAITING / STALLED /
+    // PLAYING）。true=开始缓冲（画面冻结），false=恢复。用于「正在缓冲」提示、
+    // 冻结假进度（本地时钟），以及缓冲超时后的自动重试。
+    std::function<void(bool)> on_buffering;
 };
 
 class IVideoBackend {

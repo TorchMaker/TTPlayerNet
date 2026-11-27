@@ -43,6 +43,11 @@ public:
     // —— 以下三个是 ProtocolSession 的包装，转发到对应协议 DLL 的导出 ——
     static int  Poll(ProtocolSession* s, std::wstring* out_err);
     static void Close(ProtocolSession*& s);
+    // 缓冲进度 0-100（播放位置前方连续就绪数据 / 15s 目标）。
+    // -1 = 会话无效 / 协议 DLL 不支持（旧插件未填 poll_buffering）。
+    static int  PollBuffering(ProtocolSession* s);
+    // 前方连续就绪秒数（cap 300）：进度条浅色缓冲段用。
+    static int  PollBuffered(ProtocolSession* s);
 
 private:
     VideoProtocolRegistry() = default;

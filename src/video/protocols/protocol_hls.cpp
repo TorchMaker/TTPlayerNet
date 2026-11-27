@@ -610,7 +610,11 @@ struct Segment {
 // 明文分片缓存（进程内，跨会话共用 index 命名空间，VPOpen 时清空）。
 std::mutex g_cache_mtx;
 std::map<int, std::shared_ptr<std::vector<std::uint8_t>>> g_cache;
-constexpr size_t kCacheMaxSegments = 96;
+// 点播一集通常 400~600 个分片（6s/片 ≈ 40~60 分钟）：96 个的窗口播到
+// 中段就把早期分片全部逐出，回看/续读时 state=2 却拿不到数据 → 30s 干等
+// → 断流卡住（真机日志 SEG_WAIT 超时 state=2）。容量提到 384，并配合
+// WaitSegReady 的 state 自愈（见下）双保险。
+constexpr size_t kCacheMaxSegments = 384;
 
 void CacheReset() {
     std::lock_guard<std::mutex> lk(g_cache_mtx);
@@ -703,14 +707,32 @@ std::shared_ptr<std::vector<std::uint8_t>> WaitSegReady(
         auto seg = st->FindSeg(index);
         if (!seg) {
             // 直播窗口滑动可能把该片裁掉：视为不再可用
+            ErrLog("SEG_WAIT 下滑裁掉 index=%d\n", index);
             return nullptr;
         }
-        if (seg->state.load() == 3 && seg->tries >= 3) return nullptr;
+        if (seg->state.load() == 3 && seg->tries >= 3) {
+            // 分片重试耗尽成永久空洞：这是「代理等不到数据」的一种，
+            // 上层表现为 MF 饿死/卡住。必须留下证据（哪个分片、几次失败）。
+            ErrLog("SEG_WAIT 分片失败耗尽 index=%d tries=%d url=%s\n", index,
+                   seg->tries, seg->url.substr(0, 200).c_str());
+            return nullptr;
+        }
+        // 自愈：state=2（已下载）但缓存里没有 = 数据已被逐出（或跨会话
+        // CacheReset 清掉）。旧实现干等 30s 必超时 → 断流卡住（真机日志
+        // SEG_WAIT 超时 state=2）。把状态打回「待下载」让 DownloadLoop 重取。
+        if (seg->state.load() == 2) {
+            ErrLog("SEG_WAIT 缓存逐出自愈 index=%d 重新下载\n", index);
+            seg->state.store(0);
+        }
         {
             std::lock_guard<std::mutex> lk(st->mtx);
             st->cv.notify_all();   // 唤醒下载线程补活
         }
-        if (std::chrono::steady_clock::now() >= deadline) return nullptr;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ErrLog("SEG_WAIT 超时(%dms) index=%d state=%d tries=%d\n",
+                   timeout_ms, index, seg->state.load(), seg->tries);
+            return nullptr;
+        }
         std::unique_lock<std::mutex> lk(st->mtx);
         st->cv.wait_for(lk, std::chrono::milliseconds(120));
     }
@@ -1656,6 +1678,47 @@ int VpPoll(VPSession* s, wchar_t* out_err, int cch_err) {
     return VP_POLL_CONNECTING;
 }
 
+// 播放前沿起连续就绪的秒数（state=2 且缓存命中；缓存逐出即断点）。
+double AheadReadySeconds(const std::shared_ptr<HlsState>& st, double cap) {
+    const int served = st->served_index.load();
+    double ready_sec = 0.0;
+    std::lock_guard<std::mutex> lk(st->mtx);
+    for (const auto& seg : st->segs) {
+        if (!seg || seg->index < served) continue;
+        if (seg->state.load() != 2) break;          // 前沿断点：后续未下
+        if (!CacheGet(seg->index)) break;           // 已逐出（自愈重下中）
+        ready_sec += seg->duration > 0.0 ? seg->duration : 6.0;
+        if (ready_sec >= cap) break;
+    }
+    return ready_sec;
+}
+
+// 缓冲进度 0-100：播放前沿（served_index）起**连续就绪**的分片时长占
+// 15 秒目标缓冲的比例。宿主用它把「正在缓冲」提示升级为「正在缓冲 n%」。
+// 未就绪 / 列表未就绪返回 0（正在缓冲且前方无数据），会话不可用返回 -1。
+int VpPollBuffering(VPSession* s) {
+    if (!s) return -1;
+    auto st = *reinterpret_cast<std::shared_ptr<HlsState>*>(s);
+    if (st->stop.load() || st->list_failed || !st->list_ready.load())
+        return -1;
+    constexpr double kTargetSeconds = 15.0;
+    const double ready_sec = AheadReadySeconds(st, kTargetSeconds);
+    if (ready_sec <= 0.0) return 0;
+    const double ratio = ready_sec / kTargetSeconds * 100.0;
+    return ratio >= 100.0 ? 100 : static_cast<int>(ratio);
+}
+
+// 前方连续就绪秒数（cap 300）：进度条浅色缓冲段用——15s 百分比目标在
+// 长片上只有几像素，看不出预加载进度（用户反馈）。
+int VpPollBuffered(VPSession* s) {
+    if (!s) return -1;
+    auto st = *reinterpret_cast<std::shared_ptr<HlsState>*>(s);
+    if (st->stop.load() || st->list_failed || !st->list_ready.load())
+        return -1;
+    const double ready_sec = AheadReadySeconds(st, 300.0);
+    return static_cast<int>(ready_sec);
+}
+
 void VpClose(VPSession* s) {
     if (!s) return;
     auto st = *reinterpret_cast<std::shared_ptr<HlsState>*>(s);
@@ -1688,6 +1751,8 @@ HRESULT WINAPI ttpGetVideoProtocol(VPProtocolApi* out) {
     out->open = VpOpen;
     out->poll = VpPoll;
     out->close = VpClose;
+    out->poll_buffering = VpPollBuffering;
+    out->poll_buffered = VpPollBuffered;
     return S_OK;
 }
 

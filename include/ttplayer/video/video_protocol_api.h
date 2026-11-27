@@ -69,6 +69,14 @@ typedef struct VPProtocolApi {
     int (*poll)(VPSession* s, wchar_t* out_err, int cch_err);
     // 停止内部线程、释放会话。可从任意线程调用；内部需自行 join。
     void (*close)(VPSession* s);
+    // ── ABI v1 末尾追加（与 VPHttpConfig.options 同一兼容策略）──
+    // 查询当前缓冲进度 0-100（播放位置前方连续就绪的数据比例）；未知/不支持
+    // 返回 -1。**可为 NULL**：旧协议 DLL 不填此指针，宿主回退到无百分比提示。
+    int (*poll_buffering)(VPSession* s);
+    // 前方连续就绪的**秒数**（cap 300，供进度条画「已缓冲到哪」的浅色段；
+    // poll_buffering 的 15s 百分比目标在长片上只有几像素，看不出进度）。
+    // 同样可为 NULL。
+    int (*poll_buffered)(VPSession* s);
 } VPProtocolApi;
 
 // ── 每个协议 DLL 的唯一导出（对齐音频插件 ttpGetSoundAddIn 的工厂模式）──

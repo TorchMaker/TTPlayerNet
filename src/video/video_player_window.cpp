@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -114,6 +115,16 @@ public:
                 break;
             case MF_MEDIA_ENGINE_EVENT_ERROR:
                 if (cb_.on_error) cb_.on_error("播放失败（解码或网络错误）");
+                break;
+            // 缓冲状态（HTML5 waiting/stalled/playing 的 MF 对应事件）：
+            // 「卡住但没有任何提示」就是因为这些事件没接——现在用于
+            // 「正在缓冲」浮层、冻结假进度、缓冲超时自动重试。
+            case MF_MEDIA_ENGINE_EVENT_WAITING:
+            case MF_MEDIA_ENGINE_EVENT_STALLED:
+                if (cb_.on_buffering) cb_.on_buffering(true);
+                break;
+            case MF_MEDIA_ENGINE_EVENT_PLAYING:
+                if (cb_.on_buffering) cb_.on_buffering(false);
                 break;
             default:
                 break;
@@ -296,6 +307,7 @@ constexpr COLORREF kVidBarLine = RGB(38, 46, 62);   // 栏分隔线
 constexpr COLORREF kVidText = RGB(232, 238, 244);
 constexpr COLORREF kVidDim = RGB(138, 150, 166);
 constexpr COLORREF kVidTrack = RGB(48, 56, 72);     // 进度条轨道
+constexpr COLORREF kVidBuffered = RGB(96, 118, 150); // 进度条已缓冲段（浅蓝灰）
 constexpr COLORREF kVidAccent = RGB(38, 166, 205);  // 主色（与应用一致）
 constexpr COLORREF kVidAccentHot = RGB(64, 190, 226);
 constexpr COLORREF kVidHot = RGB(52, 62, 80);       // 控件悬停底
@@ -400,6 +412,13 @@ struct PlayerState {
     RECT vol_btn{};
     RECT vol_slider{};
     bool playing = false;
+    // ★ 用户主动暂停（点播放键 / 空格 / 点画面中间）。暂停期间**一律不做**
+    //   卡住判定 / 缓冲超时恢复 / 前方分片预判 / 自动换源：用户不动就不是
+    //   卡住，而且没有播放也无从判断后面会不会卡（用户 2026-11-27 反馈：
+    //   「长时间暂停的时候会切源」）。真机日志：暂停 68s 后 MF 因为不再读流
+    //   发出 WAITING → 10s 缓冲超时 → RECOVER 重建（还顺手把播放恢复了）→
+    //   预判再换源，整条链都是误判。
+    bool user_paused = false;
     bool got_ready = false;   // LOADEDDATA 已到（开始出画面）
     bool opened_ok = false;   // backend->Open 成功
     double volume = 1.0;      // 本地音量镜像（后端接口没有 getter）
@@ -483,6 +502,68 @@ struct PlayerState {
     std::wstring history_id;
     int current_ep = -1;        // 当前集在 episodes 里的下标（电影 -1）
     int pending_start_ms = 0;   // 首帧就绪后要跳到的位置（续播）
+    // 卡住诊断（AdvancePlayClock 250ms 驱动）：显示位置连续 6s 不动记一条 STALL。
+    double stall_last_pos = -1.0;
+    int stall_ticks = 0;
+    // 放大/缩小糊屏诊断：video_host 上一次显著缩放前的尺寸（面积变化 >40%
+    // 才记，避免拖动窗口时刷屏）。
+    int last_host_w = 0;
+    int last_host_h = 0;
+    // 缓冲状态（MF WAITING/STALLED 事件驱动）：true 时画「正在缓冲」浮层、
+    // 冻结本地假进度；超过 10s 未恢复 → 自动重试。
+    bool buffering = false;
+    DWORD buffering_tick = 0;
+    // 缓冲百分比（协议代理 poll_buffering 上报；-1=未知/不支持）。
+    int buffer_percent = -1;
+    // STALL 连续轮次：第 1 轮只记日志，第 2 轮（再卡 6s）触发自动恢复。
+    int stall_rounds = 0;
+    // 播放恢复预算：卡住/断流/解码错误共用。>0 时原地重开续播，
+    // 耗尽后走既有 AUTO next source 自动换源。on_ready（出画面）重置。
+    int recover_budget = 0;
+    // 自动换源前记录的时长：新源时长首次可得时与它比对，差太多（>5% 且
+    // >60s）说明不是同一内容，继续换下一条（用户要求「时间总长基本一致」）。
+    double switch_expect_dur = 0.0;
+    // 上述校验只对自动换源生效：手动菜单选线时置 true 跳过校验。
+    bool switch_manual = false;
+    // 多源速度对比（READY 后后台探测一次）：与 sources 同下标。
+    // kbps = 该源首个分片的下载速度（-1=未测/失败）；dur = m3u8 的
+    // EXTINF 总时长（0=未知，可换源前就做时长预检）。
+    struct SourceSpeed {
+        int kbps = -1;
+        double dur = 0.0;
+    };
+    std::vector<SourceSpeed> source_speeds;
+    bool speed_probe_started = false;
+    // 窗口显著放大后重建渲染引擎的防抖（8s 内不重复重建）。
+    DWORD last_rebuild_tick = 0;
+    // 换源进度保持的基准位置：连续换源链（时长校验再换 / 中间源还没播出
+    // 进度）中 CurrentPosition 会是 0，不能只靠即时值——第一次捕获到就
+    // 存这里，后续换线沿用（换片/正常播完清零）。
+    double resume_pos = 0.0;
+    // 自动换线进行中（浮层显示「正在切换线路…」；on_ready 清除）。
+    bool switching_hint = false;
+    // 后方分片健康预判：播放中代理「前方连续就绪数据」连续为 0 的 tick 数
+    // （250ms/tick）。连续 3s = 后面的分片无法加载/非常缓慢 → 不等卡住就
+    // 提前换源（旧源还在播，提前量即「无缝」）。
+    int ahead_empty_ticks = 0;
+    // 预判冷却：刚出画面（片头缓冲期）与刚 seek/重开后，前方就绪本来就少，
+    // 不能触发预判（用户反馈「片头刚出现就被切走了」）。
+    DWORD ready_tick = 0;
+    DWORD last_seek_tick = 0;
+    // 自动换源全局冷却：预判 / 恢复换源 / 时长校验换源 / 错误换源共用。
+    // 各路径曾互相叠加链式触发（用户反馈「频繁切换源」），任何一次自动
+    // 换源后 12s 内不再自动换（手动点选不受限）。
+    DWORD last_switch_tick = 0;
+    // 进度条缓冲段末端（秒）：当前位置 + 前方已就绪时长（pct/100×15s）。
+    // 0 = 未知。进度条上以浅色段显示「已缓冲到哪」（用户需求）。
+    double buffer_end_sec = 0.0;
+    // 全屏控制条 overlay 子窗口：Windows 绘制铁律是父窗永远画在子窗口之下，
+    // 视频铺满后父窗画的控制条会被 video_host 盖住 → 控制条必须是更晚创建
+    // 的兄弟子窗口（Z 序在上）才能浮在视频上（用户：「全屏下方有一条黑色的
+    // 预留空间，进度条应该遮挡画面」）。
+    HWND footer_overlay = nullptr;
+    // overlay 首帧诊断：show 之后是否真的画出来（每轮 show 只记一次）。
+    bool overlay_paint_logged = false;
     bool start_applied = false;
     DWORD last_history_save = 0;
     // 单击画面中间 = 暂停/继续（与双击全屏共存：先挂起，确认不是双击再执行）。
@@ -667,6 +748,68 @@ RECT FitVideoRect(const RECT& box, int vw, int vh) {
     return RECT{x, y, x + fw, y + fh};
 }
 
+// 定义在本文件后部（804 行附近，同一匿名 namespace）；LayoutPlayer 里的
+// 糊屏诊断日志先于定义，需要前置声明。
+void AppendUiLog(const std::string& text);
+// 显著放大重建渲染引擎（定义在 RestartProxyAt 之后，同一匿名 namespace）。
+bool RebuildRendererAt(PlayerState* st, double pos, int old_w, int old_h,
+                       int new_w, int new_h, bool force);
+// 布局联动：全屏且控制条可见 → overlay 铺在 footer 位置（盖在视频上）；
+// 否则隐藏（非全屏由父窗画，隐藏控制条时视频全铺满）。
+// 定义必须在 LayoutPlayer 之前（同匿名 namespace，调用点可见）。
+void UpdateFooterOverlay(PlayerState* st) {
+    if (!st || !st->footer_overlay) return;
+    const bool show = st->window_fullscreen && !ControlsHidden(st) &&
+                      st->footer.bottom > st->footer.top;
+    const bool was_visible =
+        (GetWindowLongPtrW(st->footer_overlay, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (show) {
+        MoveWindow(st->footer_overlay, st->footer.left, st->footer.top,
+                   st->footer.right - st->footer.left,
+                   st->footer.bottom - st->footer.top, TRUE);
+        // 每次显示都置顶：web_host（WebView2）等子窗口是**懒创建**的，晚于
+        // overlay 创建会压在其上（父窗绘制永远在子窗之下 → 全屏控制条被盖住
+        // = 用户反馈「全屏看不到进度条/播放按钮」）。置顶保证 overlay 永远
+        // 浮在所有兄弟之上；仅调 Z 序，不移动/不激活。
+        SetWindowPos(st->footer_overlay, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (was_visible)
+            InvalidateRect(st->footer_overlay, nullptr, FALSE);
+        else {
+            ShowWindow(st->footer_overlay, SW_SHOW);
+            st->overlay_paint_logged = false;
+            RECT wr{};
+            GetWindowRect(st->footer_overlay, &wr);
+            char t[200];
+            std::snprintf(t, sizeof(t),
+                          "OVERLAY show rect=(%ld,%ld,%ld,%ld) style=0x%08llX",
+                          wr.left, wr.top, wr.right, wr.bottom,
+                          static_cast<unsigned long long>(
+                              GetWindowLongPtrW(st->footer_overlay, GWL_STYLE)));
+            AppendUiLog(t);
+            // 诊断：控制条正中这一点上，最上层到底是哪个窗口。若返回的不是
+            // overlay（而是 STATIC / MF 渲染子窗），说明它被视频盖住了。
+            POINT probe{wr.left + (wr.right - wr.left) / 2,
+                        wr.top + (wr.bottom - wr.top) / 2};
+            const HWND top = WindowFromPoint(probe);
+            wchar_t cls[64]{};
+            if (top) GetClassNameW(top, cls, 64);
+            char t2[260];
+            std::snprintf(t2, sizeof(t2),
+                          "OVERLAY zprobe top=%p same=%d class=%ls",
+                          static_cast<void*>(top),
+                          top == st->footer_overlay ? 1 : 0, cls);
+            AppendUiLog(t2);
+        }
+    } else if (was_visible) {
+        ShowWindow(st->footer_overlay, SW_HIDE);
+        AppendUiLog("OVERLAY hide");
+    }
+}
+
+// 当前显示位置（定义在本文件后部，同一匿名 namespace）。
+double CurrentPosition(const PlayerState* st);
+
 void LayoutPlayer(PlayerState* st) {
     if (!st->hwnd) return;
     RECT c{};
@@ -687,7 +830,10 @@ void LayoutPlayer(PlayerState* st) {
         st->skin_layout = {};
         st->title = {0, 0, w, 0};                 // 全屏无标题栏
         st->footer = RECT{0, h - kFooterH, w, h};
-        st->content = RECT{0, 0, w, st->footer.top};
+        // ★ 全屏画面铺满整个窗口（含控制条区域）：控制条由 footer overlay
+        //   子窗口浮在视频上（父窗绘制永远在子窗口之下，预留空间就是用户
+        //   抱怨的「下方一条黑条」）。
+        st->content = RECT{0, 0, w, h};
         st->close_btn = {};
         st->title_rect = {};
         // source_btn 不再属于标题栏：统一由下面的 LayoutFooterControls 布局。
@@ -715,10 +861,41 @@ void LayoutPlayer(PlayerState* st) {
     //   旧实现把 video_host 直接铺满 content，视频比例与显示器不一致时
     //   画面被拉伸（用户 2026-11-10 反馈「全屏好像拉伸了」）。
     st->video_rect = FitVideoRect(st->content, st->video_w, st->video_h);
-    if (st->video_host)
+    if (st->video_host) {
+        const int hw = st->video_rect.right - st->video_rect.left;
+        const int hh = st->video_rect.bottom - st->video_rect.top;
+        // 糊屏诊断：呈现窗口显著放大/缩小时记一条（面积变化 >40%），
+        // 与 READY 的 video_native 对照即可判定「分辨率没跟上窗口」还是
+        // 「线路本身低清」。
+        if (st->last_host_w > 0 && st->last_host_h > 0) {
+            const double before = static_cast<double>(st->last_host_w) *
+                                  st->last_host_h;
+            const double after = static_cast<double>(hw) * hh;
+            if (before > 0.0 && (after / before > 1.4 || after / before < 0.71)) {
+                AppendUiLog("LAYOUT host " +
+                            std::to_string(st->last_host_w) + "x" +
+                            std::to_string(st->last_host_h) + " -> " +
+                            std::to_string(hw) + "x" + std::to_string(hh) +
+                            " video=" + std::to_string(st->video_w) + "x" +
+                            std::to_string(st->video_h));
+                // ★ 糊屏根治：显著**放大**后重建渲染引擎并续播——用户反复
+                //   验证「小窗口放大糊、大窗口重开（切源）清晰」，重建即清晰。
+                //   只在放大方向触发（缩小不糊），内部 8s 防抖。
+                if (after / before > 1.4) {
+                    RebuildRendererAt(st, CurrentPosition(st),
+                                      st->last_host_w, st->last_host_h, hw,
+                                      hh, /*force=*/false);
+                }
+                st->last_host_w = hw;
+                st->last_host_h = hh;
+            }
+        } else {
+            st->last_host_w = hw;
+            st->last_host_h = hh;
+        }
         MoveWindow(st->video_host, st->video_rect.left, st->video_rect.top,
-                   st->video_rect.right - st->video_rect.left,
-                   st->video_rect.bottom - st->video_rect.top, TRUE);
+                   hw, hh, TRUE);
+    }
     // WebView2 子窗口只占画面区：底部控制栏留给父窗接收鼠标（否则 WebView2
     // 会把 WM_LBUTTONDOWN/MOUSEMOVE/LBUTTONUP 全吞掉，自绘进度条收不到点击）。
     if (st->web_host) st->web_host->Resize(st->content);
@@ -733,6 +910,8 @@ void LayoutPlayer(PlayerState* st) {
     } else {
         LayoutFooterControls(st);
     }
+    // 全屏控制条 overlay 跟随几何/显隐（盖在视频上；非全屏隐藏由父窗画）。
+    UpdateFooterOverlay(st);
 }
 
 // 无法播放的视频源信息日志：<exe>\video\play_fail.log（UTF-8 追加）。
@@ -809,6 +988,32 @@ std::wstring VideoWindowStatePath() {
     return dir.substr(0, slash) + L"\\video\\player_window.json";
 }
 
+// rect 是否属于「全屏态」矩形（±2px 容差）。两种命中：
+//   1) 位置与某个显示器 rcMonitor 重合（标准全屏）；
+//   2) **尺寸**与某个显示器一致——实测污染文件是 1920x1080@(74,-1080)，
+//      与 rcMonitor(10,-1080) 原点差 64px（DWM/多屏排列偏移），只比位置
+//      会漏掉，窗口照样开成整屏大小拖不动（用户反馈「打开就是窗口化全屏」）。
+// 必须定义在 LoadVideoWindowPlacement 之前（加载时要用它拒绝已污染的文件）。
+bool IsMonitorFullscreenRect(const RECT& r) {
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0 || h <= 0) return false;
+    HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
+    if (!mon)
+        mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (!mon) return false;
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfo(mon, &mi)) return false;
+    const RECT& m = mi.rcMonitor;
+    const bool same_pos = std::abs(r.left - m.left) <= 2 &&
+                          std::abs(r.top - m.top) <= 2 &&
+                          std::abs(r.right - m.right) <= 2 &&
+                          std::abs(r.bottom - m.bottom) <= 2;
+    const bool same_size = std::abs(w - (m.right - m.left)) <= 2 &&
+                           std::abs(h - (m.bottom - m.top)) <= 2;
+    return same_pos || same_size;
+}
+
 // 读取上次的还原态矩形与「是否最大化」。文件缺失/损坏一律返回 false。
 bool LoadVideoWindowPlacement(RECT* out, bool* maximized) {
     if (out) *out = RECT{};
@@ -832,7 +1037,13 @@ bool LoadVideoWindowPlacement(RECT* out, bool* maximized) {
     if (w <= 0 || h <= 0) return false;
     r.right = r.left + w;
     r.bottom = r.top + h;
-    if (maximized) *maximized = j.value("maximized", false);
+    if (maximized) *maximized = false;
+    // ★ 不再恢复「最大化」：无边框 WS_POPUP 窗的最大化 = 铺满工作区的
+    //   窗口化全屏（没边框、拖不动），正是用户反馈的「打开即假全屏」。
+    //   历史文件里的 maximized:true 一律忽略，按普通窗口打开。
+    // 已污染的文件（曾把全屏矩形存进来）：当损坏处理，回退默认尺寸——
+    // 否则启动就是「假全屏、拖不了边框」（用户反馈）。
+    if (IsMonitorFullscreenRect(r)) return false;
     if (out) *out = r;
     return true;
 }
@@ -846,6 +1057,10 @@ void SaveVideoWindowPlacement(HWND hwnd) {
     // 到该位置再按需最大化。
     const RECT r = wp.rcNormalPosition;
     if (r.right <= r.left || r.bottom <= r.top) return;
+    // ★ 全屏状态绝不保存：全屏矩形（含副屏的 (10,-1080,...) 这种坐标）一旦
+    //   落盘，下次启动恢复出来就是「打开即假全屏、拖不了边框」（用户反馈
+    //   「软件打开就是窗口化全屏状态，无法修改尺寸」）。
+    if (IsMonitorFullscreenRect(r)) return;
     nlohmann::json j;
     j["left"] = r.left;
     j["top"] = r.top;
@@ -966,8 +1181,10 @@ bool RestartProxyAt(PlayerState* st, double target) {
     }
     st->backend->Play();
     st->playing = true;
+    st->user_paused = false;   // 重开/跳转即恢复播放（拖进度条后本该继续播）
     st->got_ready = true;
     st->error_text.clear();
+    st->last_seek_tick = GetTickCount();   // 重开到新起点，预判冷却
     AppendUiLog("SEEK restart target=" + std::to_string(target) +
                 " url=" + RedactUrl(core::WideToUtf8(url)));
     return true;
@@ -996,6 +1213,60 @@ void SeekTo(PlayerState* st, double seconds) {
                   "SEEK target=%.1f dur=%.1f mode=%s restart=%d", target, dur,
                   st->web_mode ? "web" : "native", restarted ? 1 : 0);
     AppendUiLog(t);
+    st->last_seek_tick = GetTickCount();   // seek 后前方就绪暂缺，预判冷却
+}
+
+// ── 窗口显著放大后重建渲染引擎（糊屏根治，用户多次反馈的核心问题）──────
+// 「小窗口播放放大就很糊，大窗口切源再播放就很清晰」：MediaEngine 按打开时
+// 的呈现状态工作，放大后不重新协商/呈现窗口不跟随，画面是小尺寸拉伸 → 糊；
+// 而「切源再播」= Close+Open 重建引擎，必然清晰。既然重建是被反复验证有效
+// 的动作，就在**显著放大时主动重建**（拖进度条同款成熟路径 RestartProxyAt），
+// seek 回当前位置续播。防抖 8s，缩小不重建（缩小不糊，重建只会闪）。
+bool RebuildRendererAt(PlayerState* st, double pos, int old_w, int old_h,
+                       int new_w, int new_h, bool force) {
+    if (!st || st->web_mode || !st->backend || !st->video_host) return false;
+    if (!st->got_ready || st->dragging_progress) return false;
+    // 放大重建走防抖；恢复流程（force）不受 8s 限制但仍用 tick 防止重入。
+    if (!force && GetTickCount() - st->last_rebuild_tick < 8000) return false;
+    if (pos < 1.0) return false;   // 还没播就不用续
+    st->last_rebuild_tick = GetTickCount();
+    char t[240];
+    std::snprintf(t, sizeof(t),
+                  "REBUILD pos=%.1f %dx%d -> %dx%d force=%d", pos, old_w,
+                  old_h, new_w, new_h, force ? 1 : 0);
+    AppendUiLog(t);
+    if (NeedsRestartSeek(st)) {
+        // 本地代理流（HLS）：拖进度条同款——按起点重开会话，秒级续播。
+        // ⚠ 这是「换源/恢复后从头开始」的关键：不带 /s/ 起点重开的流，
+        //   MF 的 SetCurrentTime 在 chunked 流上无效，只能按起点重开。
+        return RestartProxyAt(st, pos);
+    }
+    // 直链 / 本地文件：直接 Close+Open+Seek 续播。
+    std::wstring url = st->protocol_media_url;
+    if (url.empty() && st->source_index >= 0 &&
+        st->source_index < static_cast<int>(st->sources.size()))
+        url = st->sources[st->source_index].url;
+    if (url.empty()) return false;
+    st->backend->Close();
+    st->opened_ok = st->backend->Open(st->video_host, url, {});
+    if (!st->opened_ok) {
+        AppendUiLog("REBUILD open FAILED");
+        return false;
+    }
+    st->backend->Seek(pos);
+    st->backend->Play();
+    st->seek_offset = pos;
+    st->play_clock_base = pos;
+    st->play_clock_tick = GetTickCount();
+    st->last_seek_tick = GetTickCount();
+    st->playing = true;
+    st->user_paused = false;   // 重建即继续播，暂停标记不能残留（否则后续判定全被跳过）
+    st->got_ready = true;
+    st->buffering = false;
+    st->error_text.clear();
+    ShowWindow(st->video_host, SW_SHOW);
+    InvalidateRect(st->hwnd, nullptr, FALSE);
+    return true;
 }
 
 bool IsPlayingNow(const PlayerState* st) {
@@ -1004,17 +1275,268 @@ bool IsPlayingNow(const PlayerState* st) {
     return st->backend && st->backend->IsPlaying();
 }
 
+// ── 播放卡住 / 断流 / 缓冲超时的统一自动恢复 ─────────────────────────────
+// 预算内原地重开（同代理 URL，seek 回当前位置——用户已验证「重开就好使」）；
+// 预算耗尽或重开失败 → 投递 WM_USER+18 由 WndProc 执行自动换源（OpenSourceAt
+// 的声明只能在匿名 namespace 之外，这里不能直接调，否则 C2668/C3861）。
+// 定义必须在 AdvancePlayClock 之前（同匿名块，调用点可见）。
+// 调用方：AdvancePlayClock 的 STALL 兜底、WM_USER+16 缓冲超时、
+// WM_USER+3 提前断流、WM_USER+2841 轮询超时。
+void AutoRecoverPlayback(PlayerState* st, const char* reason) {
+    if (!st || st->web_mode || !st->backend || !st->video_host) return;
+    // ★ 用户主动暂停时绝不恢复：重建会 Play() 并抢占进度，等于「暂停被
+    //   偷偷恢复 + 换源」（用户反馈）。恢复动作只在播放意图存在时才有意义。
+    if (st->user_paused) {
+        AppendUiLog(std::string("RECOVER skip user-paused reason=") + reason);
+        return;
+    }
+    const double pos = CurrentPosition(st);
+    if (st->recover_budget > 0 && !st->protocol_media_url.empty()) {
+        --st->recover_budget;
+        AppendUiLog(std::string("RECOVER ") + reason + " budget=" +
+                    std::to_string(st->recover_budget) + " pos=" +
+                    std::to_string(pos));
+        st->buffering = false;
+        // ★ 优先按当前源重新加载并**续播到当前位置**：旧实现只 Open 不 seek，
+        //   chunked 代理流上 MF 的 SetCurrentTime 无效 → 从头开始（用户反馈）。
+        //   RebuildRendererAt 的代理路径按 /s/<pos> 起点重开 = 拖进度条同款。
+        if (RebuildRendererAt(st, pos, 0, 0, 0, 0, /*force=*/true)) return;
+        AppendUiLog(std::string("RECOVER rebuild FAILED reason=") + reason);
+    }
+    // 预算耗尽 / 原地重开失败 → 请求自动换下一条线路（带时长校验基准）。
+    if (st->sources.size() > 1 && st->source_index >= 0 &&
+        st->auto_source_tried + 1 < static_cast<int>(st->sources.size())) {
+        AppendUiLog(std::string("RECOVER request switch reason=") + reason);
+        PostMessageW(st->hwnd, WM_USER + 18, 0,
+                     reinterpret_cast<LPARAM>(_strdup(reason)));
+        return;
+    }
+    AppendUiLog(std::string("RECOVER give_up reason=") + reason);
+}
+
+// ── 多源速度对比（用户需求：内部应有不同源的速度对比）─────────────────────
+// READY 后后台探测一次所有 m3u8 候选源：GET 列表（计时 + 解析 EXTINF 总时长）
+// → GET 首个分片（计时 → kbps）。结果经 WM_USER+19 合并进 source_speeds，
+// 供自动换源选优（时长匹配 + 速度最快）。
+struct SourceSpeedResult {
+    int index = -1;
+    int kbps = -1;
+    double dur = 0.0;
+    int list_ms = 0;
+    int seg_ms = 0;
+};
+
+// EXTINF 总时长；master 列表（#EXT-X-STREAM-INF）没有 EXTINF → 取第一个
+// 子列表再解析一层（与 ProbeHlsDuration 同规则）。
+double ParsePlaylistDuration(const std::string& text) {
+    double total = 0.0;
+    size_t pos = 0;
+    while ((pos = text.find("#EXTINF:", pos)) != std::string::npos) {
+        pos += 8;
+        const double v = std::atof(text.c_str() + pos);
+        if (v > 0.0) total += v;
+    }
+    return total;
+}
+
+// m3u8 内第一条分片地址（绝对 / 根路径 / 相对三种拼接）。
+std::string FirstSegmentUrl(const std::string& base, const std::string& text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(pos, eol - pos);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        pos = eol + 1;
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("http://", 0) == 0 || line.rfind("https://", 0) == 0)
+            return line;
+        const size_t scheme = base.find("://");
+        if (!line.empty() && line[0] == '/') {
+            const size_t host_end = base.find('/', scheme + 3);
+            return base.substr(0, host_end == std::string::npos
+                                      ? base.size() : host_end) + line;
+        }
+        const size_t slash = base.find_last_of('/');
+        return base.substr(0, slash == std::string::npos ? base.size()
+                                                         : slash + 1) + line;
+    }
+    return {};
+}
+
+void StartSourceSpeedProbe(PlayerState* st) {
+    if (!st || st->speed_probe_started || st->sources.size() < 2) return;
+    st->speed_probe_started = true;
+    struct Job {
+        int index;
+        std::wstring url;
+        std::map<std::string, std::string> headers;
+    };
+    std::vector<Job> jobs;
+    for (std::size_t i = 0; i < st->sources.size(); ++i) {
+        if (static_cast<int>(i) == st->source_index) continue;
+        // 只测 m3u8（分片结构才能测分片速度；mp4 直链无从拆分）。
+        // LooksLikeHlsUrl 的声明在本函数之后不可见，这里就地判断。
+        std::wstring lower = st->sources[i].url;
+        std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
+        if (lower.find(L".m3u8") == std::wstring::npos) continue;
+        jobs.push_back({static_cast<int>(i), st->sources[i].url,
+                        st->open_headers});
+    }
+    if (jobs.empty()) return;
+    const HWND hwnd = st->hwnd;
+    AppendUiLog("SPEED probe start candidates=" + std::to_string(jobs.size()));
+    std::thread([jobs, hwnd] {
+        Sleep(2000);   // 让首播缓冲先跑起来，别抢开局带宽
+        auto* results = new std::vector<SourceSpeedResult>();
+        results->resize(jobs.size());
+        // 2 线程并行分摊：既快又不过多抢占播放带宽。
+        std::atomic<std::size_t> cursor{0};
+        auto worker = [&] {
+            ttplayer::musicfree::ScopedHttpTimeout guard(6000);
+            for (;;) {
+                const std::size_t i = cursor.fetch_add(1);
+                if (i >= jobs.size()) return;
+                const Job& job = jobs[i];
+                SourceSpeedResult r;
+                r.index = job.index;
+                try {
+                    ttplayer::musicfree::NetworkConfig cfg;
+                    const auto t0 = GetTickCount64();
+                    std::string list = ttplayer::musicfree::DownloadText(
+                        core::WideToUtf8(job.url), cfg, job.headers);
+                    r.list_ms = static_cast<int>(GetTickCount64() - t0);
+                    if (list.find("#EXTM3U") == std::string::npos) {
+                        (*results)[i] = r;
+                        continue;
+                    }
+                    r.dur = ParsePlaylistDuration(list);
+                    std::string seg_url = FirstSegmentUrl(
+                        core::WideToUtf8(job.url), list);
+                    if (r.dur <= 0.0 &&
+                        list.find("#EXT-X-STREAM-INF") != std::string::npos &&
+                        !seg_url.empty()) {
+                        // master 列表：取第一个子列表再解析时长。
+                        list = ttplayer::musicfree::DownloadText(
+                            seg_url, cfg, job.headers);
+                        r.dur = ParsePlaylistDuration(list);
+                        seg_url = FirstSegmentUrl(seg_url, list);
+                    }
+                    if (!seg_url.empty()) {
+                        const auto t1 = GetTickCount64();
+                        const auto bytes = ttplayer::musicfree::DownloadBinary(
+                            seg_url, cfg, job.headers);
+                        r.seg_ms = static_cast<int>(GetTickCount64() - t1);
+                        if (r.seg_ms > 0 && !bytes.empty())
+                            r.kbps = static_cast<int>(
+                                bytes.size() * 8 / r.seg_ms);
+                    }
+                } catch (...) {
+                    // 单源探测失败不影响其它源。
+                }
+                (*results)[i] = r;
+            }
+        };
+        std::thread w1(worker), w2(worker);
+        w1.join();
+        w2.join();
+        if (!PostMessageW(hwnd, WM_USER + 19, 0,
+                          reinterpret_cast<LPARAM>(results)))
+            delete results;
+    }).detach();
+}
+
+// 自动换源选优：在候选里挑「时长匹配（已知时）且速度最快」的源；
+// 无测速数据/都不匹配时回退到顺序下一条。
+int PickNextSource(const PlayerState* st, double expect_dur) {
+    const int count = static_cast<int>(st->sources.size());
+    if (count < 2 || st->source_index < 0) return -1;
+    int best = -1;
+    int best_kbps = -1;
+    for (int i = 0; i < count; ++i) {
+        if (i == st->source_index) continue;
+        const bool have_speed =
+            i < static_cast<int>(st->source_speeds.size());
+        const int kbps = have_speed ? st->source_speeds[i].kbps : -1;
+        const double dur = have_speed ? st->source_speeds[i].dur : 0.0;
+        // 时长预检：测速已拿到该源总时长时，与换源前基准比对，
+        // 差太多（>5% 且 >60s）直接排除——不用打开才发现不是同一内容。
+        if (expect_dur > 0.0 && dur > 0.0) {
+            const double diff = std::fabs(dur - expect_dur);
+            if (diff > 60.0 && diff > expect_dur * 0.05) continue;
+        }
+        const int score = kbps >= 0 ? kbps : 0;   // 无数据视为最慢
+        if (score > best_kbps) {
+            best_kbps = score;
+            best = i;
+        }
+    }
+    if (best < 0) best = (st->source_index + 1) % count;   // 全被排除→顺序下一个
+    return best;
+}
+
 // 250ms 定时器调用：MF 在 chunked 流上 GetCurrentTime 恒 0，用本地单调时钟
 // 推进显示位置；暂停 / 网页形态不推进。否则进度条永远停在 0，用户拖完松手
 // 会看到滑块「弹回去」，这是「进度条无法拖动」最常见的视觉误判来源。
 void AdvancePlayClock(PlayerState* st) {
     if (!st) return;
     const DWORD now = GetTickCount();
+
+    // ── 卡住诊断（2026-11-25 用户反馈「播放一会卡住、无缓冲提示、不继续」）──
+    // 按播放进度判断（用户明确要求）：我方意图在播而显示位置不动 =
+    // 非用户操作的暂停。4s（16×250ms）→ 立刻提示「正在缓冲」；
+    // 6s（24×）→ 优先按当前源重新加载（RECOVER）；预算耗尽自动换时长
+    // 接近的源。MF WAITING/STALLED 事件路径并行保留（更快时走事件）。
+    if (!st->web_mode && st->got_ready && st->playing && !st->user_paused &&
+        !st->dragging_progress) {
+        const double pos = CurrentPosition(st);
+        if (st->stall_last_pos >= 0.0 &&
+            std::abs(pos - st->stall_last_pos) < 0.05) {
+            ++st->stall_ticks;
+            if (st->stall_ticks >= 16 && !st->buffering) {
+                // 4s：立即提示（不等 MF 事件——它并不总发）。
+                st->buffering = true;
+                st->buffering_tick = GetTickCount();
+                AppendUiLog("STALL hint buffering pos=" +
+                            std::to_string(pos));
+                InvalidateRect(st->hwnd, nullptr, FALSE);
+            }
+            if (st->stall_ticks >= 24) {   // 6s：优先当前源重新加载
+                st->stall_ticks = 0;
+                // 与「缓冲超时 10s」路径互斥：MF 已发 WAITING/STALLED 进入
+                // buffering 时走那条单一路径，避免两个计时器并发耗光重载
+                // 预算 → 频繁换源（用户反馈）。
+                if (!st->buffering) {
+                    AppendUiLog("STALL recover pos=" + std::to_string(pos));
+                    AutoRecoverPlayback(st, "stall");
+                }
+                return;
+            }
+        } else {
+            // 位置在走 = 数据在流：复位计数；顺带清掉进度判断置的缓冲提示
+            //（数据已恢复，即使 MF 没发 PLAYING 事件）。
+            st->stall_last_pos = pos;
+            st->stall_ticks = 0;
+            if (st->buffering) {
+                st->buffering = false;
+                AppendUiLog("BUFFERING off (progress resumed) pos=" +
+                            std::to_string(pos));
+                InvalidateRect(st->hwnd, nullptr, FALSE);
+            }
+        }
+    } else {
+        st->stall_last_pos = -1.0;
+        st->stall_ticks = 0;
+    }
+
     // ★ 只有「真正出画面之后」才推进度：MF 在 Open() 后立刻 IsPlaying() 就为真，
     //   但首帧可能还没到（解析/缓冲中），旧逻辑会让进度条在 00:00/--:-- 时就
     //   自己往前跑（用户反馈「还没有正式播放，播放的进度不应该走」）。
+    //   buffering 时同样冻结：本地时钟在 MF 无数据时若继续走，进度条会
+    //   「直接跑到头」（2026-11-25 用户反馈），且会掩盖真实卡死。
     if (st->play_clock_tick == 0 || st->web_mode || !st->got_ready ||
-        !IsPlayingNow(st)) {
+        !IsPlayingNow(st) || st->buffering) {
         st->play_clock_tick = now;
         return;
     }
@@ -1041,12 +1563,22 @@ void SetPlayingNow(PlayerState* st, bool play) {
     } else if (st->backend) {
         if (play) {
             st->backend->Play();
+            // 从暂停恢复：重新开始计「缓冲超时」，否则暂停期间攒下的旧
+            // buffering_tick 会立刻触发一次超时恢复（等于一恢复就重建）。
+            if (st->buffering) st->buffering_tick = GetTickCount();
+            st->ahead_empty_ticks = 0;
         } else {
             AdvancePlayClock(st);   // 冻结前把位置推进到当前时刻
             st->backend->Pause();
+            // 暂停时清掉缓冲态：MF 在没人读流时会发 WAITING，别把它当成
+            // 「卡住」画浮层，也别留一个过期的计时器。
+            st->buffering = false;
+            st->buffering_tick = 0;
         }
         st->play_clock_tick = GetTickCount();
     }
+    // 暂停 / 继续的唯一用户入口都走这里（播放键、空格、点画面中间）。
+    st->user_paused = !play;
 }
 
 bool IsMutedNow(const PlayerState* st) {
@@ -1144,26 +1676,42 @@ void EnsureGdiplus() {
 void FillEllipseAA(HDC dc, const RECT& r, COLORREF color) {
     EnsureGdiplus();
     if (!r.right || !r.bottom) return;
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::SolidBrush brush(Gdiplus::Color(
-        255, GetRValue(color), GetGValue(color), GetBValue(color)));
-    g.FillEllipse(&brush,
-                  Gdiplus::REAL(r.left), Gdiplus::REAL(r.top),
-                  Gdiplus::REAL(r.right - r.left - 1),
-                  Gdiplus::REAL(r.bottom - r.top - 1));
+    // ★ 全屏控制条 overlay 靠 SetWindowOrgEx 把 footer 坐标平移到 (0,0)。
+    //   GDI+ 对 DC 窗口原点的处理不确定（有时认有时不认），所以这里把原点
+    //   显式归零、按差值偏移绘制，再恢复——两种行为下结果都一致。否则圆角
+    //   播放键会落到 58px 高的浮层之外，表现正是「全屏有进度条但没有播放键」。
+    POINT origin{};
+    SetWindowOrgEx(dc, 0, 0, &origin);
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush brush(Gdiplus::Color(
+            255, GetRValue(color), GetGValue(color), GetBValue(color)));
+        g.FillEllipse(&brush,
+                      Gdiplus::REAL(r.left - origin.x),
+                      Gdiplus::REAL(r.top - origin.y),
+                      Gdiplus::REAL(r.right - r.left - 1),
+                      Gdiplus::REAL(r.bottom - r.top - 1));
+    }
+    if (origin.x || origin.y) SetWindowOrgEx(dc, origin.x, origin.y, nullptr);
 }
 
 void FillPolygonAA(HDC dc, const POINT* pts, int count, COLORREF color) {
     EnsureGdiplus();
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::SolidBrush brush(Gdiplus::Color(
-        255, GetRValue(color), GetGValue(color), GetBValue(color)));
-    std::vector<Gdiplus::PointF> ptsf;
-    for (int i = 0; i < count; ++i)
-        ptsf.emplace_back(Gdiplus::REAL(pts[i].x), Gdiplus::REAL(pts[i].y));
-    g.FillPolygon(&brush, ptsf.data(), count);
+    POINT origin{};
+    SetWindowOrgEx(dc, 0, 0, &origin);
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush brush(Gdiplus::Color(
+            255, GetRValue(color), GetGValue(color), GetBValue(color)));
+        std::vector<Gdiplus::PointF> ptsf;
+        for (int i = 0; i < count; ++i)
+            ptsf.emplace_back(Gdiplus::REAL(pts[i].x - origin.x),
+                              Gdiplus::REAL(pts[i].y - origin.y));
+        g.FillPolygon(&brush, ptsf.data(), count);
+    }
+    if (origin.x || origin.y) SetWindowOrgEx(dc, origin.x, origin.y, nullptr);
 }
 
 void PaintGlyphPlay(HDC dc, const RECT& r) {
@@ -1270,7 +1818,13 @@ void ToggleFullscreen(PlayerState* st) {
     st->controls_hidden = false;
     DisableWindowCorners(st->hwnd);
     if (st->window_fullscreen) {
-        GetWindowRect(st->hwnd, &st->saved_rect);
+        RECT cur{};
+        GetWindowRect(st->hwnd, &cur);
+        // ★ 进入全屏前若窗口已是「假全屏」（rect=整屏，典型是被污染的启动
+        //   态：窗口贴满屏幕导致边框在屏幕外、拖不动），别把这个 rect 存成
+        //   还原目标——退出全屏会还原回整屏矩形（用户反馈「无法修改尺寸」）。
+        //   保留创建时的 saved_rect，样式仍照常保存（进入前必是正常样式）。
+        if (!IsMonitorFullscreenRect(cur)) st->saved_rect = cur;
         st->saved_style = GetWindowLongPtrW(st->hwnd, GWL_STYLE);
         // 丢掉 WS_THICKFRAME / WS_CAPTION 等一切会产生系统边框的样式位。
         SetWindowLongPtrW(st->hwnd, GWL_STYLE,
@@ -1459,6 +2013,318 @@ bool TryStartWebFallback(PlayerState* st) {
 
 }  // namespace
 
+void PaintFooterControls(PlayerState* st, HDC dc) {
+    if (!st) return;
+    if (ControlsHidden(st)) return;
+    if (st->footer.bottom <= st->footer.top) return;
+    // 整窗已双缓冲，这里直接画进后台位图即可（不再嵌套一层）。
+    theme::FillSolidRect(dc, st->footer, kVidBar);
+    theme::FillSolidRect(dc, {st->footer.left, st->footer.top,
+                              st->footer.right, st->footer.top + 1},
+                         kVidBarLine);
+    // 圆形播放键
+    {
+        const bool hot = st->hover_id == 2;
+        FillEllipseAA(dc, st->play_btn,
+                      hot ? kVidAccentHot : kVidAccent);
+        if (IsPlayingNow(st)) PaintGlyphPause(dc, st->play_btn);
+        else PaintGlyphPlay(dc, st->play_btn);
+    }
+    // 进度条：轨道 + 缓冲段 + 已播填充 + 圆形滑块。
+    const double dur = EffectiveDuration(st);
+    const double pos = st->dragging_progress
+                           ? (dur > 0.0 ? st->drag_pos : CurrentPosition(st))
+                           : CurrentPosition(st);
+    double ratio = dur > 0.0 ? std::min(1.0, std::max(0.0, pos / dur)) : 0.0;
+    if (dur <= 0.0 && st->dragging_progress) ratio = st->drag_ratio;
+    theme::DrawRoundedBox(dc, st->progress, kVidTrack, CLR_INVALID, 3);
+    int thumb_x = st->progress.left;
+    const int span = st->progress.right - st->progress.left;
+    if (span > 0) {
+        // 已缓冲段（浅色，位于已播填充之后）：预加载的缓冲进度（用户需求）。
+        if (dur > 0.0 && st->buffer_end_sec > pos + 0.5) {
+            const double buffered_ratio = std::min(
+                1.0, std::max(0.0, st->buffer_end_sec / dur));
+            const int fill_w0 = static_cast<int>(span * ratio);
+            const int buf_w = static_cast<int>(span * buffered_ratio);
+            if (buf_w > fill_w0) {
+                RECT buf = st->progress;
+                buf.left = st->progress.left + fill_w0;
+                buf.right = st->progress.left + buf_w;
+                theme::DrawRoundedBox(dc, buf, kVidBuffered, CLR_INVALID, 3);
+            }
+        }
+        const int fill_w = static_cast<int>(span * ratio);
+        if (dur > 0.0 && fill_w > 0) {
+            RECT fill = st->progress;
+            fill.right = fill.left + fill_w;
+            theme::DrawRoundedBox(dc, fill, kVidAccent, CLR_INVALID, 3);
+        }
+        thumb_x = st->progress.left + fill_w;
+    }
+    const int cy = (st->footer.top + st->footer.bottom) / 2;
+    {
+        const int r = (st->hover_id == 5 || st->dragging_progress) ? 8 : 6;
+        FillEllipseAA(dc, {thumb_x - r, cy - r, thumb_x + r, cy + r},
+                      kVidText);
+    }
+    // 时间：时长未知显示 --:--
+    std::wstring t = FormatTime(pos) + L" / " +
+                     (dur > 0.0 ? FormatTime(dur) : L"--:--");
+    theme::DrawTextIn(dc, st->time_text, t.c_str(), kVidDim,
+                      PlayerSmallFont(), theme::kCenterFormat);
+    // 音量按钮 + 滑条
+    const bool muted = IsMutedNow(st);
+    if (st->hover_id == 3)
+        theme::DrawRoundedBox(dc, st->vol_btn, kVidHot, CLR_INVALID, 4);
+    theme::DrawTextIn(dc, st->vol_btn, muted ? L"静音" : L"音量",
+                      muted ? kVidError
+                            : (st->hover_id == 3 ? kVidText : kVidDim),
+                      PlayerSmallFont(), theme::kCenterFormat);
+    theme::DrawRoundedBox(dc, st->vol_slider, kVidTrack, CLR_INVALID, 3);
+    {
+        const double vol = !muted ? st->volume : 0.0;
+        RECT fill = st->vol_slider;
+        fill.right = fill.left + static_cast<LONG>(
+            (fill.right - fill.left) * std::min(1.0, vol));
+        if (fill.right > fill.left)
+            theme::DrawRoundedBox(dc, fill, kVidAccent, CLR_INVALID, 3);
+        const int vx = std::max(fill.right, st->vol_slider.left);
+        FillEllipseAA(dc, {vx - 6, cy - 6, vx + 6, cy + 6}, kVidText);
+    }
+    // 选集（剧集才有）
+    if (st->episodes.size() > 1 &&
+        st->episode_btn.right > st->episode_btn.left) {
+        const bool hot = st->hover_id == 8;
+        theme::DrawRoundedBox(dc, st->episode_btn,
+                              hot ? kVidAccentHot : kVidHot,
+                              kVidBarLine, 4);
+        std::wstring label = L"选集";
+        for (const auto& ep : st->episodes) {
+            if (st->source_index >= 0 &&
+                st->source_index < static_cast<int>(st->sources.size()) &&
+                ep.url == st->sources[st->source_index].url &&
+                !ep.title.empty()) {
+                label = ep.title;
+                break;
+            }
+        }
+        if (label.size() > 8) label = label.substr(0, 7) + L"…";
+        theme::DrawTextIn(dc, st->episode_btn, label.c_str(),
+                          kVidText, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    }
+    // 切换源
+    if (st->sources.size() > 1 &&
+        st->source_btn.right > st->source_btn.left) {
+        const bool hot = st->hover_id == 7;
+        theme::DrawRoundedBox(dc, st->source_btn,
+                              hot ? kVidAccentHot : kVidHot,
+                              kVidBarLine, 4);
+        std::wstring label = L"切换源";
+        if (st->source_index >= 0 &&
+            st->source_index < static_cast<int>(st->sources.size()) &&
+            !st->sources[st->source_index].name.empty())
+            label = st->sources[st->source_index].name;
+        if (label.size() > 10) label = label.substr(0, 9) + L"…";
+        theme::DrawTextIn(dc, st->source_btn, label.c_str(),
+                          kVidText, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    }
+    // 全屏 / 还原按钮
+    theme::DrawRoundedBox(dc, st->fs_btn,
+                          st->hover_id == 4 ? kVidAccentHot : kVidHot,
+                          kVidBarLine, 4);
+    if (st->window_fullscreen)
+        PaintGlyphRestore(dc, st->fs_btn, kVidText);
+    else
+        PaintGlyphFullscreen(dc, st->fs_btn, kVidText);
+}
+
+// ── 中央浮层绘制（抽离自 WM_PAINT）：错误 / 切换线路 / 缓冲 / 加载动画。
+//    client 为调用方矩形（原点 0,0）。父窗不再直接画——出画面后 video_host
+//    可见时父窗画的浮层会被它盖住（全屏更甚），一律经 center overlay 显示。
+void PaintCenterOverlay(PlayerState* st, HDC dc, const RECT& client) {
+    if (!st) return;
+    const int cx = (client.right - client.left) / 2;
+    const int cym = (client.bottom - client.top) / 2;
+    if (!st->error_text.empty() && !st->web_mode) {
+        const RECT box = {cx - 190, cym - 46, cx + 190, cym + 46};
+        theme::DrawRoundedBox(dc, box, RGB(30, 22, 24), kVidError, 8);
+        theme::DrawTextIn(dc, {box.left + 14, box.top + 8, box.right - 14,
+                               box.top + 30},
+                          L"播放失败", kVidError, PlayerSmallFont(),
+                          theme::kCenterFormat);
+        theme::DrawTextIn(dc, {box.left + 14, box.top + 32, box.right - 14,
+                               box.bottom - 8},
+                          st->error_text.c_str(), kVidDim,
+                          PlayerSmallFont(),
+                          DT_CENTER | DT_WORDBREAK | DT_NOPREFIX |
+                              DT_END_ELLIPSIS);
+    } else if (st->switching_hint) {
+        const int dots = static_cast<int>((GetTickCount() / 400) % 4);
+        theme::DrawTextIn(dc, {cx - 170, cym - 16, cx + 170, cym + 16},
+                          (L"正在切换线路…" + std::wstring(dots, L'.'))
+                              .c_str(),
+                          kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    } else if (st->buffering) {
+        const int dots = static_cast<int>((GetTickCount() / 400) % 4);
+        std::wstring text;
+        if (st->buffer_percent >= 0)
+            text = L"正在缓冲 " + std::to_wstring(st->buffer_percent) +
+                   L"%" + std::wstring(dots, L'…');
+        else
+            text = L"正在缓冲" + std::wstring(dots, L'…');
+        theme::DrawTextIn(dc, {cx - 150, cym - 16, cx + 150, cym + 16},
+                          text.c_str(),
+                          kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+        if (st->buffer_percent >= 0) {
+            const RECT bar{cx - 120, cym + 24, cx + 120, cym + 32};
+            theme::DrawRoundedBox(dc, bar, RGB(40, 40, 44), kVidDim, 4);
+            const int fill = (bar.right - bar.left) *
+                             st->buffer_percent / 100;
+            if (fill > 0) {
+                RECT done{bar.left, bar.top, bar.left + fill,
+                          bar.bottom};
+                theme::DrawRoundedBox(dc, done, RGB(90, 160, 255),
+                                      kVidDim, 4);
+            }
+        }
+    } else if (st->hls_running) {
+        const int pct = st->hls_percent.load();
+        theme::DrawTextIn(dc, {cx - 150, cym - 16, cx + 150, cym + 16},
+                          (L"正在缓冲 " + std::to_wstring(pct) +
+                           L"%").c_str(),
+                          kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    } else if (st->download_running) {
+        theme::DrawTextIn(dc, {cx - 150, cym - 16, cx + 150, cym + 16},
+                          L"正在准备播放…", kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    } else if (st->resolving) {
+        theme::DrawTextIn(dc, {cx - 170, cym - 16, cx + 170, cym + 16},
+                          L"正在解析播放地址…", kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    } else if (!st->got_ready) {
+        const int dots = static_cast<int>((GetTickCount() / 400) % 4);
+        const std::wstring text = L"正在加载" + std::wstring(dots, L'·');
+        theme::DrawTextIn(dc, {cx - 120, cym - 16, cx + 120, cym + 16},
+                          text.c_str(), kVidDim, PlayerSmallFont(),
+                          theme::kCenterFormat);
+    }
+}
+
+// ── 全屏控制条 overlay：浮在 video_host 之上的兄弟子窗口 ─────────────────
+// 鼠标消息全部转发父窗（坐标换算回父窗 client），命中/拖动/唤出逻辑复用
+// 父窗 WM_LBUTTONDOWN 等现成代码；自身 250ms 刷新以跟进 hover/进度。
+constexpr wchar_t kFooterOverlayClass[] = L"TTVideoFooterOverlay";
+
+LRESULT CALLBACK FooterOverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = reinterpret_cast<PlayerState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCCREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                              reinterpret_cast<LPARAM>(cs->lpCreateParams));
+            return TRUE;
+        }
+        case WM_ERASEBKGND:
+            return 1;   // 自绘，背景由 WM_PAINT 覆盖
+        case WM_PAINT: {
+            if (!st) return DefWindowProcW(hwnd, msg, wp, lp);
+            PAINTSTRUCT ps{};
+            HDC screen = BeginPaint(hwnd, &ps);
+            RECT c{};
+            GetClientRect(hwnd, &c);
+            const int cw = c.right, ch = c.bottom;
+            HDC dc = screen;
+            HBITMAP back_bmp = nullptr;
+            HGDIOBJ back_old = nullptr;
+            HDC back_dc = nullptr;
+            if (cw > 0 && ch > 0) {
+                back_dc = CreateCompatibleDC(screen);
+                if (back_dc) {
+                    back_bmp = CreateCompatibleBitmap(screen, cw, ch);
+                    if (back_bmp) {
+                        back_old = SelectObject(back_dc, back_bmp);
+                        dc = back_dc;
+                    } else {
+                        DeleteDC(back_dc);
+                        back_dc = nullptr;
+                    }
+                }
+            }
+            // 坐标平移：PaintFooterControls 用父窗坐标（footer.top≈窗口高-58），
+            // overlay 本身只有 58px 高——不设 DC 原点就全画到窗口外（全屏
+            // 暂停/移鼠标不显示进度条的根因）。逻辑(footer.left,footer.top)
+            // → 物理(0,0)，绘制即落在 overlay 内。
+            if (st->footer_overlay == hwnd)
+                SetWindowOrgEx(dc, st->footer.left, st->footer.top, nullptr);
+            PaintFooterControls(st, dc);
+            if (dc != screen) {
+                SetWindowOrgEx(dc, 0, 0, nullptr);   // 复位后再整块拷贝
+                BitBlt(screen, 0, 0, cw, ch, dc, 0, 0, SRCCOPY);
+                SelectObject(dc, back_old);
+                DeleteObject(back_bmp);
+                DeleteDC(dc);
+            }
+            EndPaint(hwnd, &ps);
+            if (st && !st->overlay_paint_logged) {
+                st->overlay_paint_logged = true;
+                char t[200];
+                std::snprintf(t, sizeof(t),
+                              "OVERLAY paint client=(%ld,%ld) footer=(%ld,%ld,"
+                              "%ld,%ld) dc=%s",
+                              cw, ch, st->footer.left, st->footer.top,
+                              st->footer.right, st->footer.bottom,
+                              dc != screen ? "buf" : "screen");
+                AppendUiLog(t);
+            }
+            return 0;
+        }        case WM_TIMER:   // 自刷新：hover / 进度 / 时间每 250ms 跟进
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_SETCURSOR:   // 光标形状交给父窗（手型/箭头按命中区）
+            if (st) {
+                SendMessageW(st->hwnd, WM_SETCURSOR, wp, lp);
+                return TRUE;
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_MOUSEMOVE: {
+            // 转发父窗：坐标从 overlay client 换回父窗 client。
+            if (!st || !st->hwnd) return 0;
+            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            MapWindowPoints(hwnd, st->hwnd, &p, 1);
+            SendMessageW(st->hwnd, msg, wp, MAKELPARAM(p.x, p.y));
+            return 0;
+        }
+        default:
+            return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+bool EnsureFooterOverlayClass() {
+    static const bool registered = [] {
+        WNDCLASSW wc{};
+        wc.style = CS_DBLCLKS;
+        wc.lpfnWndProc = FooterOverlayProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = nullptr;
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = kFooterOverlayClass;
+        return RegisterClassW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }();
+    return registered;
+}
+
+        
+
 LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     PlayerState* st = reinterpret_cast<PlayerState*>(
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1476,13 +2342,38 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_CREATE: {
             if (!st) return -1;
-            st->video_host = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+            // ★ WS_CLIPSIBLINGS 必须加：视频渲染子窗口每帧重绘，若不做兄弟
+            //   裁剪，它会把叠在上面的 footer_overlay（全屏控制条）整块刷掉
+            //   —— 这正是「全屏看不到进度条/播放按钮」的根因（浮层确实创建、
+            //   显示、绘制了，但每一帧都被视频重绘覆盖）。
+            st->video_host = CreateWindowW(
+                L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                 0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
             if (!st->video_host) return -1;
             // 渲染子窗口不吃鼠标：命中测试会跳过被禁用的窗口（连同它内部的
             // MF 渲染子窗），于是画面区的点击 / 双击 / 移动都能落到父窗，
             // 双击画面切全屏、全屏下动鼠标唤出控件才生效。禁用不影响绘制。
             EnableWindow(st->video_host, FALSE);
+            // 全屏控制条 overlay（Z 序在 video_host 之后=画在其上）：同样
+            // 禁用让鼠标穿透到父窗（复用现有命中逻辑），自身只负责绘制。
+            if (EnsureFooterOverlayClass()) {
+                st->footer_overlay = CreateWindowExW(
+                    0, kFooterOverlayClass, L"",
+                    WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, hwnd, nullptr,
+                    GetModuleHandleW(nullptr), st);
+                if (st->footer_overlay) {
+                    EnableWindow(st->footer_overlay, FALSE);
+                    SetTimer(st->footer_overlay, 1, 250, nullptr);
+                    ShowWindow(st->footer_overlay, SW_HIDE);
+                    AppendUiLog("OVERLAY create ok");
+                } else {
+                    AppendUiLog("OVERLAY create FAIL err=" +
+                                std::to_string(GetLastError()));
+                }
+            } else {
+                AppendUiLog("OVERLAY class FAIL err=" +
+                            std::to_string(GetLastError()));
+            }
             // Win11 自动圆角会让无边框 WS_POPUP 看起来仍带一圈边，先关掉。
             DisableWindowCorners(hwnd);
             st->last_input = GetTickCount();
@@ -1679,6 +2570,12 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (st->sources.size() > 1 && st->source_index >= 0 &&
                     st->auto_source_tried + 1 <
                         static_cast<int>(st->sources.size())) {
+                    // 出过画面后的换源受全局冷却（防链式切换）；从没出过
+                    // 画面的首播失败换线不受限（快速试错）。
+                    if (st->got_ready &&
+                        GetTickCount() - st->last_switch_tick < 12000)
+                        return 0;
+                    st->last_switch_tick = GetTickCount();
                     ++st->auto_source_tried;
                     const int next =
                         (st->source_index + 1) %
@@ -1741,6 +2638,50 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st) {
                 st->got_ready = true;
                 st->playing = true;
+                // 糊/清晰判定数据（2026-11-25 用户反馈「小窗口放大很糊、
+                // 大窗口切源再播很清晰」）：记录**源分辨率**与**呈现窗口
+                // 尺寸**。若 native 随打开时窗口变小 → 分辨率协商问题；
+                // 若 native 恒为低清 → 是该线路码率问题（换源即高清）。
+                {
+                    int vw = 0, vh = 0;
+                    if (st->backend) st->backend->GetVideoSize(&vw, &vh);
+                    // 比例修复：异步轮询拿到尺寸前 video_w/h=0 → FitVideoRect
+                    // 铺满 →「首次进入分辨率比例有问题」。首帧就绪时立即写回
+                    // 并重排，把铺满期从 ~2s 缩到 0（轮询路径仅作后续兜底）。
+                    if (vw > 0 && vh > 0 &&
+                        (vw != st->video_w || vh != st->video_h)) {
+                        st->video_w = vw;
+                        st->video_h = vh;
+                        LayoutPlayer(st);
+                    }
+                    RECT hr{};
+                    if (st->video_host) GetClientRect(st->video_host, &hr);
+                    AppendUiLog("READY video_native=" + std::to_string(vw) +
+                                "x" + std::to_string(vh) + " host=" +
+                                std::to_string(hr.right) + "x" +
+                                std::to_string(hr.bottom) + " line=" +
+                                core::WideToUtf8(st->line_label));
+                }
+                // 出画面 = 本条线路可用：恢复预算重置、缓冲状态清零。
+                st->recover_budget = 2;
+                st->buffering = false;
+                st->stall_rounds = 0;
+                st->switching_hint = false;   // 换线完成（或本来就没换）
+                st->ready_tick = GetTickCount();   // 片头缓冲期预判冷却起点
+                // 换源续播诊断（用户反馈「第二次播放进度被重置」）：无条件
+                // 记录 pending/applied/dur，没走到 seek 一眼可定位哪环断了。
+                {
+                    char rt[200];
+                    std::snprintf(rt, sizeof(rt),
+                                  "RESUME check pending=%d applied=%d dur=%.1f "
+                                  "pos=%.1f",
+                                  st->pending_start_ms,
+                                  st->start_applied ? 1 : 0,
+                                  EffectiveDuration(st), CurrentPosition(st));
+                    AppendUiLog(rt);
+                }
+                // 多源速度对比：首帧就绪后后台测各候选源（只测一次）。
+                StartSourceSpeedProbe(st);
                 st->auto_source_tried = 0;   // 出画面即视为本条线路可用
                 st->same_src_retry_index = -1;   // 下一条故障线路仍可同源重试
                 st->resolve_retry_pending = false;
@@ -1778,7 +2719,13 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_USER + 2:  // on_playing
             if (st) {
-                st->playing = (wp != 0);
+                const bool now_playing = (wp != 0);
+                // 状态变化才记：卡住诊断需要区分「后端自己停了」与「还在跑」。
+                if (now_playing != st->playing)
+                    AppendUiLog(std::string("PLAYBACK playing=") +
+                                (now_playing ? "1" : "0") + " pos=" +
+                                std::to_string(CurrentPosition(st)));
+                st->playing = now_playing;
                 if (st->footer.bottom > st->footer.top)
                     InvalidateRect(hwnd, &st->footer, FALSE);
             }
@@ -1786,12 +2733,130 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_USER + 3:  // on_end
             if (st) {
                 st->playing = false;
+                const double pos = CurrentPosition(st);
+                const double dur = EffectiveDuration(st);
+                AppendUiLog("PLAYBACK end pos=" + std::to_string(pos) +
+                            " dur=" + std::to_string(dur));
+                // 提前断流：代理流在播放中途 EOF（分片等待失败 break → chunked
+                // 正常收尾），MF 当成「播完」但时长才走了一半（真机日志：
+                // end pos=1507 dur=2939）。这不是正常结束，自动重开续播 /
+                // 换源，而不是停在半路。
+                if (!st->web_mode && dur > 0.0 && pos > 10.0 &&
+                    pos < dur * 0.95) {
+                    AutoRecoverPlayback(st, "premature-end");
+                    return 0;
+                }
+                // 正常播完：清进度基准（避免下一条换线 resume 到片尾）。
+                st->resume_pos = 0.0;
                 if (st->footer.bottom > st->footer.top)
                     InvalidateRect(hwnd, &st->footer, FALSE);
             }
             return 0;
+        case WM_USER + 16:  // 缓冲开始（MF WAITING / STALLED）
+            // ★ 用户主动暂停时 MF 同样会发 WAITING（暂停=不再读流），这不是
+            //   卡住。若照单全收，10s 后就会触发「缓冲超时恢复」重建并自动
+            //   续播、再连锁预判换源（真机日志 2026-11-27）。暂停期间忽略。
+            if (st && !st->web_mode && !st->user_paused) {
+                if (!st->buffering)
+                    AppendUiLog("BUFFERING on pos=" +
+                                std::to_string(CurrentPosition(st)));
+                st->buffering = true;
+                st->buffering_tick = GetTickCount();
+                InvalidateRect(hwnd, nullptr, FALSE);   // 画「正在缓冲」浮层
+            }
+            return 0;
+        case WM_USER + 17:  // 缓冲恢复（MF PLAYING）
+            if (st) {
+                if (st->buffering)
+                    AppendUiLog("BUFFERING off pos=" +
+                                std::to_string(CurrentPosition(st)));
+                st->buffering = false;
+                InvalidateRect(hwnd, nullptr, FALSE);   // 清浮层
+            }
+            return 0;
+        case WM_USER + 18: {  // AutoRecover 请求自动换下一条源（带时长校验）
+            std::string reason;
+            if (lp) {
+                reason = reinterpret_cast<const char*>(lp);
+                free(reinterpret_cast<void*>(lp));
+            }
+            if (st && st->sources.size() > 1 && st->source_index >= 0 &&
+                st->auto_source_tried + 1 <
+                    static_cast<int>(st->sources.size())) {
+                // 自动换源全局冷却：预判/恢复/时长校验/错误换源互相叠加会
+                // 链式触发（用户反馈「频繁切换源」）——12s 内只换一次。
+                if (GetTickCount() - st->last_switch_tick < 12000) {
+                    st->switching_hint = false;
+                    AppendUiLog("SWITCH cooldown active, skip reason=" +
+                                reason);
+                    return 0;
+                }
+                st->last_switch_tick = GetTickCount();
+                ++st->auto_source_tried;
+                // 换源前记录总时长：新源时长首次可得时校验是否同一内容
+                //（差 >5% 且 >60s → 继续换，见定时器里的 switch_expect_dur）。
+                const double expect = EffectiveDuration(st);
+                // 选优：时长匹配（测速已知时前置排除）+ 速度最快的候选。
+                const int next = PickNextSource(st, expect);
+                if (next < 0 || next == st->source_index) {
+                    st->switching_hint = false;   // 没换成，别卡住提示浮层
+                    return 0;
+                }
+                st->switch_expect_dur = expect > 0.0 ? expect : 0.0;
+                st->switch_manual = false;
+                st->switching_hint = true;   // 浮层提示「正在切换线路…」
+                AppendUiLog("AUTO next source after " +
+                            (reason.empty() ? std::string("recover")
+                                            : reason) +
+                            " #" + std::to_string(next + 1) + " " +
+                            core::WideToUtf8(st->sources[next].name) +
+                            " expect_dur=" + std::to_string(expect));
+                OpenSourceAt(st, next);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else {
+                AppendUiLog("RECOVER give_up (no more sources) reason=" +
+                            reason);
+            }
+            return 0;
+        }
+        case WM_USER + 19: {  // 多源测速结果合并（lp = new vector<Result>）
+            auto* results =
+                reinterpret_cast<std::vector<SourceSpeedResult>*>(lp);
+            if (st && results) {
+                if (st->source_speeds.size() < st->sources.size())
+                    st->source_speeds.resize(st->sources.size());
+                for (const auto& r : *results) {
+                    if (r.index < 0 ||
+                        r.index >= static_cast<int>(st->source_speeds.size()))
+                        continue;
+                    st->source_speeds[r.index].kbps = r.kbps;
+                    st->source_speeds[r.index].dur = r.dur;
+                    char t[320];
+                    std::snprintf(
+                        t, sizeof(t),
+                        "SPEED #%d name=%s kbps=%d dur=%.0f list_ms=%d "
+                        "seg_ms=%d",
+                        r.index + 1,
+                        r.index < static_cast<int>(st->sources.size())
+                            ? core::WideToUtf8(st->sources[r.index].name)
+                                  .c_str()
+                            : "?",
+                        r.kbps, r.dur, r.list_ms, r.seg_ms);
+                    AppendUiLog(t);
+                }
+            }
+            delete results;
+            return 0;
+        }
         case WM_USER + 4: {  // on_error
             if (st) {
+                // 后端错误原文必须落盘：以前只进 UI浮层，事后无法分析
+                // 「卡住」到底是解码错误还是网络错误。
+                if (lp) {
+                    AppendUiLog("ERROR backend: " +
+                                std::string(reinterpret_cast<const char*>(lp))
+                                    .substr(0, 400));
+                }
                 // ★ 本地 HLS 代理偶发断流（分片暂未就绪 / 旧 RANGE probe 抢
                 //   资源）会让 MF 在开播几秒后报「解码或网络错误」。第一次
                 //   ERROR 不直接判死，用不带起点的原始 media URL 重开一次。
@@ -1813,6 +2878,7 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (st->opened_ok) {
                         st->backend->Play();
                         st->playing = true;
+                        st->user_paused = false;   // 重新打开即播放
                         st->got_ready = true;
                         st->resolving = false;
                         st->hls_running = false;
@@ -1882,6 +2948,10 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     st->sources.size() > 1 && st->source_index >= 0 &&
                     st->auto_source_tried + 1 <
                         static_cast<int>(st->sources.size())) {
+                    if (st->got_ready &&
+                        GetTickCount() - st->last_switch_tick < 12000)
+                        return 0;
+                    st->last_switch_tick = GetTickCount();
                     ++st->auto_source_tried;
                     const int next =
                         (st->source_index + 1) %
@@ -1915,7 +2985,31 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 光标随内容变化：控制栏按钮 / 进度条 / 音量条用小手，其它区域
             // 保持箭头（此前窗口类没设 hCursor，整窗永远是箭头，按钮上也没有
             // 「可点」提示，和音乐窗的「全是手」是同一类问题）。
-            if (LOWORD(lp) != HTCLIENT || !st) break;
+            if (!st) break;
+            const UINT hit = LOWORD(lp);
+            // ★ 边框缩放带必须显式给缩放光标：这是无边框 WS_POPUP 窗，默认
+            //   WM_SETCURSOR 处理只会套用窗口类的箭头，不会按 HTLEFT/HTTOP
+            //   这类命中码换成双向箭头（用户反馈「能拖大，但光标不变」）。
+            if (hit != HTCLIENT) {
+                LPCTSTR cursor_id = nullptr;
+                switch (hit) {
+                    case HTLEFT: case HTRIGHT:
+                        cursor_id = IDC_SIZEWE; break;
+                    case HTTOP: case HTBOTTOM:
+                        cursor_id = IDC_SIZENS; break;
+                    case HTTOPLEFT: case HTBOTTOMRIGHT:
+                        cursor_id = IDC_SIZENWSE; break;
+                    case HTTOPRIGHT: case HTBOTTOMLEFT:
+                        cursor_id = IDC_SIZENESW; break;
+                    case HTCAPTION:
+                        cursor_id = IDC_ARROW; break;
+                    default:
+                        break;
+                }
+                if (!cursor_id) break;
+                SetCursor(LoadCursorW(nullptr, cursor_id));
+                return TRUE;
+            }
             // 控制条隐藏期间连鼠标指针一起隐藏，观感与其它播放器一致。
             if (ControlsHidden(st)) { SetCursor(nullptr); return TRUE; }
             POINT p{};
@@ -1967,16 +3061,37 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return base;
         }
+        case WM_NCLBUTTONDBLCLK:
+            // ★ 双击标题栏（WM_NCHITTEST 返回 HTCAPTION 的区域）会被
+            //   DefWindowProc 当成「最大化/还原」。这是无边框 WS_POPUP 窗，
+            //   最大化后就是铺满工作区、四周没有可抓边框的「窗口化全屏」，
+            //   用户拖不动也改不了尺寸，而且会被存成 maximized:true 下次启动
+            //   直接复现（用户反馈「软件打开就是窗口化全屏状态，无法修改尺寸」）。
+            //   视频窗没有「最大化」这个概念，双击一律吞掉。
+            return 0;
+        case WM_GETMINMAXINFO: {
+            // 兜底：任何途径（系统手势 / 外部工具）触发最大化时，把最大化
+            // 尺寸限制成正常窗口大小，绝不允许出现无边框铺满屏幕的状态。
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            if (mmi) {
+                mmi->ptMaxSize.x = 880;
+                mmi->ptMaxSize.y = 540;
+                mmi->ptMaxTrackSize.x = 16384;
+                mmi->ptMaxTrackSize.y = 16384;
+            }
+            return 0;
+        }
         case WM_ERASEBKGND:
             // WM_PAINT 会全量重绘整个客户区（皮肤背景 + 标题 + 控制栏），无需擦除
             // 背景；默认擦除会用 BLACK_BRUSH 把整窗刷黑，与重绘之间存在可见的「黑闪」，
             // 切换源 / 缓冲 / 出错时的整窗闪烁即源于此。直接返回已处理，消除闪烁。
             return 1;
-        case WM_PAINT: {
+// ── 控制栏绘制（抽离自 WM_PAINT）：父窗（非全屏）与 footer overlay
+//    （全屏浮在视频上）共用。dc 已是调用方的后台位图。
+case WM_PAINT: {
             if (!st) break;
             PAINTSTRUCT ps{};
-            HDC screen = BeginPaint(hwnd, &ps);
-            RECT c{};
+            HDC screen = BeginPaint(hwnd, &ps);            RECT c{};
             GetClientRect(hwnd, &c);
             const bool hide = ControlsHidden(st);
             // ---- 整窗双缓冲 ------------------------------------------------
@@ -2125,7 +3240,10 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // ---- 控制栏 -------------------------------------------------
                 // 原生形态 / web 形态 / 全屏都画这一层自绘控制条；只有 footer
                 // 为空（控件被显式隐藏）时才跳过，避免空矩形把图标画到左上角。
-                if (!hide && st->footer.bottom > st->footer.top) {
+                // 全屏例外：video_host 已铺满全窗，父窗画的控制条会被盖住
+                // （且画面要铺到窗口底）——全屏由 footer overlay 子窗口画。
+                if (!hide && st->footer.bottom > st->footer.top &&
+                    !st->window_fullscreen) {
                 // 整窗已双缓冲，这里直接画进后台位图即可（不再嵌套一层）。
                 theme::FillSolidRect(dc, st->footer, kVidBar);
                 theme::FillSolidRect(dc, {st->footer.left, st->footer.top,
@@ -2151,6 +3269,22 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int thumb_x = st->progress.left;
                 const int span = st->progress.right - st->progress.left;
                 if (span > 0) {
+                    // 已缓冲段（浅色，位于已播填充之后）：显示预加载的
+                    // 缓冲到哪了（用户需求「预加载的缓冲要在进度条中看到」）。
+                    if (dur > 0.0 && st->buffer_end_sec > pos + 0.5) {
+                        const double buffered_ratio = std::min(
+                            1.0, std::max(0.0, st->buffer_end_sec / dur));
+                        const int fill_w0 = static_cast<int>(span * ratio);
+                        const int buf_w =
+                            static_cast<int>(span * buffered_ratio);
+                        if (buf_w > fill_w0) {
+                            RECT buf = st->progress;
+                            buf.left = st->progress.left + fill_w0;
+                            buf.right = st->progress.left + buf_w;
+                            theme::DrawRoundedBox(dc, buf, kVidBuffered,
+                                                  CLR_INVALID, 3);
+                        }
+                    }
                     const int fill_w = static_cast<int>(span * ratio);
                     if (dur > 0.0 && fill_w > 0) {
                         RECT fill = st->progress;
@@ -2263,6 +3397,44 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   PlayerSmallFont(),
                                   DT_CENTER | DT_WORDBREAK | DT_NOPREFIX |
                                       DT_END_ELLIPSIS);
+            } else if (st->switching_hint) {
+                // 自动换线进行中（用户要求换源也要有提示）。
+                const int dots = static_cast<int>((GetTickCount() / 400) % 4);
+                const int cx = c.right / 2, cym = c.bottom / 2;
+                theme::DrawTextIn(dc, {cx - 170, cym - 16, cx + 170, cym + 16},
+                                  (L"正在切换线路…" + std::wstring(dots, L'.'))
+                                      .c_str(),
+                                  kVidDim, PlayerSmallFont(),
+                                  theme::kCenterFormat);
+            } else if (st->buffering) {
+                // 播放中数据不足（MF WAITING/STALLED）：显示缓冲提示。
+                // 以前卡住完全没有提示（2026-11-25 用户反馈）；现在带
+                // 百分比（协议代理 poll_buffering 上报前方就绪比例）。
+                const int dots = static_cast<int>((GetTickCount() / 400) % 4);
+                const int cx = c.right / 2, cym = c.bottom / 2;
+                std::wstring text;
+                if (st->buffer_percent >= 0)
+                    text = L"正在缓冲 " + std::to_wstring(st->buffer_percent) +
+                           L"%" + std::wstring(dots, L'…');
+                else
+                    text = L"正在缓冲" + std::wstring(dots, L'…');
+                theme::DrawTextIn(dc, {cx - 150, cym - 16, cx + 150, cym + 16},
+                                  text.c_str(),
+                                  kVidDim, PlayerSmallFont(),
+                                  theme::kCenterFormat);
+                // 缓冲进度条：底槽 + 已缓冲比例填充。
+                if (st->buffer_percent >= 0) {
+                    const RECT bar{cx - 120, cym + 24, cx + 120, cym + 32};
+                    theme::DrawRoundedBox(dc, bar, RGB(40, 40, 44), kVidDim, 4);
+                    const int fill = (bar.right - bar.left) *
+                                     st->buffer_percent / 100;
+                    if (fill > 0) {
+                        RECT done{bar.left, bar.top, bar.left + fill,
+                                  bar.bottom};
+                        theme::DrawRoundedBox(dc, done, RGB(90, 160, 255),
+                                              kVidDim, 4);
+                    }
+                }
             } else if (st->hls_running) {
                 // HLS 拼接中：显示缓冲百分比（分段拼接完成度）。
                 const int pct = st->hls_percent.load();
@@ -2585,12 +3757,125 @@ LRESULT CALLBACK VideoPlayerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!st->controls_hidden) {
                     const bool overlay = !st->error_text.empty() || st->hls_running ||
                                          st->download_running || st->resolving ||
+                                         st->buffering || st->switching_hint ||
                                          !st->got_ready;
                     if (overlay)
                         InvalidateRect(hwnd, nullptr, FALSE);
                     else if (st->footer.right > st->footer.left &&
                              st->footer.bottom > st->footer.top)
                         InvalidateRect(hwnd, &st->footer, FALSE);
+                }
+                // ── 缓冲进度轮询（250ms）：代理 poll_buffering 上报「播放
+                //    位置前方连续就绪数据 / 15s 目标」。
+                //    · buffering 时 → 浮层「正在缓冲 n%」；
+                //    · 始终更新 buffer_end_sec → 进度条浅色缓冲段（用户需求：
+                //      预加载的缓冲要在进度条中看到）。
+                if (st->proto_session) {
+                    const int pct =
+                        VideoProtocolRegistry::PollBuffering(st->proto_session);
+                    if (st->buffering) st->buffer_percent = pct;
+                    // 进度条缓冲段用「前方连续就绪秒数」（poll_buffered）：
+                    // 15s 百分比目标在长片上只有几像素，看不出预加载进度。
+                    const int buffered_sec =
+                        VideoProtocolRegistry::PollBuffered(st->proto_session);
+                    if (buffered_sec > 0) {
+                        st->buffer_end_sec =
+                            CurrentPosition(st) + buffered_sec;
+                    } else {
+                        st->buffer_end_sec = 0.0;
+                    }
+                    // ── 后方分片健康预判（预加载后面的片，发现后面无法
+                    //    加载/非常缓慢就预判，直接换源）──正常边播边下前方
+                    //    就绪恒 >0；连续 5s 为 0 = 后面的分片拉不上来。
+                    //    冷却：刚出画面（片头缓冲期）10s 内、刚 seek/重开
+                    //    8s 内不预判——那些时刻前方就绪本来就少（否则片头
+                    //    刚出现就被切走）。此时旧源还在播，提前换源即「无缝」。
+                    const DWORD now_tick = GetTickCount();
+                    if (!st->web_mode && !st->user_paused && st->got_ready &&
+                        st->playing && !st->buffering && !st->switching_hint &&
+                        !st->dragging_progress &&
+                        now_tick - st->ready_tick > 10000 &&
+                        now_tick - st->last_seek_tick > 8000 &&
+                        st->source_index >= 0 && st->sources.size() > 1 &&
+                        st->auto_source_tried + 1 <
+                            static_cast<int>(st->sources.size())) {
+                        if (pct == 0) {
+                            if (++st->ahead_empty_ticks >= 20) {   // 5s
+                                st->ahead_empty_ticks = 0;
+                                st->switching_hint = true;
+                                AppendUiLog(
+                                    "PREDICT ahead-empty 5s -> preemptive "
+                                    "switch pos=" +
+                                    std::to_string(CurrentPosition(st)));
+                                PostMessageW(hwnd, WM_USER + 18, 0,
+                                             reinterpret_cast<LPARAM>(_strdup(
+                                                 "predict-ahead-empty")));
+                                InvalidateRect(hwnd, nullptr, FALSE);
+                            }
+                        } else if (pct > 0) {
+                            st->ahead_empty_ticks = 0;
+                        }
+                    } else {
+                        st->ahead_empty_ticks = 0;
+                    }
+                } else {
+                    st->buffer_percent = -1;
+                    st->buffer_end_sec = 0.0;
+                    st->ahead_empty_ticks = 0;
+                }
+                // ── 缓冲超时自动恢复（250ms 轮询）：MF WAITING 后 10s 没有
+                //    PLAYING 恢复 → 原地重开续播，预算耗尽自动换源。
+                //    ★ 用户主动暂停期间不判超时（暂停本来就「没有新数据」）。
+                if (st->buffering && !st->web_mode && !st->user_paused &&
+                    GetTickCount() - st->buffering_tick > 10000) {
+                    AppendUiLog("BUFFERING timeout pos=" +
+                                std::to_string(CurrentPosition(st)));
+                    st->buffering = false;
+                    AutoRecoverPlayback(st, "buffer-timeout");
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                // ── 自动换源时长校验（用户要求「切换的源时间总长要跟当前
+                //    视频基本一致，否则有可能不是」）：新源时长首次可得时与
+                //    换源前记录的时长比对，差 >5% 且 >60s → 不是同一内容 →
+                //    继续自动换下一条（受 auto_source_tried 预算限制）。
+                if (st->switch_expect_dur > 0.0 && !st->switch_manual &&
+                    !st->web_mode) {
+                    const double new_dur = EffectiveDuration(st);
+                    if (new_dur > 0.0) {
+                        const double expect = st->switch_expect_dur;
+                        st->switch_expect_dur = 0.0;   // 只校验一次
+                        const double diff = std::fabs(new_dur - expect);
+                        const bool mismatch =
+                            diff > 60.0 && diff > expect * 0.05;
+                        if (mismatch) {
+                            AppendUiLog(
+                                "SOURCE dur mismatch expect=" +
+                                std::to_string(expect) + " got=" +
+                                std::to_string(new_dur) + " -> next source");
+                            if (st->sources.size() > 1 && st->source_index >= 0 &&
+                                st->auto_source_tried + 1 <
+                                    static_cast<int>(st->sources.size()) &&
+                                GetTickCount() - st->last_switch_tick >=
+                                    12000) {
+                                st->last_switch_tick = GetTickCount();
+                                ++st->auto_source_tried;
+                                // 选优：其余候选中时长匹配且速度最快的。
+                                const int next = PickNextSource(st, expect);
+                                if (next >= 0 && next != st->source_index) {
+                                    st->switch_expect_dur = expect;  // 继续校验
+                                    st->switch_manual = false;
+                                    st->switching_hint = true;
+                                    AppendUiLog(
+                                        "AUTO next source on dur mismatch #" +
+                                        std::to_string(next + 1) + " " +
+                                        core::WideToUtf8(
+                                            st->sources[next].name));
+                                    OpenSourceAt(st, next);
+                                    InvalidateRect(hwnd, nullptr, FALSE);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             break;
@@ -3072,6 +4357,8 @@ void SwitchSource(PlayerState* st) {
     st->auto_source_tried = 0;   // 用户手动换线：重置自动兜底计数
     st->same_src_retry_index = -1;
     st->resolve_retry_pending = false;
+    st->switch_expect_dur = 0.0;  // 手动选线不做时长校验
+    st->switch_manual = true;
     const int next = (st->source_index + 1) %
                      static_cast<int>(st->sources.size());
     OpenSourceAt(st, next);
@@ -3110,6 +4397,8 @@ void ShowSourceMenu(PlayerState* st) {
             st->auto_source_tried = 0;   // 用户手动选线：重置自动兜底计数
             st->same_src_retry_index = -1;
             st->resolve_retry_pending = false;
+            st->switch_expect_dur = 0.0;  // 手动选线不做时长校验
+            st->switch_manual = true;
             OpenSourceAt(st, index);
         }
     }
@@ -3262,6 +4551,26 @@ void ProbeHlsDuration(HWND hwnd, const std::wstring& url,
 
 void OpenSourceAt(PlayerState* st, int index) {
     if (!st || index < 0 || index >= static_cast<int>(st->sources.size())) return;
+    // 换线路（同一集）要保留进度：记住当前位置，首帧就绪后由 on_ready 的
+    // pending_start_ms 续播逻辑自动 SeekTo（用户反馈「切换了源之后，进度也
+    // 并没有还原」）。判定依据：index 真的变化（换线）且 start_applied
+    // （当前集已正常播过）——换集走 ShowVideoPlayer 会先把 start_applied
+    // 置 false 并重算 source_index，不会误触发。
+    // ★ 进度基准存 resume_pos：连续换源链（时长校验再换）中中间源还没播出
+    //   进度、play_clock_base 已被清 0，只看即时位置会丢基准 → 从头开始。
+    if (index != st->source_index && st->start_applied) {
+        const double pos = CurrentPosition(st);
+        if (pos > 3.0) st->resume_pos = pos;   // 正常播放中：刷新基准
+        if (st->resume_pos > 3.0) {            // 连续换源：沿用上次基准
+            st->pending_start_ms =
+                static_cast<int>(st->resume_pos * 1000.0);
+            st->start_applied = false;
+            AppendUiLog("SOURCE resume " +
+                        std::to_string(static_cast<int>(st->resume_pos)) +
+                        "s from line " + std::to_string(st->source_index) +
+                        " -> " + std::to_string(index));
+        }
+    }
     st->source_index = index;
     // 换线路 / 重新打开源：先拆掉上一条线路的网页宿主，否则旧网页会盖在新源上。
     st->web_host.reset();
@@ -3271,6 +4580,9 @@ void OpenSourceAt(PlayerState* st, int index) {
     if (was_web) AppendUiLog("MODE web=0 (switch to native)");
     // 从网页内嵌播放切回原生播放：重新排一次，恢复原生控制栏。
     if (was_web) LayoutPlayer(st);
+    // 换源 = 重新开始播放：清掉「用户暂停」标记，否则新源出画面后所有卡住
+    // 判定/恢复都被跳过，真卡住也不会自救。
+    st->user_paused = false;
     // 同一播放窗换集 / 换线：上一轮 HLS 拼接、下载、解析若还在跑，必须取消并
     // 复位标志，否则新地址会被「已有拼接在跑」直接跳过，旧的完成消息还会把
     // 上一集画面顶上来。
@@ -3646,6 +4958,19 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
         st->history_id = history_id;
         st->pending_start_ms = start_ms;
         st->start_applied = false;
+        // 换片/换集：清掉上一条线路的恢复状态（时长校验、缓冲、恢复预算），
+        // 避免对新内容误用旧基准。
+        st->switch_expect_dur = 0.0;
+        st->switch_manual = false;
+        st->buffering = false;
+        st->recover_budget = 0;
+        st->stall_rounds = 0;
+        // 新片重新测速（候选源都换了）。
+        st->source_speeds.clear();
+        st->speed_probe_started = false;
+        // 新片：进度基准与换线提示一并清掉。
+        st->resume_pos = 0.0;
+        st->switching_hint = false;
         st->last_history_save = GetTickCount();
         st->title_text = L"千千静听 · " +
                          (title.empty() ? std::wstring(L"视频播放") : title);
@@ -3811,10 +5136,32 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
                 win_y = mi.rcWork.top + 24;
             }
         } else {
-            win_x = saved.left;
-            win_y = saved.top;
-            win_w = w;
-            win_h = h;
+            // 恢复矩形必须「能拖能改」：尺寸超过工作区 92% 时按默认尺寸重新
+            // 居中——即使历史文件里存了一个略小于整屏、但边缘已经贴到屏幕外
+            // 的矩形（用户「打开就是窗口化全屏、无法修改尺寸」），也不会再
+            // 出现「边框在屏幕外抓不到」的情况。
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            const bool have_mon =
+                GetMonitorInfoW(MonitorFromRect(&saved,
+                                                MONITOR_DEFAULTTONEAREST),
+                                &mi) != FALSE;
+            const int work_w = have_mon ? mi.rcWork.right - mi.rcWork.left : 0;
+            const int work_h = have_mon ? mi.rcWork.bottom - mi.rcWork.top : 0;
+            const bool too_big =
+                work_w > 0 && work_h > 0 &&
+                (w > work_w * 92 / 100 || h > work_h * 92 / 100);
+            if (too_big) {
+                win_w = std::min(880, work_w - 48);
+                win_h = std::min(540, work_h - 48);
+                win_x = mi.rcWork.left + (work_w - win_w) / 2;
+                win_y = mi.rcWork.top + (work_h - win_h) / 2;
+            } else {
+                win_x = saved.left;
+                win_y = saved.top;
+                win_w = w;
+                win_h = h;
+            }
         }
     }
     // ⚠ 父/属主窗口传 nullptr：主窗口最小化时不能把播放窗一起最小化
@@ -3824,6 +5171,11 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
         style, win_x, win_y, win_w, win_h, nullptr, nullptr,
         GetModuleHandleW(nullptr), st);
     if (!st->hwnd) { delete st; return; }
+    // 全屏还原目标初始化为「创建时的正常窗口态」：即使窗口启动就处于被污染的
+    // 假全屏（ToggleFullscreen 会跳过覆盖），退出全屏也能还原成可拖边框的窗口，
+    // 而不是 0 矩形 / 空样式。
+    GetWindowRect(st->hwnd, &st->saved_rect);
+    st->saved_style = GetWindowLongPtrW(st->hwnd, GWL_STYLE);
     // 诊断：入口 / 皮肤 / 选集数量（排查「两个入口样式不一致」时先看这行）。
     AppendUiLog(std::string("PLAYER open skinned=") +
                 (st->skinned ? "1" : "0") + " episodes=" +
@@ -3831,6 +5183,21 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
                 (st->history_id.empty() ? "0" : "1") + " resume=" +
                 std::to_string(st->pending_start_ms));
     if (restore_maximized) ShowWindow(st->hwnd, SW_MAXIMIZE);
+    {
+        // 诊断：启动时的窗口矩形 / 样式（用户反馈「打开就是窗口化全屏、
+        // 改不了尺寸」时，一行即可确认是恢复出的矩形异常还是样式缺边框）。
+        RECT wr{};
+        GetWindowRect(st->hwnd, &wr);
+        char t[220];
+        std::snprintf(t, sizeof(t),
+                      "WINDOW open rect=(%ld,%ld,%ld,%ld) style=0x%08llX "
+                      "maximized=%d",
+                      wr.left, wr.top, wr.right, wr.bottom,
+                      static_cast<unsigned long long>(
+                          GetWindowLongPtrW(st->hwnd, GWL_STYLE)),
+                      restore_maximized ? 1 : 0);
+        AppendUiLog(t);
+    }
     if (app_icon) {
         SendMessageW(st->hwnd, WM_SETICON, ICON_SMALL,
                      reinterpret_cast<LPARAM>(app_icon));
@@ -3853,6 +5220,9 @@ void ShowVideoPlayer(HWND owner, const std::wstring& url, const std::wstring& ti
         PostMessageW(hwnd, WM_USER + 2, playing ? 1 : 0, 0);
     };
     cb.on_end = [hwnd = st->hwnd] { PostMessageW(hwnd, WM_USER + 3, 0, 0); };
+    cb.on_buffering = [hwnd = st->hwnd](bool buffering) {
+        PostMessageW(hwnd, buffering ? WM_USER + 16 : WM_USER + 17, 0, 0);
+    };
     cb.on_error = [hwnd = st->hwnd](const std::string& e) {
         PostMessageW(hwnd, WM_USER + 4, 0, reinterpret_cast<LPARAM>(_strdup(e.c_str())));
     };

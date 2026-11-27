@@ -154,6 +154,21 @@ int VideoProtocolRegistry::Poll(ProtocolSession* s, std::wstring* out_err) {
     return state;
 }
 
+int VideoProtocolRegistry::PollBuffering(ProtocolSession* s) {
+    if (!s || !s->proto || !s->handle) return -1;
+    // 旧协议 DLL 不认识此字段（宿主 api{} 初始化为 0）→ 安全回退 -1。
+    if (!s->proto->api.poll_buffering) return -1;
+    return s->proto->api.poll_buffering(
+        reinterpret_cast<VPSession*>(s->handle));
+}
+
+int VideoProtocolRegistry::PollBuffered(ProtocolSession* s) {
+    if (!s || !s->proto || !s->handle) return -1;
+    if (!s->proto->api.poll_buffered) return -1;
+    return s->proto->api.poll_buffered(
+        reinterpret_cast<VPSession*>(s->handle));
+}
+
 void VideoProtocolRegistry::Close(ProtocolSession*& s) {
     if (!s) return;
     if (s->proto && s->handle) {
